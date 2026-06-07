@@ -7,6 +7,91 @@ import traceback
 import termios
 import threading
 import socket
+import glob
+
+PICOTOOL_WRAPPER_CONTENT = """#!/usr/bin/env python3
+import sys
+import os
+import socket
+
+def main():
+    args = sys.argv[1:]
+    target_file = None
+    for arg in args:
+        if arg.endswith('.elf') or arg.endswith('.uf2'):
+            target_file = arg
+            break
+            
+    if not target_file:
+        sys.exit(0)
+        
+    if target_file.endswith('.elf'):
+        uf2_file = target_file[:-4] + '.uf2'
+        if not os.path.exists(uf2_file):
+            uf2_file = target_file
+    else:
+        uf2_file = target_file
+        
+    if not os.path.exists(uf2_file):
+        print(f"com2tty UF2 wrapper: {uf2_file} not found.", file=sys.stderr)
+        sys.exit(1)
+        
+    print(f"com2tty UF2 wrapper: Sending {uf2_file} to host...", file=sys.stderr)
+    try:
+        with open(uf2_file, 'rb') as f:
+            data = f.read()
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect(('127.0.0.1', {port}))
+        s.sendall(data)
+        s.close()
+        print("com2tty UF2 wrapper: Transfer complete.", file=sys.stderr)
+    except Exception as e:
+        print(f"com2tty UF2 wrapper error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()
+"""
+
+intercepted_picotools = []
+
+def setup_picotool_interceptor(uf2_port):
+    wrapper_path = "/tmp/com2tty_picotool.py"
+    try:
+        with open(wrapper_path, "w") as f:
+            f.write(PICOTOOL_WRAPPER_CONTENT.replace("{port}", str(uf2_port)))
+        os.chmod(wrapper_path, 0o755)
+    except Exception as e:
+        sys.stderr.write(f"Warning: Failed to create picotool wrapper: {e}\n")
+        return
+
+    home = os.path.expanduser("~")
+    search_pattern = os.path.join(home, ".platformio", "packages", "tool-picotool*", "picotool")
+    for picotool_path in glob.glob(search_pattern):
+        if os.path.islink(picotool_path) or not os.path.isfile(picotool_path):
+            continue
+        real_path = picotool_path + ".real"
+        try:
+            if not os.path.exists(real_path):
+                os.rename(picotool_path, real_path)
+            if os.path.lexists(picotool_path):
+                os.remove(picotool_path)
+            os.symlink(wrapper_path, picotool_path)
+            intercepted_picotools.append((picotool_path, real_path))
+            sys.stderr.write(f"Intercepted picotool at {picotool_path}\n")
+        except Exception as e:
+            sys.stderr.write(f"Warning: Failed to intercept {picotool_path}: {e}\n")
+
+def cleanup_picotool_interceptor():
+    for picotool_path, real_path in intercepted_picotools:
+        try:
+            if os.path.lexists(picotool_path):
+                os.remove(picotool_path)
+            if os.path.exists(real_path):
+                os.rename(real_path, picotool_path)
+            sys.stderr.write(f"Restored picotool at {picotool_path}\n")
+        except Exception as e:
+            sys.stderr.write(f"Warning: Failed to restore {picotool_path}: {e}\n")
 
 baud_map = {getattr(termios, k): int(k[1:]) for k in dir(termios) if k.startswith('B') and k[1:].isdigit()}
 
@@ -171,6 +256,104 @@ def run_rfc2217_server_thread(port, rfc2217_active):
     finally:
         s.close()
 
+def run_uf2_relay_thread(port, uf2_active):
+    """
+    TCP server inside WSL that receives UF2 data from the picotool wrapper
+    and relays it to the Windows host through stdout pipe with control messages.
+    """
+    import subprocess as sp
+    import time
+
+    # Kill any leftover process from a previous com2tty session
+    try:
+        sp.run(["fuser", "-k", f"{port}/tcp"], capture_output=True, timeout=3)
+        time.sleep(0.3)
+    except Exception:
+        pass
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind(('127.0.0.1', port))
+    except Exception as e:
+        sys.stderr.write(f"[CONTROL] UF2_ERROR: bind failed on port {port}: {e}\n")
+        sys.stderr.flush()
+        return
+    s.listen(1)
+    s.settimeout(1.0)
+
+    sys.stderr.write(f"[CONTROL] UF2_READY:{port}\n")
+    sys.stderr.flush()
+
+    try:
+        while True:
+            try:
+                conn, addr = s.accept()
+            except socket.timeout:
+                continue
+            except Exception:
+                break
+
+            # Read all UF2 data from the picotool wrapper
+            uf2_data = bytearray()
+            try:
+                while True:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    uf2_data.extend(chunk)
+            except Exception:
+                pass
+            finally:
+                conn.close()
+
+            import hashlib
+            md5_hash = hashlib.md5(uf2_data).hexdigest()
+
+            sys.stderr.write(f"[CONTROL] UF2_UPLOAD_START:{len(uf2_data)}:{md5_hash}\n")
+            sys.stderr.flush()
+
+            # Pause the PTY main loop so we own stdout exclusively
+            uf2_active.set()
+            time.sleep(0.3)
+
+            # Block, waiting for [CONTROL] UF2_ACK from stdin (fd 0)
+            ack_received = False
+            timeout_time = time.time() + 5.0
+            buffer = b""
+            while time.time() < timeout_time and not ack_received:
+                r, _, _ = select.select([0], [], [], 0.1)
+                if 0 in r:
+                    try:
+                        chunk = os.read(0, 1024)
+                        if not chunk:
+                            break
+                        buffer += chunk
+                        if b"[CONTROL] UF2_ACK" in buffer:
+                            ack_received = True
+                            break
+                    except Exception:
+                        break
+
+            if ack_received:
+                # Send UF2 binary data through stdout pipe to Windows host
+                try:
+                    sys.stdout.buffer.write(uf2_data)
+                    sys.stdout.buffer.flush()
+                except Exception as e:
+                    sys.stderr.write(f"[CONTROL] UF2_ERROR: Failed to write to stdout: {e}\n")
+                    sys.stderr.flush()
+            else:
+                sys.stderr.write("[CONTROL] UF2_ERROR: Timeout waiting for host UF2_ACK\n")
+                sys.stderr.flush()
+
+            sys.stderr.write("[CONTROL] UF2_UPLOAD_END\n")
+            sys.stderr.flush()
+
+            uf2_active.clear()
+    finally:
+        s.close()
+
 def main():
     parser = argparse.ArgumentParser(description="com2tty WSL Bridge Helper")
     parser.add_argument(
@@ -197,8 +380,9 @@ def main():
     if args.rfc2217_port:
         inject_rc(args.rfc2217_port)
 
-    # Event to coordinate stdin/stdout access between PTY bridge and RFC 2217 forwarder
+    # Events to coordinate stdin/stdout access between PTY bridge, RFC 2217, and UF2 relay
     rfc2217_active = threading.Event()
+    uf2_active = threading.Event()
 
     try:
         master_fd, slave_fd = os.openpty()
@@ -237,12 +421,20 @@ def main():
 
         # Start RFC 2217 server thread if port is specified
         if args.rfc2217_port:
+            uf2_port = args.rfc2217_port + 1
+            setup_picotool_interceptor(uf2_port)
             t_rfc2217 = threading.Thread(
                 target=run_rfc2217_server_thread,
                 args=(args.rfc2217_port, rfc2217_active),
                 daemon=True
             )
             t_rfc2217.start()
+            t_uf2_relay = threading.Thread(
+                target=run_uf2_relay_thread,
+                args=(uf2_port, uf2_active),
+                daemon=True
+            )
+            t_uf2_relay.start()
             
         # Select loop
         # 0 is stdin, master_fd is the pseudo-terminal master
@@ -252,8 +444,8 @@ def main():
         last_settings = None
         
         while True:
-            # Yield stdin/stdout to RFC 2217 forwarder when active
-            if rfc2217_active.is_set():
+            # Yield stdin/stdout to RFC 2217 forwarder or UF2 relay when active
+            if rfc2217_active.is_set() or uf2_active.is_set():
                 import time
                 time.sleep(0.1)
                 continue
@@ -268,8 +460,8 @@ def main():
             # select blocks until data is available on stdin or master_fd
             r, w, x = select.select([0, master_fd], [], [], 0.5)
 
-            # Re-check after select returns (RFC 2217 might have activated during select)
-            if rfc2217_active.is_set():
+            # Re-check after select returns (RFC 2217 or UF2 might have activated during select)
+            if rfc2217_active.is_set() or uf2_active.is_set():
                 continue
             
             if 0 in r:
@@ -309,6 +501,7 @@ def main():
         # Clean up symlink and file descriptors
         if args.rfc2217_port:
             clean_rc()
+            cleanup_picotool_interceptor()
         if created_symlink:
             cleanup_symlink(created_symlink)
         if slave_fd is not None:
