@@ -27,6 +27,13 @@ def main():
     )
     
     parser.add_argument(
+        "--rfc2217-port",
+        type=int,
+        default=4000,
+        help="TCP port for RFC 2217 server (default: 4000)."
+    )
+    
+    parser.add_argument(
         "--bytesize",
         type=int,
         choices=[5, 6, 7, 8],
@@ -96,7 +103,8 @@ def main():
             stopbits=parsed_args.stopbits,
             xonxoff=parsed_args.xonxoff,
             rtscts=parsed_args.rtscts,
-            dsrdtr=parsed_args.dsrdtr
+            dsrdtr=parsed_args.dsrdtr,
+            rfc2217_port=parsed_args.rfc2217_port
         )
     except KeyboardInterrupt:
         logging.info("Interrupted by user. Exiting.")
