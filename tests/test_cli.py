@@ -16,8 +16,25 @@ class TestCli(unittest.TestCase):
         
         mock_run_bridge.assert_called_once_with(
             port="COM1",
-            baud=115200,
+            baud="115200",
             wsl_tty="/dev/ttyUSB1",
+            bytesize=8,
+            parity="N",
+            stopbits=1,
+            xonxoff=False,
+            rtscts=False,
+            dsrdtr=False
+        )
+
+    @patch("com2tty.cli.run_bridge")
+    @patch("sys.argv", ["com2tty", "COM2"])
+    def test_cli_defaults(self, mock_run_bridge):
+        main()
+        
+        mock_run_bridge.assert_called_once_with(
+            port="COM2",
+            baud="auto",
+            wsl_tty="/tmp/ttyUSB0",
             bytesize=8,
             parity="N",
             stopbits=1,

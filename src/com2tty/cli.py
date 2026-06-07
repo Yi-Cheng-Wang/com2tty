@@ -15,9 +15,9 @@ def main():
     
     parser.add_argument(
         "-b", "--baud",
-        type=int,
-        default=9600,
-        help="Baud rate for the serial port (default: 9600)."
+        type=str,
+        default="auto",
+        help="Baud rate for the serial port or 'auto' to match Windows (default: auto)."
     )
     
     parser.add_argument(

@@ -44,6 +44,20 @@ def get_serial_settings(bytesize, parity, stopbits):
         stopbits_map.get(stopbits, serial.STOPBITS_ONE)
     )
 
+def get_system_baudrate(port):
+    import re
+    try:
+        # mode.com prints system states for COM ports. 
+        # The keys may be localized, but the baudrate value is consistently the first large number.
+        res = subprocess.run(["mode.com", port], capture_output=True, text=True)
+        if res.returncode == 0:
+            match = re.search(r"\b(\d{3,7})\b", res.stdout)
+            if match:
+                return int(match.group(1))
+    except Exception as e:
+        logging.debug(f"Failed to auto-detect baudrate for {port}: {e}")
+    return None
+
 def read_wsl_stdout(proc, ser, shutdown_event):
     logging.debug("WSL-to-COM thread started.")
     try:
@@ -95,6 +109,17 @@ def run_bridge(port, baud, wsl_tty, bytesize, parity, stopbits, xonxoff, rtscts,
     # Resolve serial settings
     ser_bytesize, ser_parity, ser_stopbits = get_serial_settings(bytesize, parity, stopbits)
     
+    if str(baud).lower() == "auto":
+        detected_baud = get_system_baudrate(port)
+        if detected_baud:
+            logging.info(f"Auto-detected Windows COM port baudrate: {detected_baud} baud")
+            baud = detected_baud
+        else:
+            logging.warning("Failed to auto-detect baudrate, falling back to 9600 baud.")
+            baud = 9600
+    else:
+        baud = int(baud)
+        
     logging.info(f"Opening Windows serial port {port} at {baud} baud...")
     ser = serial.Serial(
         port=port,

@@ -47,6 +47,29 @@ class TestCom2TtyHost(unittest.TestCase):
         self.assertEqual(par, serial.PARITY_ODD)
         self.assertEqual(sb, serial.STOPBITS_ONE_POINT_FIVE)
 
+    @patch("subprocess.run")
+    def test_get_system_baudrate(self, mock_run):
+        from com2tty.host import get_system_baudrate
+        
+        # Test success (English and Localized output)
+        mock_res = MagicMock()
+        mock_res.returncode = 0
+        mock_res.stdout = "\n  Baud:            115200\n"
+        mock_run.return_value = mock_res
+        self.assertEqual(get_system_baudrate("COM1"), 115200)
+        
+        # Test no number found
+        mock_res.stdout = "No data here"
+        self.assertIsNone(get_system_baudrate("COM1"))
+        
+        # Test command failure
+        mock_res.returncode = 1
+        self.assertIsNone(get_system_baudrate("COM1"))
+        
+        # Test exception
+        mock_run.side_effect = Exception("missing mode.com")
+        self.assertIsNone(get_system_baudrate("COM1"))
+
     def test_read_wsl_stdout_normal(self):
         proc = MagicMock()
         ser = MagicMock()
@@ -118,24 +141,51 @@ class TestCom2TtyHost(unittest.TestCase):
         read_wsl_stderr(proc, shutdown_event)
         self.assertTrue(shutdown_event.is_set() is False)
 
+    @patch("com2tty.host.get_system_baudrate")
     @patch("com2tty.host.get_wsl_path")
     @patch("serial.Serial")
     @patch("subprocess.Popen")
     @patch("os.path.exists")
     @patch("threading.Thread")
     @patch("time.sleep")
-    def test_run_bridge(self, mock_sleep, mock_thread, mock_exists, mock_popen, mock_serial, mock_wsl_path):
+    def test_run_bridge(self, mock_sleep, mock_thread, mock_exists, mock_popen, mock_serial, mock_wsl_path, mock_get_sys_baud):
         mock_exists.return_value = True
         mock_wsl_path.return_value = "/wsl/bridge.py"
+        mock_get_sys_baud.return_value = 115200
         
         mock_proc = MagicMock()
         # Immediately pretend it exited to break loop
         mock_proc.poll.return_value = 0
         mock_popen.return_value = mock_proc
         
-        run_bridge("COM1", 9600, "/tmp/tty", 8, "N", 1, False, False, False)
+        run_bridge("COM1", "auto", "/tmp/tty", 8, "N", 1, False, False, False)
+        
+        # Ensure the baudrate used was the auto-detected 115200
+        mock_serial.assert_called_once()
+        self.assertEqual(mock_serial.call_args[1]["baudrate"], 115200)
         
         mock_proc.terminate.assert_not_called()
+
+    @patch("com2tty.host.get_system_baudrate")
+    @patch("com2tty.host.get_wsl_path")
+    @patch("serial.Serial")
+    @patch("subprocess.Popen")
+    @patch("os.path.exists")
+    @patch("threading.Thread")
+    @patch("time.sleep")
+    def test_run_bridge_auto_fallback(self, mock_sleep, mock_thread, mock_exists, mock_popen, mock_serial, mock_wsl_path, mock_get_sys_baud):
+        mock_exists.return_value = True
+        mock_wsl_path.return_value = "/wsl/bridge.py"
+        mock_get_sys_baud.return_value = None # Force fallback
+        
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 0
+        mock_popen.return_value = mock_proc
+        
+        run_bridge("COM1", "auto", "/tmp/tty", 8, "N", 1, False, False, False)
+        
+        # Ensure it fell back to 9600
+        self.assertEqual(mock_serial.call_args[1]["baudrate"], 9600)
 
     @patch("com2tty.host.get_wsl_path")
     @patch("serial.Serial")
