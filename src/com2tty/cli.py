@@ -15,15 +15,22 @@ def main():
     
     parser.add_argument(
         "-b", "--baud",
-        type=int,
-        default=9600,
-        help="Baud rate for the serial port (default: 9600)."
+        type=str,
+        default="auto",
+        help="Baud rate for the serial port or 'auto' to match Windows (default: auto)."
     )
     
     parser.add_argument(
         "-w", "--wsl-tty",
         default="/tmp/ttyUSB0",
         help="Target symlink path inside WSL (default: /tmp/ttyUSB0)."
+    )
+    
+    parser.add_argument(
+        "--rfc2217-port",
+        type=int,
+        default=4000,
+        help="TCP port for RFC 2217 server (default: 4000)."
     )
     
     parser.add_argument(
@@ -96,7 +103,8 @@ def main():
             stopbits=parsed_args.stopbits,
             xonxoff=parsed_args.xonxoff,
             rtscts=parsed_args.rtscts,
-            dsrdtr=parsed_args.dsrdtr
+            dsrdtr=parsed_args.dsrdtr,
+            rfc2217_port=parsed_args.rfc2217_port
         )
     except KeyboardInterrupt:
         logging.info("Interrupted by user. Exiting.")

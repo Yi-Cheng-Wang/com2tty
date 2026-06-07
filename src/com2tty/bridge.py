@@ -4,16 +4,172 @@ import select
 import argparse
 import signal
 import traceback
+import termios
+import threading
+import socket
+
+baud_map = {getattr(termios, k): int(k[1:]) for k in dir(termios) if k.startswith('B') and k[1:].isdigit()}
+
+MARKER_START = "# === COM2TTY INJECTION START ==="
+MARKER_END   = "# === COM2TTY INJECTION END ==="
+
+def get_rc_files():
+    home = os.path.expanduser("~")
+    return [os.path.join(home, ".bashrc")]
+
+def clean_rc():
+    for rc_path in get_rc_files():
+        if not os.path.exists(rc_path):
+            continue
+        try:
+            with open(rc_path, "r") as f:
+                lines = f.readlines()
+            new_lines = []
+            in_block = False
+            for line in lines:
+                if MARKER_START in line:
+                    in_block = True
+                    continue
+                if MARKER_END in line:
+                    in_block = False
+                    continue
+                if not in_block:
+                    new_lines.append(line)
+            with open(rc_path, "w") as f:
+                f.writelines(new_lines)
+            sys.stderr.write(f"Cleaned injection from {rc_path}\n")
+            sys.stderr.flush()
+        except Exception as e:
+            sys.stderr.write(f"Warning: could not clean {rc_path}: {e}\n")
+            sys.stderr.flush()
+
+def inject_rc(port):
+    clean_rc()
+    block = (
+        f"{MARKER_START}\n"
+        f"export PLATFORMIO_UPLOAD_PORT=rfc2217://127.0.0.1:{port}\n"
+        f"export PLATFORMIO_MONITOR_PORT=/tmp/ttyUSB0\n"
+        f"{MARKER_END}\n"
+    )
+    for rc_path in get_rc_files():
+        try:
+            with open(rc_path, "a") as f:
+                f.write(block)
+            sys.stderr.write(f"Injected environment variables to {rc_path}\n")
+            sys.stderr.flush()
+        except Exception as e:
+            sys.stderr.write(f"Warning: could not inject into {rc_path}: {e}\n")
+            sys.stderr.flush()
+
+def get_pty_settings(fd):
+    try:
+        attrs = termios.tcgetattr(fd)
+        speed = attrs[5]
+        baud = baud_map.get(speed)
+        cflag = attrs[2]
+        cs_mask = termios.CS5 | termios.CS6 | termios.CS7 | termios.CS8
+        cs_val = cflag & cs_mask
+        bytesize_map = {termios.CS5: 5, termios.CS6: 6, termios.CS7: 7, termios.CS8: 8}
+        bytesize = bytesize_map.get(cs_val, 8)
+        if cflag & termios.PARENB:
+            parity = 'O' if (cflag & termios.PARODD) else 'E'
+        else:
+            parity = 'N'
+        stopbits = '2' if (cflag & termios.CSTOPB) else '1'
+        return baud, bytesize, parity, stopbits
+    except Exception:
+        return None, None, None, None
 
 def cleanup_symlink(path):
-    if path and os.path.exists(path):
-        try:
+    try:
+        if os.path.lexists(path):
             os.unlink(path)
-            sys.stderr.write(f"Removed symlink: {path}\n")
+            sys.stderr.write(f"Removed symlink {path}\n")
             sys.stderr.flush()
-        except Exception as e: # pragma: no cover
-            sys.stderr.write(f"Failed to remove symlink {path}: {e}\n")
+    except Exception as e:
+        sys.stderr.write(f"Warning: Failed to remove symlink {path}: {e}\n")
+        sys.stderr.flush()
+
+def run_rfc2217_server_thread(port, rfc2217_active):
+    """
+    Long-lived TCP forwarder that runs as a thread inside the main bridge process.
+    Accepts esptool connections and relays data through stdin/stdout (shared with
+    the PTY bridge, coordinated by the rfc2217_active event).
+    """
+    import subprocess as sp
+
+    # Kill any leftover process from a previous com2tty session
+    try:
+        sp.run(["fuser", "-k", f"{port}/tcp"], capture_output=True, timeout=3)
+        import time
+        time.sleep(0.3)
+    except Exception:
+        pass
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind(('127.0.0.1', port))
+    except Exception as e:
+        sys.stderr.write(f"[CONTROL] RFC2217_ERROR: bind failed: {e}\n")
+        sys.stderr.flush()
+        return
+    s.listen(1)
+    s.settimeout(1.0)
+
+    sys.stderr.write(f"[CONTROL] RFC2217_READY:{port}\n")
+    sys.stderr.flush()
+
+    try:
+        while True:
+            try:
+                conn, addr = s.accept()
+            except socket.timeout:
+                continue
+            except Exception:
+                break
+
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+            # Signal connection to Windows side and pause PTY bridge
+            sys.stderr.write("[CONTROL] RFC2217_CONNECT\n")
             sys.stderr.flush()
+            rfc2217_active.set()
+            import time
+            time.sleep(0.3)  # Wait for main loop to yield stdin/stdout
+
+            conn.setblocking(False)
+
+            try:
+                while True:
+                    r, _, _ = select.select([0, conn], [], [], 0.5)
+                    if 0 in r:
+                        data = os.read(0, 4096)
+                        if not data:
+                            break
+                        conn.sendall(data)
+                    if conn in r:
+                        try:
+                            data = conn.recv(4096)
+                            if not data:
+                                break
+                            os.write(1, data)
+                        except BlockingIOError:
+                            continue
+                        except ConnectionResetError:
+                            break
+            except Exception as e:
+                sys.stderr.write(f"[CONTROL] RFC2217_ERROR: session: {e}\n")
+                sys.stderr.flush()
+            finally:
+                conn.close()
+
+            # Signal disconnection and resume PTY bridge
+            rfc2217_active.clear()
+            sys.stderr.write("[CONTROL] RFC2217_DISCONNECT\n")
+            sys.stderr.flush()
+    finally:
+        s.close()
 
 def main():
     parser = argparse.ArgumentParser(description="com2tty WSL Bridge Helper")
@@ -22,24 +178,35 @@ def main():
         required=True,
         help="Target symlink path for the pseudo-terminal device."
     )
+    parser.add_argument(
+        "-r", "--rfc2217-port",
+        type=int,
+        help="TCP port for RFC 2217 server to inject into bashrc and listen on"
+    )
     args = parser.parse_args()
-    
+
     target_path = args.symlink
     created_symlink = None
-    
+
     # We must keep both master and slave descriptors open.
     # Keeping slave_fd open prevents EIO errors on the master side when
     # WSL clients open and close the virtual serial port.
     master_fd = None
     slave_fd = None
-    
+
+    if args.rfc2217_port:
+        inject_rc(args.rfc2217_port)
+
+    # Event to coordinate stdin/stdout access between PTY bridge and RFC 2217 forwarder
+    rfc2217_active = threading.Event()
+
     try:
         master_fd, slave_fd = os.openpty()
         slave_name = os.ttyname(slave_fd)
-        
+
         sys.stderr.write(f"Created pseudo-terminal: master_fd={master_fd}, slave={slave_name}\n")
         sys.stderr.flush()
-        
+
         # Attempt to create the symlink at target path
         try:
             if os.path.lexists(target_path):
@@ -67,15 +234,43 @@ def main():
             sys.stderr.write(f"  sudo ln -sf {fallback_path} {target_path}\n")
             sys.stderr.write("--------------------------------------------------\n")
             sys.stderr.flush()
+
+        # Start RFC 2217 server thread if port is specified
+        if args.rfc2217_port:
+            t_rfc2217 = threading.Thread(
+                target=run_rfc2217_server_thread,
+                args=(args.rfc2217_port, rfc2217_active),
+                daemon=True
+            )
+            t_rfc2217.start()
             
         # Select loop
         # 0 is stdin, master_fd is the pseudo-terminal master
         sys.stderr.write("WSL bridge enter main loop.\n")
         sys.stderr.flush()
         
+        last_settings = None
+        
         while True:
+            # Yield stdin/stdout to RFC 2217 forwarder when active
+            if rfc2217_active.is_set():
+                import time
+                time.sleep(0.1)
+                continue
+
+            current_settings = get_pty_settings(master_fd)
+            if current_settings != last_settings and current_settings[0] is not None:
+                baud, bytesize, parity, stopbits = current_settings
+                sys.stderr.write(f"[CONTROL] SETTINGS: baud={baud} bytesize={bytesize} parity={parity} stopbits={stopbits}\n")
+                sys.stderr.flush()
+                last_settings = current_settings
+
             # select blocks until data is available on stdin or master_fd
-            r, w, x = select.select([0, master_fd], [], [])
+            r, w, x = select.select([0, master_fd], [], [], 0.5)
+
+            # Re-check after select returns (RFC 2217 might have activated during select)
+            if rfc2217_active.is_set():
+                continue
             
             if 0 in r:
                 data = os.read(0, 4096)
@@ -112,6 +307,8 @@ def main():
         sys.stderr.flush()
     finally:
         # Clean up symlink and file descriptors
+        if args.rfc2217_port:
+            clean_rc()
         if created_symlink:
             cleanup_symlink(created_symlink)
         if slave_fd is not None:
