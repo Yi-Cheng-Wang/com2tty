@@ -874,9 +874,10 @@ class TestReadWslStderr(unittest.TestCase):
 
         read_wsl_stderr(proc, ser, sd, rfc_evt, q, uf2_evt, uf2_q, "123456", "pico")
 
+        import os
         proc.stdin.write.assert_called_with(b"[CONTROL] UF2_ACK\n")
         mock_reset.assert_called_once_with(ser)
-        mock_open.assert_called_once_with("T:\\flash.uf2", "wb")
+        mock_open.assert_called_once_with(os.path.join("T:\\", "flash.uf2"), "wb")
         mock_open.return_value.__enter__.return_value.write.assert_called_once_with(bytearray(b"test"))
         self.assertFalse(uf2_evt.is_set())
 
@@ -1418,12 +1419,11 @@ class TestWindowCloserAndExplorer(unittest.TestCase):
         ]
         uf2_q.put(b"test")
 
-        # We need ctypes to be available; mock it at import level
-        import ctypes
-        mock_enum = MagicMock()
-        mock_enum.side_effect = lambda cb, _: None  # Don't actually enumerate
+        # Mock ctypes entirely to avoid importing it while os.name is patched to 'nt'
+        mock_ctypes = MagicMock()
+        mock_ctypes.windll.user32.EnumWindows.side_effect = lambda cb, _: None
 
-        with patch.dict('sys.modules', {'ctypes': ctypes}):
+        with patch.dict('sys.modules', {'ctypes': mock_ctypes}):
             read_wsl_stderr(proc, ser, sd, rfc_evt, q, uf2_evt, uf2_q, None, "pico")
 
     @patch("com2tty.host.os.name", "posix")
