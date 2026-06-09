@@ -76,6 +76,126 @@ options:
 
 ---
 
+## Gamepad Mode: forward an Xbox / XInput controller into WSL
+
+`usbipd` forwards a *raw USB device* into the WSL2 kernel, which then has to
+enumerate it and own the right driver (`xpad`). The stock WSL2 kernel ships
+**without** `CONFIG_JOYSTICK_XPAD`, so attaching an Xbox controller fails — the
+guest sees the USB device but never produces a usable `/dev/input/js*`.
+
+Gamepad mode sidesteps this entirely. Windows keeps doing what it is good at
+(USB enumeration + the rock-solid XInput driver); com2tty reads the controller
+state on the Windows side and streams it through the **same firewall-free
+stdin/stdout pipe** the serial bridge uses. Inside WSL, a tiny helper (Python
+**standard library only** — no `evdev`, no extra packages) turns it into a
+Linux **evdev event stream** for a "Microsoft X-Box 360 pad" (VID `045e`,
+PID `028e`).
+
+Just like the serial bridge — which defaults to a user-writable `/tmp/ttyUSB0`
+and only touches `/dev` when *you* choose to elevate — gamepad mode has **two
+tiers**:
+
+| | Endpoint | Root needed | Who can consume it |
+|---|---|---|---|
+| **Default (`--gamepad`)** | FIFO `/tmp/com2pad0` | **None** | anything that reads the evdev stream from that path |
+| **Opt-in (`--gamepad --uinput`)** | real `/dev/input/event*` | one-time setup | **any** SDL2 game / emulator / `evtest`, system-wide |
+
+```
+[Xbox controller] -> Windows XInput driver -> [com2tty host] -> stdin/stdout pipe
+   -> [WSL helper] --+-- default:  /tmp/com2pad0   (evdev byte stream, no root)
+                     '-- --uinput: /dev/uinput  -> /dev/input/event*  (real device)
+```
+
+Both tiers emit the **identical evdev `input_event` byte stream**, so one reader
+works against the `/tmp` FIFO *and* a real device node. com2tty itself **never
+needs administrator at runtime** in either tier.
+
+### Why `--uinput` needs a one-time setup (and the default doesn't)
+
+A `/tmp` FIFO is just a user-owned file — no privileges involved, which is why
+the default tier works immediately. A *real* input device is different: Linux's
+**only** way to create one from user space is `/dev/uinput`, and that is
+root-gated. Unlike the serial PTY, there is no user-space stand-in for a kernel
+input device, so the `/tmp` trick cannot conjure a system-wide controller —
+that is precisely what `--uinput` (and its one-time grant) buys you.
+
+### Default tier — zero setup
+
+```cmd
+com2tty --gamepad
+```
+
+Streams controller slot 0 to `/tmp/com2pad0` (override with `--wsl-pad`). No
+root, nothing to install. Consume it from WSL by reading 24-byte Linux
+`input_event` records from the FIFO (see the axis/button profile below).
+
+### Opt-in tier — `--uinput` (system-wide real device)
+
+```cmd
+com2tty --gamepad --uinput
+```
+
+Two things need a **one-time** root action (com2tty itself never elevates):
+
+1. `/dev/uinput` is `root 0600`, so com2tty can't open it to *create* the device.
+2. The resulting `/dev/input/event*` node is `root:input 0660`, so games can't
+   *read* it unless your user is in the `input` group.
+
+Run once inside WSL (use `sudo`, or `wsl -u root` from Windows — no password):
+
+```bash
+sudo modprobe uinput
+sudo chmod 0666 /dev/uinput
+sudo usermod -aG input "$USER"     # so apps can read /dev/input/event*
+```
+
+To make the uinput part survive `wsl --shutdown`, add this to `/etc/wsl.conf`
+(the `[boot]` command runs as root automatically on every WSL start, so you
+never need `sudo` again):
+
+```ini
+[boot]
+command = modprobe uinput && chmod 0666 /dev/uinput
+```
+
+Then run `wsl --shutdown` from Windows once (this also refreshes your group
+membership). If `/dev/uinput` is unavailable, com2tty prints these exact
+instructions and **automatically falls back to the `/tmp` stream** so it keeps
+working.
+
+> Note: the stock WSL2 kernel has `CONFIG_INPUT_UINPUT=m` (works) but
+> `CONFIG_INPUT_JOYDEV` is **not** set, so the legacy `/dev/input/js*` node is
+> absent. This is fine — modern apps and SDL2 read `/dev/input/event*` directly.
+
+### Options
+
+```
+--gamepad             Enable gamepad mode (no COM port needed).
+--pad-index {0,1,2,3} Which XInput controller slot to forward (default: 0).
+--pad-name NAME       Virtual device name (default: "Microsoft X-Box 360 pad").
+--poll-hz HZ          XInput polling rate, send-on-change (default: 250).
+--uinput              Create a real /dev/input device (needs one-time setup).
+--wsl-pad PATH        FIFO path for the default /tmp stream (default: /tmp/com2pad0).
+```
+
+### Device profile (both tiers)
+
+Linux event codes emitted: buttons `BTN_A/B/X/Y`, `BTN_TL/TR`, `BTN_SELECT`,
+`BTN_START`, `BTN_THUMBL/THUMBR`; axes `ABS_X/Y/RX/RY` (sticks, ±32768),
+`ABS_Z`/`ABS_RZ` (triggers, 0–255), `ABS_HAT0X/Y` (D-pad, −1..1). Stick Y axes
+are inverted to match Linux convention.
+
+### Verifying `--uinput` in WSL
+
+```bash
+sudo apt install evtest
+evtest                     # pick the "Microsoft X-Box 360 pad" device
+```
+
+Press buttons / move sticks on Windows and watch the events appear in WSL.
+
+---
+
 ## Configuring `/dev/ttyUSB0` in WSL (Highly Recommended)
 
 In Linux, the `/dev` directory is owned by `root`. Running `com2tty` as a normal Windows user means the WSL subprocess cannot write directly to `/dev/ttyUSB0`.
