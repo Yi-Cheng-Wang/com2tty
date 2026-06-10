@@ -746,6 +746,146 @@ $result | ConvertTo-Json -Compress
 
 
 
+def run_gamepad_bridge(pad_index=0, poll_hz=250, name="Microsoft X-Box 360 pad",
+                       use_uinput=False, tmp_path="/tmp/com2pad0"):
+    """
+    Forward a Windows XInput controller into WSL as a virtual gamepad.
+
+    The Windows host polls XInput (native driver, no usbipd needed) and streams
+    fixed-length frames through the same stdin/stdout pipe mechanism used by the
+    serial bridge. The WSL helper (pad_bridge.py) turns them into an evdev event
+    stream.
+
+    By default (``use_uinput=False``) the WSL side writes the event stream to a
+    user-writable FIFO under /tmp -- no root required, exactly like the serial
+    bridge's default /tmp/ttyUSB0 endpoint. With ``use_uinput=True`` it creates
+    a real system-wide /dev/input device (one-time root setup; it falls back to
+    the /tmp stream and prints instructions if /dev/uinput is not accessible).
+    com2tty itself never needs administrator at runtime.
+    """
+    from .xinput import GamepadSource
+
+    # Construct the source first so a missing controller/DLL fails fast on the
+    # Windows side with a clear message.
+    src = GamepadSource(pad_index)
+
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    pad_script = os.path.join(current_dir, "pad_bridge.py")
+    if not os.path.exists(pad_script):
+        raise FileNotFoundError(f"WSL gamepad bridge script not found at: {pad_script}")
+
+    wsl_pad_path = get_wsl_path(pad_script)
+    logging.info(f"WSL gamepad bridge script resolved to: {wsl_pad_path}")
+
+    cmd = ["wsl", "python3", "-u", wsl_pad_path,
+           "--pad-index", str(pad_index), "--name", name,
+           "--tmp-path", tmp_path]
+    if use_uinput:
+        cmd.append("--uinput")
+    logging.info(f"Spawning WSL process: {' '.join(cmd)}")
+
+    CREATE_NO_WINDOW = 0x08000000
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+        creationflags=CREATE_NO_WINDOW,
+    )
+
+    shutdown_event = threading.Event()
+
+    def read_wsl_logs():
+        """Surface WSL bridge stderr (status + one-time setup instructions)."""
+        try:
+            while not shutdown_event.is_set():
+                line = proc.stderr.readline()
+                if not line:
+                    break
+                msg = line.decode("utf-8", errors="replace").rstrip()
+                if msg:
+                    logging.info(f"[WSL] {msg}")
+        except Exception as e:
+            if not shutdown_event.is_set():
+                logging.debug(f"Error in WSL log thread: {e}")
+        finally:
+            shutdown_event.set()
+
+    def drain_wsl_stdout():
+        """Reverse channel (reserved for future rumble); drain to avoid blocking."""
+        try:
+            while not shutdown_event.is_set():
+                if not proc.stdout.read(1):
+                    break
+        except Exception:
+            pass
+
+    t_logs = threading.Thread(target=read_wsl_logs, daemon=True)
+    t_out = threading.Thread(target=drain_wsl_stdout, daemon=True)
+    t_logs.start()
+    t_out.start()
+
+    yellow = "\033[93m"
+    cyan = "\033[96m"
+    green = "\033[92m"
+    reset = "\033[0m"
+    if use_uinput:
+        sink_mode = "uinput (real /dev/input device, one-time root)"
+        sink_node = "/dev/input/event* (SDL2-ready)"
+    else:
+        sink_mode = "/tmp evdev stream (no root, default)"
+        sink_node = tmp_path
+    print(f"\n{yellow}========================================================================{reset}")
+    print(f"{yellow}  com2tty Gamepad Bridge Active{reset}")
+    print(f"{yellow}------------------------------------------------------------------------{reset}")
+    print(f"{cyan}  Mode                 : {green}XInput -> WSL ({sink_mode}){reset}")
+    print(f"{cyan}  Controller slot      : {green}{pad_index}{reset}")
+    print(f"{cyan}  Virtual device       : {green}{name}{reset}")
+    print(f"{cyan}  WSL endpoint         : {green}{sink_node}{reset}")
+    print(f"{cyan}  Poll rate            : {poll_hz} Hz (send-on-change){reset}")
+    print(f"{yellow}========================================================================{reset}\n")
+
+    logging.info("Gamepad bridge is active. Press Ctrl+C to stop.")
+
+    interval = 1.0 / float(poll_hz)
+    heartbeat = 0.5  # seconds; keep the pipe warm even when idle
+    last_send = 0.0
+
+    try:
+        while not shutdown_event.is_set():
+            if proc.poll() is not None:
+                logging.info("WSL gamepad subprocess exited.")
+                break
+
+            changed, frame = src.poll()
+            now = time.time()
+            if changed or (now - last_send) >= heartbeat:
+                try:
+                    proc.stdin.write(frame)
+                    proc.stdin.flush()
+                    last_send = now
+                except (BrokenPipeError, OSError):
+                    logging.info("WSL pipe closed.")
+                    break
+
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        logging.info("Stopping gamepad bridge due to KeyboardInterrupt...")
+    finally:
+        shutdown_event.set()
+        logging.info("Cleaning up gamepad bridge...")
+        if proc.poll() is None:
+            logging.info("Terminating WSL process...")
+            proc.terminate()
+            try:
+                proc.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                logging.warning("WSL process did not exit. Killing it.")
+                proc.kill()
+        logging.info("Gamepad bridge stopped successfully.")
+
+
 def run_bridge(port, baud, wsl_tty, bytesize, parity, stopbits, xonxoff, rtscts, dsrdtr, rfc2217_port):
     # Resolve serial settings
     ser_bytesize, ser_parity, ser_stopbits = get_serial_settings(bytesize, parity, stopbits)

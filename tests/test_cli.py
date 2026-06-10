@@ -76,5 +76,80 @@ class TestCli(unittest.TestCase):
         mock_exit.assert_called_once_with(1)
 
 
+class TestCliGamepad(unittest.TestCase):
+
+    @patch("com2tty.cli.run_gamepad_bridge")
+    @patch("sys.argv", ["com2tty", "--gamepad"])
+    def test_gamepad_defaults(self, mock_pad):
+        main()
+        mock_pad.assert_called_once_with(
+            pad_index=0,
+            poll_hz=250,
+            name="Microsoft X-Box 360 pad",
+            use_uinput=False,
+            tmp_path="/tmp/com2pad0",
+        )
+
+    @patch("com2tty.cli.run_gamepad_bridge")
+    @patch("sys.argv", ["com2tty", "--gamepad", "--pad-index", "2",
+                         "--poll-hz", "500", "--pad-name", "Custom Pad",
+                         "--uinput", "--wsl-pad", "/tmp/mypad"])
+    def test_gamepad_options(self, mock_pad):
+        main()
+        mock_pad.assert_called_once_with(
+            pad_index=2,
+            poll_hz=500,
+            name="Custom Pad",
+            use_uinput=True,
+            tmp_path="/tmp/mypad",
+        )
+
+    @patch("com2tty.cli.run_gamepad_bridge")
+    @patch("sys.argv", ["com2tty", "--gamepad"])
+    def test_gamepad_defaults_to_tmp_not_uinput(self, mock_pad):
+        main()
+        self.assertFalse(mock_pad.call_args[1]["use_uinput"])
+
+    @patch("com2tty.cli.run_bridge")
+    @patch("com2tty.cli.run_gamepad_bridge")
+    @patch("sys.argv", ["com2tty", "--gamepad"])
+    def test_gamepad_does_not_call_serial(self, mock_pad, mock_serial):
+        main()
+        mock_pad.assert_called_once()
+        mock_serial.assert_not_called()
+
+    @patch("sys.argv", ["com2tty"])
+    def test_missing_port_without_gamepad_errors(self):
+        # argparse parser.error raises SystemExit
+        with self.assertRaises(SystemExit):
+            main()
+
+    @patch("com2tty.cli.run_gamepad_bridge")
+    @patch("sys.exit")
+    @patch("sys.argv", ["com2tty", "--gamepad"])
+    def test_gamepad_keyboard_interrupt(self, mock_exit, mock_pad):
+        mock_pad.side_effect = KeyboardInterrupt()
+        main()
+        mock_exit.assert_called_once_with(0)
+
+    @patch("com2tty.cli.run_gamepad_bridge")
+    @patch("sys.exit")
+    @patch("sys.argv", ["com2tty", "--gamepad"])
+    def test_gamepad_fatal_error_no_debug(self, mock_exit, mock_pad):
+        mock_pad.side_effect = Exception("boom")
+        main()
+        mock_exit.assert_called_once_with(1)
+
+    @patch("traceback.print_exc")
+    @patch("com2tty.cli.run_gamepad_bridge")
+    @patch("sys.exit")
+    @patch("sys.argv", ["com2tty", "--gamepad", "--debug"])
+    def test_gamepad_fatal_error_with_debug(self, mock_exit, mock_pad, mock_tb):
+        mock_pad.side_effect = Exception("boom")
+        main()
+        mock_exit.assert_called_once_with(1)
+        mock_tb.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
