@@ -1,0 +1,536 @@
+"""
+com2tty WSL Gamepad Bridge Helper.
+
+Runs *inside* WSL. Reads fixed-length controller frames from stdin (fed by the
+Windows host, which polls XInput) and turns them into a Linux evdev
+``input_event`` stream representing a "Microsoft X-Box 360 pad".
+
+It supports two sinks, mirroring com2tty's serial bridge philosophy of
+defaulting to a user-writable ``/tmp`` endpoint and only touching ``/dev`` when
+the user opts in and grants access:
+
+* **TmpStreamGamepad (default, no root):** writes the evdev event stream to a
+  FIFO under ``/tmp`` (e.g. ``/tmp/com2pad0``). Identical bytes to what a real
+  ``/dev/input/eventN`` would emit, so a single reader works against both.
+* **UinputGamepad (``--uinput``, one-time root):** creates a real, system-wide
+  ``/dev/input/event*`` device via ``/dev/uinput`` so SDL2 games and emulators
+  see a normally-inserted controller. Falls back to the ``/tmp`` stream if
+  ``/dev/uinput`` is not accessible.
+
+This module deliberately uses *only* the Python standard library (ctypes,
+struct, fcntl, os) so that the WSL guest needs no extra packages.
+
+Frame format (16 bytes, little-endian), see ``xinput.py`` on the host side::
+
+    <BBBBHBBhhhh>
+     |||| | || \\\\__ sThumbLX/LY/RX/RY  (int16)
+     |||| | \\______ bLeftTrigger / bRightTrigger (uint8)
+     |||| \\________ wButtons (uint16, XInput bitmask)
+     |||\\__________ flags  (bit0 = controller connected)
+     ||\\___________ pad index (0-3)
+     \\\\___________ magic 0xAB 0xCD
+"""
+import os
+import sys
+import stat
+import struct
+import argparse
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows import guard for unit tests
+    fcntl = None
+
+DEFAULT_TMP_PAD = "/tmp/com2pad0"
+
+
+# --------------------------------------------------------------------------- #
+# ioctl number construction (Linux asm-generic, valid on x86_64 WSL2)
+# --------------------------------------------------------------------------- #
+_IOC_NRBITS = 8
+_IOC_TYPEBITS = 8
+_IOC_SIZEBITS = 14
+
+_IOC_NRSHIFT = 0
+_IOC_TYPESHIFT = _IOC_NRSHIFT + _IOC_NRBITS      # 8
+_IOC_SIZESHIFT = _IOC_TYPESHIFT + _IOC_TYPEBITS  # 16
+_IOC_DIRSHIFT = _IOC_SIZESHIFT + _IOC_SIZEBITS   # 30
+
+_IOC_NONE = 0
+_IOC_WRITE = 1
+
+
+def _IOC(direction, typ, nr, size):
+    return ((direction << _IOC_DIRSHIFT) | (typ << _IOC_TYPESHIFT) |
+            (nr << _IOC_NRSHIFT) | (size << _IOC_SIZESHIFT))
+
+
+def _IO(typ, nr):
+    return _IOC(_IOC_NONE, typ, nr, 0)
+
+
+def _IOW(typ, nr, size):
+    return _IOC(_IOC_WRITE, typ, nr, size)
+
+
+UINPUT_IOCTL_BASE = ord('U')
+UI_DEV_CREATE = _IO(UINPUT_IOCTL_BASE, 1)
+UI_DEV_DESTROY = _IO(UINPUT_IOCTL_BASE, 2)
+UI_SET_EVBIT = _IOW(UINPUT_IOCTL_BASE, 100, 4)
+UI_SET_KEYBIT = _IOW(UINPUT_IOCTL_BASE, 101, 4)
+UI_SET_ABSBIT = _IOW(UINPUT_IOCTL_BASE, 103, 4)
+
+
+# --------------------------------------------------------------------------- #
+# Linux input event constants (from linux/input-event-codes.h)
+# --------------------------------------------------------------------------- #
+EV_SYN = 0x00
+EV_KEY = 0x01
+EV_ABS = 0x03
+SYN_REPORT = 0x00
+
+BTN_A = 0x130
+BTN_B = 0x131
+BTN_X = 0x133
+BTN_Y = 0x134
+BTN_TL = 0x136
+BTN_TR = 0x137
+BTN_SELECT = 0x13a
+BTN_START = 0x13b
+BTN_MODE = 0x13c
+BTN_THUMBL = 0x13d
+BTN_THUMBR = 0x13e
+
+ABS_X = 0x00
+ABS_Y = 0x01
+ABS_Z = 0x02
+ABS_RX = 0x03
+ABS_RY = 0x04
+ABS_RZ = 0x05
+ABS_HAT0X = 0x10
+ABS_HAT0Y = 0x11
+
+ABS_CNT = 64
+UINPUT_MAX_NAME_SIZE = 80
+
+# XInput button bitmasks -> Linux button codes.
+XINPUT_BUTTON_MAP = [
+    (0x1000, BTN_A),
+    (0x2000, BTN_B),
+    (0x4000, BTN_X),
+    (0x8000, BTN_Y),
+    (0x0100, BTN_TL),       # Left shoulder (LB)
+    (0x0200, BTN_TR),       # Right shoulder (RB)
+    (0x0020, BTN_SELECT),   # Back
+    (0x0010, BTN_START),    # Start
+    (0x0040, BTN_THUMBL),   # Left stick click
+    (0x0080, BTN_THUMBR),   # Right stick click
+]
+
+# XInput D-pad bitmasks (synthesised into HAT axes).
+XI_DPAD_UP = 0x0001
+XI_DPAD_DOWN = 0x0002
+XI_DPAD_LEFT = 0x0004
+XI_DPAD_RIGHT = 0x0008
+
+# All buttons we advertise (declared as capabilities).
+DECLARED_BUTTONS = [
+    BTN_A, BTN_B, BTN_X, BTN_Y, BTN_TL, BTN_TR,
+    BTN_SELECT, BTN_START, BTN_MODE, BTN_THUMBL, BTN_THUMBR,
+]
+
+# Axis -> (min, max, fuzz, flat) matching a real Xbox 360 pad.
+AXIS_INFO = {
+    ABS_X:    (-32768, 32767, 16, 128),
+    ABS_Y:    (-32768, 32767, 16, 128),
+    ABS_RX:   (-32768, 32767, 16, 128),
+    ABS_RY:   (-32768, 32767, 16, 128),
+    ABS_Z:    (0, 255, 0, 0),
+    ABS_RZ:   (0, 255, 0, 0),
+    ABS_HAT0X: (-1, 1, 0, 0),
+    ABS_HAT0Y: (-1, 1, 0, 0),
+}
+
+FRAME_MAGIC0 = 0xAB
+FRAME_MAGIC1 = 0xCD
+FRAME_FORMAT = "<BBBBHBBhhhh"
+FRAME_SIZE = struct.calcsize(FRAME_FORMAT)  # 16
+
+
+def _clamp(value, lo, hi):
+    return lo if value < lo else (hi if value > hi else value)
+
+
+def build_uinput_user_dev(name, vendor, product, version, bustype=0x03):
+    """Pack a ``struct uinput_user_dev`` (legacy device-creation method).
+
+    Layout (no padding inserted on x86_64)::
+
+        char  name[80];
+        struct input_id { u16 bustype, vendor, product, version; };
+        u32   ff_effects_max;
+        s32   absmax[64]; absmin[64]; absfuzz[64]; absflat[64];
+    """
+    name_bytes = name.encode("utf-8")[:UINPUT_MAX_NAME_SIZE - 1]
+
+    absmax = [0] * ABS_CNT
+    absmin = [0] * ABS_CNT
+    absfuzz = [0] * ABS_CNT
+    absflat = [0] * ABS_CNT
+    for code, (mn, mx, fz, fl) in AXIS_INFO.items():
+        absmin[code] = mn
+        absmax[code] = mx
+        absfuzz[code] = fz
+        absflat[code] = fl
+
+    return struct.pack(
+        "=%dsHHHHI%di" % (UINPUT_MAX_NAME_SIZE, ABS_CNT * 4),
+        name_bytes,
+        bustype, vendor, product, version,
+        0,  # ff_effects_max
+        *(absmax + absmin + absfuzz + absflat),
+    )
+
+
+def encode_event(etype, code, value):
+    """Pack a ``struct input_event`` for a 64-bit kernel.
+
+    ``struct timeval`` is two 64-bit longs on x86_64; the kernel timestamps
+    uinput writes itself, so zeros are fine.
+    """
+    return struct.pack("=qqHHi", 0, 0, etype, code, value)
+
+
+def parse_frame(frame):
+    """Parse a 16-byte controller frame into a state dict, or ``None``."""
+    if len(frame) != FRAME_SIZE:
+        return None
+    (m0, m1, index, flags, buttons, lt, rt,
+     lx, ly, rx, ry) = struct.unpack(FRAME_FORMAT, frame)
+    if m0 != FRAME_MAGIC0 or m1 != FRAME_MAGIC1:
+        return None
+    return {
+        "index": index,
+        "connected": bool(flags & 0x01),
+        "buttons": buttons,
+        "lt": lt,
+        "rt": rt,
+        "lx": lx,
+        "ly": ly,
+        "rx": rx,
+        "ry": ry,
+    }
+
+
+def state_to_events(state):
+    """Translate a parsed controller state into a list of (type, code, value).
+
+    When the controller is disconnected, everything is reported as neutral so
+    the virtual device stays present but idle (avoids the device vanishing
+    mid-game).
+    """
+    events = []
+    connected = state["connected"]
+    buttons = state["buttons"] if connected else 0
+
+    for mask, code in XINPUT_BUTTON_MAP:
+        events.append((EV_KEY, code, 1 if (buttons & mask) else 0))
+
+    # D-pad -> HAT axes (Linux convention: up/left are negative).
+    hat_x = 0
+    hat_y = 0
+    if buttons & XI_DPAD_LEFT:
+        hat_x = -1
+    elif buttons & XI_DPAD_RIGHT:
+        hat_x = 1
+    if buttons & XI_DPAD_UP:
+        hat_y = -1
+    elif buttons & XI_DPAD_DOWN:
+        hat_y = 1
+    events.append((EV_ABS, ABS_HAT0X, hat_x))
+    events.append((EV_ABS, ABS_HAT0Y, hat_y))
+
+    if connected:
+        lx, ly, rx, ry = state["lx"], state["ly"], state["rx"], state["ry"]
+        lt, rt = state["lt"], state["rt"]
+    else:
+        lx = ly = rx = ry = 0
+        lt = rt = 0
+
+    # Y axes are inverted: XInput up is positive, Linux ABS down is positive.
+    events.append((EV_ABS, ABS_X, _clamp(lx, -32768, 32767)))
+    events.append((EV_ABS, ABS_Y, _clamp(-ly, -32768, 32767)))
+    events.append((EV_ABS, ABS_RX, _clamp(rx, -32768, 32767)))
+    events.append((EV_ABS, ABS_RY, _clamp(-ry, -32768, 32767)))
+    events.append((EV_ABS, ABS_Z, _clamp(lt, 0, 255)))
+    events.append((EV_ABS, ABS_RZ, _clamp(rt, 0, 255)))
+    return events
+
+
+class FrameReader:
+    """Resynchronising parser for the fixed-length frame stream.
+
+    Tolerates partial reads and stray bytes by scanning for the magic prefix.
+    """
+
+    def __init__(self):
+        self._buf = bytearray()
+
+    def feed(self, data):
+        """Add raw bytes, yield every complete, magic-aligned frame."""
+        self._buf.extend(data)
+        frames = []
+        while True:
+            # Drop bytes until the buffer starts with a plausible magic byte.
+            start = self._buf.find(FRAME_MAGIC0)
+            if start == -1:
+                self._buf.clear()
+                break
+            if start > 0:
+                del self._buf[:start]
+            if len(self._buf) < FRAME_SIZE:
+                break
+            if self._buf[1] != FRAME_MAGIC1:
+                # False positive on magic0; skip it and keep scanning.
+                del self._buf[0]
+                continue
+            frame = bytes(self._buf[:FRAME_SIZE])
+            del self._buf[:FRAME_SIZE]
+            parsed = parse_frame(frame)
+            if parsed is not None:
+                frames.append(parsed)
+        return frames
+
+
+SETUP_INSTRUCTIONS = """\
+[CONTROL] PAD_PERMISSION_ERROR
+--------------------------------------------------------------------
+com2tty gamepad bridge cannot access /dev/uinput.
+
+This needs a ONE-TIME setup with root (com2tty itself never needs
+administrator at runtime). Run these once inside WSL:
+
+  sudo modprobe uinput
+  sudo chmod 0666 /dev/uinput
+
+To make it persist across `wsl --shutdown`, add to /etc/wsl.conf:
+
+  [boot]
+  command = modprobe uinput && chmod 0666 /dev/uinput
+
+then run `wsl --shutdown` from Windows and start com2tty again.
+--------------------------------------------------------------------"""
+
+
+def encode_report(events):
+    """Serialise a list of (type, code, value) plus a trailing SYN_REPORT.
+
+    This is exactly the byte stream a real ``/dev/input/eventN`` emits, so both
+    sinks (uinput and the /tmp FIFO) share it and a single reader is portable.
+    """
+    blob = bytearray()
+    for etype, code, value in events:
+        blob += encode_event(etype, code, value)
+    blob += encode_event(EV_SYN, SYN_REPORT, 0)
+    return bytes(blob)
+
+
+class GamepadSink:
+    """Common base: turns controller events into an evdev report and writes it."""
+
+    label = "gamepad"
+
+    def open(self):  # pragma: no cover - overridden
+        raise NotImplementedError
+
+    def _write(self, blob):  # pragma: no cover - overridden
+        raise NotImplementedError
+
+    def emit(self, events):
+        self._write(encode_report(events))
+
+    def close(self):  # pragma: no cover - overridden
+        pass
+
+
+class TmpStreamGamepad(GamepadSink):
+    """Default, root-free sink: an evdev event stream over a ``/tmp`` FIFO.
+
+    Mirrors the serial bridge's ``/tmp/ttyUSB0`` approach. The FIFO is opened
+    O_RDWR so the bridge always holds a reader end (writes never raise on a
+    missing consumer); when no real consumer is draining and the pipe buffer
+    fills, writes are dropped (only the latest controller state matters).
+    """
+
+    def __init__(self, path=DEFAULT_TMP_PAD,
+                 name="Microsoft X-Box 360 pad", **_ignored):
+        self.path = path
+        self.name = name
+        self.fd = None
+
+    def open(self):
+        # Replace a stale non-FIFO file if one is in the way.
+        if os.path.lexists(self.path):
+            try:
+                if not stat.S_ISFIFO(os.stat(self.path).st_mode):
+                    os.unlink(self.path)
+            except OSError:
+                os.unlink(self.path)
+        if not os.path.exists(self.path):
+            os.mkfifo(self.path, 0o666)
+        self.fd = os.open(self.path, os.O_RDWR | os.O_NONBLOCK)
+
+    def _write(self, blob):
+        try:
+            os.write(self.fd, blob)
+        except BlockingIOError:
+            pass  # no consumer / buffer full -> drop, keep latest state policy
+        except OSError:
+            pass
+
+    def close(self):
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except Exception:
+                pass
+            self.fd = None
+        try:
+            if os.path.lexists(self.path):
+                os.unlink(self.path)
+        except Exception:
+            pass
+
+
+class UinputGamepad(GamepadSink):
+    """Opt-in system-wide sink: a real device via ``/dev/uinput``."""
+
+    label = "uinput"
+
+    def __init__(self, name="Microsoft X-Box 360 pad",
+                 vendor=0x045e, product=0x028e, version=0x0110, **_ignored):
+        self.name = name
+        self.vendor = vendor
+        self.product = product
+        self.version = version
+        self.fd = None
+
+    def open(self):
+        if fcntl is None:  # pragma: no cover
+            raise OSError("fcntl unavailable (not running on Linux)")
+        # O_WRONLY | O_NONBLOCK
+        self.fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+
+        fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_KEY)
+        fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_ABS)
+        fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_SYN)
+        for code in DECLARED_BUTTONS:
+            fcntl.ioctl(self.fd, UI_SET_KEYBIT, code)
+        for code in AXIS_INFO:
+            fcntl.ioctl(self.fd, UI_SET_ABSBIT, code)
+
+        dev = build_uinput_user_dev(self.name, self.vendor,
+                                    self.product, self.version)
+        os.write(self.fd, dev)
+        fcntl.ioctl(self.fd, UI_DEV_CREATE)
+
+    def _write(self, blob):
+        os.write(self.fd, blob)
+
+    def close(self):
+        if self.fd is not None:
+            try:
+                fcntl.ioctl(self.fd, UI_DEV_DESTROY)
+            except Exception:
+                pass
+            try:
+                os.close(self.fd)
+            except Exception:
+                pass
+            self.fd = None
+
+
+def _open_sink(use_uinput, tmp_path, name):
+    """Resolve the sink, mirroring the serial bridge's /dev->/tmp fallback.
+
+    Returns ``(sink, ready_message)``. In --uinput mode, if /dev/uinput is not
+    accessible we print the one-time setup instructions and transparently fall
+    back to the root-free /tmp stream so the bridge still works.
+    """
+    if use_uinput:
+        sink = UinputGamepad(name=name)
+        try:
+            sink.open()
+            return sink, ("[CONTROL] PAD_READY: real device '%s' created "
+                          "(/dev/input/event*). Bridge active." % name)
+        except (PermissionError, FileNotFoundError, OSError) as exc:
+            sys.stderr.write(
+                "[CONTROL] PAD_UINPUT_UNAVAILABLE: %s\n" % exc)
+            sys.stderr.write(SETUP_INSTRUCTIONS + "\n")
+            sys.stderr.write(
+                "Falling back to the root-free /tmp stream at %s ...\n"
+                % tmp_path)
+            sys.stderr.flush()
+
+    sink = TmpStreamGamepad(path=tmp_path, name=name)
+    sink.open()
+    return sink, ("[CONTROL] PAD_READY: evdev stream at %s (no root). "
+                  "Bridge active." % tmp_path)
+
+
+def main(argv=None):  # pragma: no cover - integration entry point
+    parser = argparse.ArgumentParser(description="com2tty WSL Gamepad Bridge")
+    parser.add_argument("-i", "--pad-index", type=int, default=0,
+                        help="Controller index this bridge represents (0-3).")
+    parser.add_argument("-n", "--name", default="Microsoft X-Box 360 pad",
+                        help="Virtual device name advertised to Linux.")
+    parser.add_argument("-u", "--uinput", action="store_true",
+                        help="Create a real /dev/input device via /dev/uinput "
+                             "(needs one-time root setup). Default is the "
+                             "root-free /tmp evdev stream.")
+    parser.add_argument("-p", "--tmp-path", default=DEFAULT_TMP_PAD,
+                        help="FIFO path for the /tmp stream sink "
+                             "(default: %s)." % DEFAULT_TMP_PAD)
+    args = parser.parse_args(argv)
+
+    try:
+        pad, ready_msg = _open_sink(args.uinput, args.tmp_path, args.name)
+    except Exception as exc:
+        sys.stderr.write(f"[CONTROL] PAD_ERROR: cannot init sink: {exc}\n")
+        sys.stderr.flush()
+        return 13
+
+    sys.stderr.write(ready_msg + "\n")
+    sys.stderr.flush()
+
+    reader = FrameReader()
+    # Emit an initial neutral state so the device reads as centred/idle.
+    pad.emit(state_to_events(parse_frame(struct.pack(
+        FRAME_FORMAT, FRAME_MAGIC0, FRAME_MAGIC1, args.pad_index,
+        0, 0, 0, 0, 0, 0, 0, 0))))
+
+    try:
+        while True:
+            data = os.read(0, 4096)
+            if not data:
+                sys.stderr.write("EOF on stdin. Exiting.\n")
+                sys.stderr.flush()
+                break
+            for state in reader.feed(data):
+                if state["index"] != args.pad_index:
+                    continue
+                pad.emit(state_to_events(state))
+    except KeyboardInterrupt:  # pragma: no cover
+        pass
+    except Exception as exc:  # pragma: no cover
+        sys.stderr.write(f"[CONTROL] PAD_ERROR: {exc}\n")
+        sys.stderr.flush()
+    finally:
+        pad.close()
+        sys.stderr.write("WSL gamepad bridge shut down.\n")
+        sys.stderr.flush()
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(main())
