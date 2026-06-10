@@ -132,6 +132,24 @@ class TestCliGamepad(unittest.TestCase):
         main()
         mock_exit.assert_called_once_with(0)
 
+    @patch("com2tty.cli.run_gamepad_bridge")
+    @patch("sys.exit")
+    @patch("sys.argv", ["com2tty", "--gamepad"])
+    def test_gamepad_fatal_error_no_debug(self, mock_exit, mock_pad):
+        mock_pad.side_effect = Exception("boom")
+        main()
+        mock_exit.assert_called_once_with(1)
+
+    @patch("traceback.print_exc")
+    @patch("com2tty.cli.run_gamepad_bridge")
+    @patch("sys.exit")
+    @patch("sys.argv", ["com2tty", "--gamepad", "--debug"])
+    def test_gamepad_fatal_error_with_debug(self, mock_exit, mock_pad, mock_tb):
+        mock_pad.side_effect = Exception("boom")
+        main()
+        mock_exit.assert_called_once_with(1)
+        mock_tb.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

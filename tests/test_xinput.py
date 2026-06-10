@@ -98,5 +98,39 @@ class TestGamepadSource(unittest.TestCase):
         self.assertTrue(changed3)
 
 
+class TestLoadXinput(unittest.TestCase):
+
+    class _OkLoader:
+        def __getattr__(self, name):
+            return "dll-" + name
+
+    class _FailLoader:
+        def __getattr__(self, name):
+            raise OSError("no such dll")
+
+    class _SecondOkLoader:
+        def __getattr__(self, name):
+            if name == "xinput1_4":
+                raise OSError("missing")
+            return "dll-" + name
+
+    def test_returns_first_available_dll(self):
+        with patch("com2tty.xinput.ctypes") as mc:
+            mc.windll = self._OkLoader()
+            self.assertEqual(xi._load_xinput(), "dll-xinput1_4")
+
+    def test_falls_through_to_next_dll(self):
+        with patch("com2tty.xinput.ctypes") as mc:
+            mc.windll = self._SecondOkLoader()
+            # xinput1_4 fails, so the next candidate (xinput1_3) is used.
+            self.assertEqual(xi._load_xinput(), "dll-xinput1_3")
+
+    def test_raises_when_no_dll_found(self):
+        with patch("com2tty.xinput.ctypes") as mc:
+            mc.windll = self._FailLoader()
+            with self.assertRaises(OSError):
+                xi._load_xinput()
+
+
 if __name__ == "__main__":
     unittest.main()

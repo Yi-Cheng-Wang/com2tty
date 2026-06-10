@@ -2,6 +2,7 @@ import os
 import sys
 import struct
 import unittest
+from unittest.mock import patch, MagicMock
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
@@ -96,6 +97,8 @@ class TestStateToEvents(unittest.TestCase):
         self.assertEqual(self._find(ev, pb.EV_ABS, pb.ABS_HAT0X), 1)
         ev = pb.state_to_events(self._state(buttons=0x0001))  # UP
         self.assertEqual(self._find(ev, pb.EV_ABS, pb.ABS_HAT0Y), -1)
+        ev = pb.state_to_events(self._state(buttons=0x0002))  # DOWN
+        self.assertEqual(self._find(ev, pb.EV_ABS, pb.ABS_HAT0Y), 1)
 
     def test_y_axis_inverted(self):
         ev = pb.state_to_events(self._state(ly=100, ry=-200))
@@ -203,6 +206,216 @@ class TestSinkEmit(unittest.TestCase):
         # TmpStreamGamepad and UinputGamepad share the event report format.
         self.assertTrue(issubclass(pb.TmpStreamGamepad, pb.GamepadSink))
         self.assertTrue(issubclass(pb.UinputGamepad, pb.GamepadSink))
+
+
+class TestTmpStreamGamepad(unittest.TestCase):
+    """The FIFO sink uses Linux syscalls; mock os.* so it runs anywhere.
+
+    os.O_NONBLOCK and os.mkfifo do not exist on Windows, so they are patched
+    with create=True to let these tests run on any platform.
+    """
+
+    @patch("com2tty.pad_bridge.os.O_NONBLOCK", 2048, create=True)
+    @patch("com2tty.pad_bridge.os.open", return_value=7)
+    @patch("com2tty.pad_bridge.os.mkfifo", create=True)
+    @patch("com2tty.pad_bridge.os.path.exists", return_value=False)
+    @patch("com2tty.pad_bridge.os.path.lexists", return_value=False)
+    def test_open_creates_fifo(self, m_lexists, m_exists, m_mkfifo, m_open):
+        sink = pb.TmpStreamGamepad(path="/tmp/p")
+        sink.open()
+        m_mkfifo.assert_called_once_with("/tmp/p", 0o666)
+        self.assertEqual(sink.fd, 7)
+
+    @patch("com2tty.pad_bridge.os.O_NONBLOCK", 2048, create=True)
+    @patch("com2tty.pad_bridge.os.open", return_value=7)
+    @patch("com2tty.pad_bridge.os.mkfifo", create=True)
+    @patch("com2tty.pad_bridge.os.path.exists", return_value=True)
+    @patch("com2tty.pad_bridge.os.unlink")
+    @patch("com2tty.pad_bridge.stat.S_ISFIFO", return_value=False)
+    @patch("com2tty.pad_bridge.os.stat")
+    @patch("com2tty.pad_bridge.os.path.lexists", return_value=True)
+    def test_open_replaces_stale_non_fifo(self, m_lex, m_stat, m_isfifo,
+                                          m_unlink, m_exists, m_mkfifo, m_open):
+        sink = pb.TmpStreamGamepad(path="/tmp/p")
+        sink.open()
+        m_unlink.assert_called_once_with("/tmp/p")
+        # exists() returned True so mkfifo is skipped.
+        m_mkfifo.assert_not_called()
+
+    @patch("com2tty.pad_bridge.os.O_NONBLOCK", 2048, create=True)
+    @patch("com2tty.pad_bridge.os.open", return_value=7)
+    @patch("com2tty.pad_bridge.os.mkfifo", create=True)
+    @patch("com2tty.pad_bridge.os.path.exists", return_value=False)
+    @patch("com2tty.pad_bridge.os.unlink")
+    @patch("com2tty.pad_bridge.os.stat", side_effect=OSError("boom"))
+    @patch("com2tty.pad_bridge.os.path.lexists", return_value=True)
+    def test_open_stat_oserror_unlinks(self, m_lex, m_stat, m_unlink,
+                                       m_exists, m_mkfifo, m_open):
+        sink = pb.TmpStreamGamepad(path="/tmp/p")
+        sink.open()
+        m_unlink.assert_called_once_with("/tmp/p")
+        m_mkfifo.assert_called_once()
+
+    @patch("com2tty.pad_bridge.os.O_NONBLOCK", 2048, create=True)
+    @patch("com2tty.pad_bridge.os.open", return_value=7)
+    @patch("com2tty.pad_bridge.os.mkfifo", create=True)
+    @patch("com2tty.pad_bridge.os.path.exists", return_value=True)
+    @patch("com2tty.pad_bridge.os.unlink")
+    @patch("com2tty.pad_bridge.stat.S_ISFIFO", return_value=True)
+    @patch("com2tty.pad_bridge.os.stat")
+    @patch("com2tty.pad_bridge.os.path.lexists", return_value=True)
+    def test_open_reuses_existing_fifo(self, m_lex, m_stat, m_isfifo,
+                                       m_unlink, m_exists, m_mkfifo, m_open):
+        # Existing path that is already a FIFO: no unlink, no mkfifo.
+        sink = pb.TmpStreamGamepad(path="/tmp/p")
+        sink.open()
+        m_unlink.assert_not_called()
+        m_mkfifo.assert_not_called()
+        self.assertEqual(sink.fd, 7)
+
+    @patch("com2tty.pad_bridge.os.write")
+    def test_write_ok(self, m_write):
+        sink = pb.TmpStreamGamepad()
+        sink.fd = 7
+        sink._write(b"abc")
+        m_write.assert_called_once_with(7, b"abc")
+
+    @patch("com2tty.pad_bridge.os.write", side_effect=BlockingIOError())
+    def test_write_blocking_dropped(self, m_write):
+        sink = pb.TmpStreamGamepad()
+        sink.fd = 7
+        sink._write(b"abc")  # must not raise
+
+    @patch("com2tty.pad_bridge.os.write", side_effect=OSError())
+    def test_write_oserror_dropped(self, m_write):
+        sink = pb.TmpStreamGamepad()
+        sink.fd = 7
+        sink._write(b"abc")  # must not raise
+
+    @patch("com2tty.pad_bridge.os.unlink")
+    @patch("com2tty.pad_bridge.os.path.lexists", return_value=True)
+    @patch("com2tty.pad_bridge.os.close")
+    def test_close_unlinks(self, m_close, m_lexists, m_unlink):
+        sink = pb.TmpStreamGamepad(path="/tmp/p")
+        sink.fd = 7
+        sink.close()
+        m_close.assert_called_once_with(7)
+        m_unlink.assert_called_once_with("/tmp/p")
+        self.assertIsNone(sink.fd)
+
+    @patch("com2tty.pad_bridge.os.close", side_effect=Exception("x"))
+    @patch("com2tty.pad_bridge.os.path.lexists", return_value=False)
+    def test_close_swallows_errors(self, m_lexists, m_close):
+        sink = pb.TmpStreamGamepad(path="/tmp/p")
+        sink.fd = 7
+        sink.close()  # must not raise
+        self.assertIsNone(sink.fd)
+
+    def test_close_when_never_opened(self):
+        sink = pb.TmpStreamGamepad(path="/tmp/p")
+        with patch("com2tty.pad_bridge.os.path.lexists", return_value=False):
+            sink.close()  # fd is None branch
+
+    @patch("com2tty.pad_bridge.os.unlink", side_effect=OSError("unlink fail"))
+    @patch("com2tty.pad_bridge.os.path.lexists", return_value=True)
+    @patch("com2tty.pad_bridge.os.close")
+    def test_close_swallows_unlink_errors(self, m_close, m_lexists, m_unlink):
+        sink = pb.TmpStreamGamepad(path="/tmp/p")
+        sink.fd = 7
+        sink.close()  # unlink raises -> swallowed by the second try/except
+        self.assertIsNone(sink.fd)
+
+
+class TestUinputGamepad(unittest.TestCase):
+    """uinput sink uses fcntl ioctls; inject a fake fcntl + mock os.*."""
+
+    @patch("com2tty.pad_bridge.os.O_NONBLOCK", 2048, create=True)
+    @patch("com2tty.pad_bridge.os.write")
+    @patch("com2tty.pad_bridge.os.open", return_value=9)
+    def test_open_creates_device(self, m_open, m_write):
+        fake_fcntl = MagicMock()
+        with patch("com2tty.pad_bridge.fcntl", fake_fcntl):
+            sink = pb.UinputGamepad()
+            sink.open()
+        self.assertEqual(sink.fd, 9)
+        m_open.assert_called_once()
+        # uinput_user_dev written, then UI_DEV_CREATE issued.
+        m_write.assert_called_once()
+        called_requests = [c.args[1] for c in fake_fcntl.ioctl.call_args_list]
+        self.assertIn(pb.UI_DEV_CREATE, called_requests)
+        self.assertIn(pb.UI_SET_EVBIT, called_requests)
+
+    @patch("com2tty.pad_bridge.os.write")
+    def test_write_delegates_to_os_write(self, m_write):
+        sink = pb.UinputGamepad()
+        sink.fd = 9
+        sink._write(b"xyz")
+        m_write.assert_called_once_with(9, b"xyz")
+
+    @patch("com2tty.pad_bridge.os.close")
+    def test_close_destroys_device(self, m_close):
+        fake_fcntl = MagicMock()
+        with patch("com2tty.pad_bridge.fcntl", fake_fcntl):
+            sink = pb.UinputGamepad()
+            sink.fd = 9
+            sink.close()
+        fake_fcntl.ioctl.assert_called_once_with(9, pb.UI_DEV_DESTROY)
+        m_close.assert_called_once_with(9)
+        self.assertIsNone(sink.fd)
+
+    @patch("com2tty.pad_bridge.os.close", side_effect=Exception("x"))
+    def test_close_swallows_errors(self, m_close):
+        fake_fcntl = MagicMock()
+        fake_fcntl.ioctl.side_effect = Exception("destroy fail")
+        with patch("com2tty.pad_bridge.fcntl", fake_fcntl):
+            sink = pb.UinputGamepad()
+            sink.fd = 9
+            sink.close()  # must not raise
+        self.assertIsNone(sink.fd)
+
+    def test_close_when_never_opened(self):
+        sink = pb.UinputGamepad()
+        sink.close()  # fd is None branch, no-op
+
+
+class TestOpenSink(unittest.TestCase):
+
+    def test_default_uses_tmp_stream(self):
+        fake = MagicMock()
+        with patch("com2tty.pad_bridge.TmpStreamGamepad", return_value=fake):
+            sink, msg = pb._open_sink(False, "/tmp/p", "Pad")
+        self.assertIs(sink, fake)
+        fake.open.assert_called_once()
+        self.assertIn("/tmp/p", msg)
+        self.assertIn("no root", msg)
+
+    def test_uinput_success(self):
+        fake = MagicMock()
+        with patch("com2tty.pad_bridge.UinputGamepad", return_value=fake):
+            sink, msg = pb._open_sink(True, "/tmp/p", "Pad")
+        self.assertIs(sink, fake)
+        fake.open.assert_called_once()
+        self.assertIn("real device", msg)
+
+    def test_uinput_permission_error_falls_back_to_tmp(self):
+        bad = MagicMock()
+        bad.open.side_effect = PermissionError("denied")
+        good = MagicMock()
+        with patch("com2tty.pad_bridge.UinputGamepad", return_value=bad), \
+             patch("com2tty.pad_bridge.TmpStreamGamepad", return_value=good):
+            sink, msg = pb._open_sink(True, "/tmp/p", "Pad")
+        self.assertIs(sink, good)        # fell back
+        good.open.assert_called_once()
+        self.assertIn("/tmp/p", msg)
+
+    def test_uinput_oserror_falls_back(self):
+        bad = MagicMock()
+        bad.open.side_effect = OSError("ENODEV")
+        good = MagicMock()
+        with patch("com2tty.pad_bridge.UinputGamepad", return_value=bad), \
+             patch("com2tty.pad_bridge.TmpStreamGamepad", return_value=good):
+            sink, msg = pb._open_sink(True, "/tmp/p", "Pad")
+        self.assertIs(sink, good)
 
 
 if __name__ == "__main__":

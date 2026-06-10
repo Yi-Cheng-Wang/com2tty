@@ -17,6 +17,7 @@ from com2tty.host import (
     read_com_port,
     read_wsl_stderr,
     run_bridge,
+    run_gamepad_bridge,
     QueuePipeConnection,
     ResetProofSerial,
     esp32_manual_reset,
@@ -1800,4 +1801,197 @@ class TestHostEdgeCases(unittest.TestCase):
 
         run_bridge("COM1", "auto", "/tmp/tty", 8, "N", 1, False, False, False, 4000)
         mock_usb.assert_called_with("COM1")
+
+
+# == run_gamepad_bridge =====================================================
+
+class TestRunGamepadBridge(unittest.TestCase):
+
+    def _fake_proc(self, poll=None):
+        proc = MagicMock()
+        proc.poll.return_value = poll
+        return proc
+
+    def _fake_src(self, changed=True, frame=b"\xab\xcd" + b"\x00" * 14):
+        src = MagicMock()
+        src.poll.return_value = (changed, frame)
+        return src
+
+    # --- real threads: cover read_wsl_logs / drain_wsl_stdout closures ---
+    #
+    # The daemon threads race against shutdown_event (set in the main finally).
+    # To deterministically execute the drain thread's body, the log thread is
+    # held open (~40ms) before signalling EOF, keeping shutdown_event clear
+    # while the drain thread runs.
+
+    @staticmethod
+    def _slow_eof_readline(lines, hold=0.04):
+        """Return the given lines in order, then sleep + EOF.
+
+        ``lines`` is a list of byte strings yielded before EOF; the hold keeps
+        the main loop alive long enough for the drain thread to run.
+        """
+        queue_lines = list(lines)
+        state = {"i": 0}
+
+        def _readline():
+            i = state["i"]
+            state["i"] += 1
+            if i < len(queue_lines):
+                return queue_lines[i]
+            _time.sleep(hold)  # keep main loop alive so drain thread runs
+            return b""
+
+        return _readline
+
+    @patch("builtins.print")
+    @patch("com2tty.host.get_wsl_path", return_value="/wsl/pad.py")
+    @patch("os.path.exists", return_value=True)
+    @patch("subprocess.Popen")
+    @patch("com2tty.xinput.GamepadSource")
+    def test_threads_log_and_drain_happy(self, mock_src_cls, mock_pop,
+                                         mock_ex, mock_wsl, mock_pr):
+        mock_src_cls.return_value = self._fake_src()
+        proc = self._fake_proc(poll=None)
+        # A real line (logged) and a whitespace-only line (skipped: msg falsy).
+        proc.stderr.readline.side_effect = self._slow_eof_readline(
+            [b"[WSL] PAD_READY\n", b"   \n"])
+        # drain: one chunk (loop continues), then EOF (break) -> covers 819-820
+        proc.stdout.read.side_effect = [b"x", b""]
+        mock_pop.return_value = proc
+
+        run_gamepad_bridge(pad_index=0)
+        _time.sleep(0.05)  # let daemon threads finish for coverage
+
+        proc.terminate.assert_called()  # poll None in finally -> terminate
+
+    @patch("builtins.print")
+    @patch("com2tty.host.get_wsl_path", return_value="/wsl/pad.py")
+    @patch("os.path.exists", return_value=True)
+    @patch("subprocess.Popen")
+    @patch("com2tty.xinput.GamepadSource")
+    def test_log_thread_exception_path(self, mock_src_cls, mock_pop,
+                                       mock_ex, mock_wsl, mock_pr):
+        mock_src_cls.return_value = self._fake_src()
+        proc = self._fake_proc(poll=None)
+        # log: one line, then raise -> covers the except branch (809-811)
+        proc.stderr.readline.side_effect = [b"hi\n", Exception("read fail")]
+        proc.stdout.read.side_effect = [b""]
+        mock_pop.return_value = proc
+
+        run_gamepad_bridge(pad_index=0)
+        _time.sleep(0.05)
+
+        proc.terminate.assert_called()
+
+    @patch("builtins.print")
+    @patch("com2tty.host.get_wsl_path", return_value="/wsl/pad.py")
+    @patch("os.path.exists", return_value=True)
+    @patch("subprocess.Popen")
+    @patch("com2tty.xinput.GamepadSource")
+    def test_drain_thread_exception_path(self, mock_src_cls, mock_pop,
+                                         mock_ex, mock_wsl, mock_pr):
+        mock_src_cls.return_value = self._fake_src()
+        proc = self._fake_proc(poll=None)
+        # Hold the log thread open so the drain thread runs and raises,
+        # covering drain's except branch (821-822).
+        proc.stderr.readline.side_effect = self._slow_eof_readline([b"hi\n"])
+        proc.stdout.read.side_effect = Exception("drain fail")
+        mock_pop.return_value = proc
+
+        run_gamepad_bridge(pad_index=0)
+        _time.sleep(0.05)
+
+        proc.terminate.assert_called()
+
+    # --- mocked threads: deterministic main-loop branches ---
+
+    @patch("builtins.print")
+    @patch("com2tty.host.time.sleep", side_effect=KeyboardInterrupt())
+    @patch("threading.Thread")
+    @patch("com2tty.host.get_wsl_path", return_value="/wsl/pad.py")
+    @patch("os.path.exists", return_value=True)
+    @patch("subprocess.Popen")
+    @patch("com2tty.xinput.GamepadSource")
+    def test_send_then_keyboard_interrupt_terminates(self, mock_src_cls,
+                                                     mock_pop, mock_ex,
+                                                     mock_wsl, mock_thr,
+                                                     mock_sleep, mock_pr):
+        src = self._fake_src(changed=True)
+        mock_src_cls.return_value = src
+        proc = self._fake_proc(poll=None)
+        mock_pop.return_value = proc
+
+        run_gamepad_bridge(pad_index=0)
+
+        proc.stdin.write.assert_called()   # send path executed
+        proc.terminate.assert_called()
+
+    @patch("builtins.print")
+    @patch("com2tty.host.time.sleep")
+    @patch("threading.Thread")
+    @patch("com2tty.host.get_wsl_path", return_value="/wsl/pad.py")
+    @patch("os.path.exists", return_value=True)
+    @patch("subprocess.Popen")
+    @patch("com2tty.xinput.GamepadSource")
+    def test_broken_pipe_breaks_and_kills(self, mock_src_cls, mock_pop,
+                                          mock_ex, mock_wsl, mock_thr,
+                                          mock_sleep, mock_pr):
+        mock_src_cls.return_value = self._fake_src(changed=True)
+        proc = self._fake_proc(poll=None)
+        proc.stdin.write.side_effect = BrokenPipeError()
+        # cleanup: still running -> terminate -> wait times out -> kill
+        proc.wait.side_effect = __import__("subprocess").TimeoutExpired(
+            cmd="wsl", timeout=3.0)
+        mock_pop.return_value = proc
+
+        run_gamepad_bridge(pad_index=0)
+
+        proc.kill.assert_called()
+
+    @patch("builtins.print")
+    @patch("com2tty.host.time.sleep")
+    @patch("threading.Thread")
+    @patch("com2tty.host.get_wsl_path", return_value="/wsl/pad.py")
+    @patch("os.path.exists", return_value=True)
+    @patch("subprocess.Popen")
+    @patch("com2tty.xinput.GamepadSource")
+    def test_subprocess_exited_skips_terminate(self, mock_src_cls, mock_pop,
+                                               mock_ex, mock_wsl, mock_thr,
+                                               mock_sleep, mock_pr):
+        mock_src_cls.return_value = self._fake_src()
+        proc = self._fake_proc(poll=1)  # already exited
+        mock_pop.return_value = proc
+
+        run_gamepad_bridge(pad_index=0)
+
+        proc.terminate.assert_not_called()
+
+    @patch("builtins.print")
+    @patch("com2tty.host.time.time", return_value=100.0)
+    @patch("com2tty.host.time.sleep", side_effect=[None, KeyboardInterrupt()])
+    @patch("threading.Thread")
+    @patch("com2tty.host.get_wsl_path", return_value="/wsl/pad.py")
+    @patch("os.path.exists", return_value=True)
+    @patch("subprocess.Popen")
+    @patch("com2tty.xinput.GamepadSource")
+    def test_uinput_banner_and_heartbeat_skip(self, mock_src_cls, mock_pop,
+                                              mock_ex, mock_wsl, mock_thr,
+                                              mock_sleep, mock_time, mock_pr):
+        # changed=False so the only send is the first heartbeat; the second
+        # iteration (same time) skips sending, exercising the False branch.
+        mock_src_cls.return_value = self._fake_src(changed=False)
+        proc = self._fake_proc(poll=None)
+        mock_pop.return_value = proc
+
+        run_gamepad_bridge(pad_index=0, use_uinput=True)
+
+        self.assertEqual(proc.stdin.write.call_count, 1)  # heartbeat only
+
+    @patch("os.path.exists", return_value=False)
+    @patch("com2tty.xinput.GamepadSource")
+    def test_pad_script_missing_raises(self, mock_src_cls, mock_ex):
+        mock_src_cls.return_value = self._fake_src()
+        with self.assertRaises(FileNotFoundError):
+            run_gamepad_bridge(pad_index=0)
 
