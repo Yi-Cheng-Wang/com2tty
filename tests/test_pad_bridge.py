@@ -161,6 +161,14 @@ class TestFrameReader(unittest.TestCase):
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0]["buttons"], 0x8000)
 
+    def test_parse_returning_none_is_skipped(self):
+        # Guard: a magic-aligned frame that parse_frame rejects (returns None)
+        # is consumed and dropped rather than appended.
+        r = pb.FrameReader()
+        with patch("com2tty.pad_bridge.parse_frame", return_value=None):
+            out = r.feed(self._frame(buttons=0x1000))
+        self.assertEqual(out, [])
+
 
 class TestEncodeReport(unittest.TestCase):
 
@@ -344,6 +352,19 @@ class TestUinputGamepad(unittest.TestCase):
         called_requests = [c.args[1] for c in fake_fcntl.ioctl.call_args_list]
         self.assertIn(pb.UI_DEV_CREATE, called_requests)
         self.assertIn(pb.UI_SET_EVBIT, called_requests)
+
+    @patch("com2tty.pad_bridge.os.open", return_value=9)
+    def test_open_rejects_non_64bit_abi(self, m_open):
+        """On a 32-bit ABI the struct/ioctl layout is wrong; fail clearly and
+        do not open the device."""
+        fake_fcntl = MagicMock()
+        with patch("com2tty.pad_bridge.fcntl", fake_fcntl), \
+             patch("com2tty.pad_bridge.struct.calcsize", return_value=4):
+            sink = pb.UinputGamepad()
+            with self.assertRaises(OSError) as ctx:
+                sink.open()
+        self.assertIn("64-bit", str(ctx.exception))
+        m_open.assert_not_called()
 
     @patch("com2tty.pad_bridge.os.write")
     def test_write_delegates_to_os_write(self, m_write):

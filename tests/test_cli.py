@@ -26,6 +26,8 @@ class TestCli(unittest.TestCase):
             rtscts=False,
             dsrdtr=False,
             rfc2217_port=4000,
+            distro=None,
+            board="auto",
         )
 
     @patch("com2tty.cli.run_bridge")
@@ -43,7 +45,17 @@ class TestCli(unittest.TestCase):
             rtscts=False,
             dsrdtr=False,
             rfc2217_port=4000,
+            distro=None,
+            board="auto",
         )
+
+    @patch("com2tty.cli.run_bridge")
+    @patch("sys.argv", ["com2tty", "COM2", "--distro", "Ubuntu-22.04",
+                         "--board", "esp32"])
+    def test_cli_distro_and_board(self, mock_run):
+        main()
+        self.assertEqual(mock_run.call_args[1]["distro"], "Ubuntu-22.04")
+        self.assertEqual(mock_run.call_args[1]["board"], "esp32")
 
     @patch("com2tty.cli.run_bridge")
     @patch("sys.argv", ["com2tty", "COM2", "--rfc2217-port", "5000"])
@@ -88,6 +100,7 @@ class TestCliGamepad(unittest.TestCase):
             name="Microsoft X-Box 360 pad",
             use_uinput=False,
             tmp_path="/tmp/com2pad0",
+            distro=None,
         )
 
     @patch("com2tty.cli.run_gamepad_bridge")
@@ -102,6 +115,7 @@ class TestCliGamepad(unittest.TestCase):
             name="Custom Pad",
             use_uinput=True,
             tmp_path="/tmp/mypad",
+            distro=None,
         )
 
     @patch("com2tty.cli.run_gamepad_bridge")

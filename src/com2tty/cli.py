@@ -77,6 +77,21 @@ def main():
         default=4000,
         help="TCP port for RFC 2217 server (default: 4000)."
     )
+
+    parser.add_argument(
+        "--distro",
+        default=None,
+        help="WSL distribution to use (default: the WSL default distro). "
+             "Useful when the default distro lacks python3 (e.g. docker-desktop)."
+    )
+
+    parser.add_argument(
+        "--board",
+        choices=["auto", "esp32", "pico", "none"],
+        default="auto",
+        help="Override USB VID board detection for reset/upload handling "
+             "(default: auto). Use 'none' to disable board-specific resets."
+    )
     
     parser.add_argument(
         "--bytesize",
@@ -146,6 +161,7 @@ def main():
                 name=parsed_args.pad_name,
                 use_uinput=parsed_args.uinput,
                 tmp_path=parsed_args.wsl_pad,
+                distro=parsed_args.distro,
             )
         except KeyboardInterrupt:
             logging.info("Interrupted by user. Exiting.")
@@ -172,7 +188,9 @@ def main():
             xonxoff=parsed_args.xonxoff,
             rtscts=parsed_args.rtscts,
             dsrdtr=parsed_args.dsrdtr,
-            rfc2217_port=parsed_args.rfc2217_port
+            rfc2217_port=parsed_args.rfc2217_port,
+            distro=parsed_args.distro,
+            board=parsed_args.board
         )
     except KeyboardInterrupt:
         logging.info("Interrupted by user. Exiting.")
