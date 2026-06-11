@@ -31,6 +31,7 @@ Frame format (16 bytes, little-endian), see ``xinput.py`` on the host side::
      \\\\___________ magic 0xAB 0xCD
 """
 import os
+import select
 import sys
 import stat
 import struct
@@ -58,6 +59,7 @@ _IOC_DIRSHIFT = _IOC_SIZESHIFT + _IOC_SIZEBITS   # 30
 
 _IOC_NONE = 0
 _IOC_WRITE = 1
+_IOC_READ = 2
 
 
 def _IOC(direction, typ, nr, size):
@@ -73,12 +75,41 @@ def _IOW(typ, nr, size):
     return _IOC(_IOC_WRITE, typ, nr, size)
 
 
+def _IOWR(typ, nr, size):
+    return _IOC(_IOC_READ | _IOC_WRITE, typ, nr, size)
+
+
+# struct sizes on a 64-bit (LP64) kernel ABI, the only one we support
+# (see UinputGamepad.open): sizeof(struct ff_effect) == 48, so
+# uinput_ff_upload = u32 + s32 + 2 * ff_effect and uinput_ff_erase =
+# u32 request_id + s32 retval + u32 effect_id.
+INPUT_EVENT_FORMAT = "=qqHHi"
+INPUT_EVENT_SIZE = struct.calcsize(INPUT_EVENT_FORMAT)  # 24
+FF_EFFECT_SIZE = 48
+UINPUT_FF_UPLOAD_SIZE = 4 + 4 + FF_EFFECT_SIZE * 2  # 104
+UINPUT_FF_ERASE_SIZE = 12
+# Offsets inside uinput_ff_upload: the ff_effect starts after request_id and
+# retval; its union (ff_rumble_effect for FF_RUMBLE) starts 16 bytes in,
+# after type/id/direction/trigger/replay plus alignment padding.
+FF_EFFECT_OFFSET = 8
+FF_RUMBLE_UNION_OFFSET = 16
+
 UINPUT_IOCTL_BASE = ord('U')
 UI_DEV_CREATE = _IO(UINPUT_IOCTL_BASE, 1)
 UI_DEV_DESTROY = _IO(UINPUT_IOCTL_BASE, 2)
 UI_SET_EVBIT = _IOW(UINPUT_IOCTL_BASE, 100, 4)
 UI_SET_KEYBIT = _IOW(UINPUT_IOCTL_BASE, 101, 4)
 UI_SET_ABSBIT = _IOW(UINPUT_IOCTL_BASE, 103, 4)
+UI_SET_FFBIT = _IOW(UINPUT_IOCTL_BASE, 107, 4)
+UI_BEGIN_FF_UPLOAD = _IOWR(UINPUT_IOCTL_BASE, 200, UINPUT_FF_UPLOAD_SIZE)
+UI_END_FF_UPLOAD = _IOW(UINPUT_IOCTL_BASE, 201, UINPUT_FF_UPLOAD_SIZE)
+UI_BEGIN_FF_ERASE = _IOWR(UINPUT_IOCTL_BASE, 202, UINPUT_FF_ERASE_SIZE)
+UI_END_FF_ERASE = _IOW(UINPUT_IOCTL_BASE, 203, UINPUT_FF_ERASE_SIZE)
+
+# Codes the kernel sends on the uinput fd to drive FF effect management.
+EV_UINPUT = 0x0101
+UI_FF_UPLOAD = 1
+UI_FF_ERASE = 2
 
 
 # --------------------------------------------------------------------------- #
@@ -87,7 +118,13 @@ UI_SET_ABSBIT = _IOW(UINPUT_IOCTL_BASE, 103, 4)
 EV_SYN = 0x00
 EV_KEY = 0x01
 EV_ABS = 0x03
+EV_FF = 0x15
 SYN_REPORT = 0x00
+
+FF_RUMBLE = 0x50
+FF_GAIN = 0x60
+FF_AUTOCENTER = 0x61
+FF_MAX_EFFECTS = 16
 
 BTN_A = 0x130
 BTN_B = 0x131
@@ -125,6 +162,8 @@ XINPUT_BUTTON_MAP = [
     (0x0010, BTN_START),    # Start
     (0x0040, BTN_THUMBL),   # Left stick click
     (0x0080, BTN_THUMBR),   # Right stick click
+    (0x0400, BTN_MODE),     # Guide (only set when the host polls via
+                            # XInputGetStateEx; zero otherwise)
 ]
 
 # XInput D-pad bitmasks (synthesised into HAT axes).
@@ -156,12 +195,27 @@ FRAME_MAGIC1 = 0xCD
 FRAME_FORMAT = "<BBBBHBBhhhh"
 FRAME_SIZE = struct.calcsize(FRAME_FORMAT)  # 16
 
+# Reverse-channel rumble frame (this helper -> Windows host over stdout).
+# Mirrored by RumbleReader in xinput.py; kept in sync by tests.
+RUMBLE_MAGIC0 = 0xFB
+RUMBLE_MAGIC1 = 0xFE
+RUMBLE_FORMAT = "<BBHH"
+RUMBLE_SIZE = struct.calcsize(RUMBLE_FORMAT)  # 6
+
+
+def pack_rumble(strong, weak):
+    """Build a rumble frame: strong (left/low-freq) and weak (right/high-freq)
+    motor magnitudes, 0-65535 each."""
+    return struct.pack(RUMBLE_FORMAT, RUMBLE_MAGIC0, RUMBLE_MAGIC1,
+                       strong & 0xFFFF, weak & 0xFFFF)
+
 
 def _clamp(value, lo, hi):
     return lo if value < lo else (hi if value > hi else value)
 
 
-def build_uinput_user_dev(name, vendor, product, version, bustype=0x03):
+def build_uinput_user_dev(name, vendor, product, version, bustype=0x03,
+                          ff_effects_max=0):
     """Pack a ``struct uinput_user_dev`` (legacy device-creation method).
 
     Layout (no padding inserted on x86_64)::
@@ -187,7 +241,7 @@ def build_uinput_user_dev(name, vendor, product, version, bustype=0x03):
         "=%dsHHHHI%di" % (UINPUT_MAX_NAME_SIZE, ABS_CNT * 4),
         name_bytes,
         bustype, vendor, product, version,
-        0,  # ff_effects_max
+        ff_effects_max,
         *(absmax + absmin + absfuzz + absflat),
     )
 
@@ -349,6 +403,17 @@ class GamepadSink:
     def emit(self, events):
         self._write(encode_report(events))
 
+    def ff_fileno(self):
+        """File descriptor to watch for force-feedback requests, or None.
+
+        Only the uinput sink has a kernel-driven reverse channel; the /tmp
+        FIFO stream is one-way.
+        """
+        return None
+
+    def handle_ff_io(self):  # pragma: no cover - overridden where used
+        return None
+
     def close(self):  # pragma: no cover - overridden
         pass
 
@@ -414,28 +479,100 @@ class UinputGamepad(GamepadSink):
         self.product = product
         self.version = version
         self.fd = None
+        # FF effect id -> (strong, weak) rumble magnitudes, populated by the
+        # kernel-driven upload handshake in handle_ff_io.
+        self._effects = {}
 
     def open(self):
         if fcntl is None:  # pragma: no cover
             raise OSError("fcntl unavailable (not running on Linux)")
-        # O_WRONLY | O_NONBLOCK
-        self.fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+        # The ioctl numbers and struct layouts here assume a 64-bit (LP64)
+        # kernel ABI (true for both x86_64 and aarch64 WSL). On a 32-bit ABI
+        # the uinput_user_dev/input_event packing would be wrong; fail clearly
+        # so _open_sink falls back to the portable /tmp stream instead.
+        if struct.calcsize("P") != 8:
+            raise OSError(
+                "uinput mode requires a 64-bit (LP64) kernel ABI; this "
+                "interpreter is not 64-bit. Use the default /tmp stream.")
+        # O_RDWR: reads carry the kernel's force-feedback requests back to us.
+        self.fd = os.open("/dev/uinput", os.O_RDWR | os.O_NONBLOCK)
 
         fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_KEY)
         fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_ABS)
         fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_SYN)
+        fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_FF)
         for code in DECLARED_BUTTONS:
             fcntl.ioctl(self.fd, UI_SET_KEYBIT, code)
         for code in AXIS_INFO:
             fcntl.ioctl(self.fd, UI_SET_ABSBIT, code)
+        fcntl.ioctl(self.fd, UI_SET_FFBIT, FF_RUMBLE)
 
         dev = build_uinput_user_dev(self.name, self.vendor,
-                                    self.product, self.version)
+                                    self.product, self.version,
+                                    ff_effects_max=FF_MAX_EFFECTS)
         os.write(self.fd, dev)
         fcntl.ioctl(self.fd, UI_DEV_CREATE)
 
     def _write(self, blob):
         os.write(self.fd, blob)
+
+    def ff_fileno(self):
+        return self.fd
+
+    def handle_ff_io(self):
+        """Service one kernel force-feedback request from the uinput fd.
+
+        Effect uploads and erasures are acknowledged via the
+        UI_BEGIN/END_FF_UPLOAD/ERASE handshake and tracked in ``_effects``;
+        a play/stop request returns the (strong, weak) magnitudes to forward
+        to the Windows host, all other events return None.
+        """
+        try:
+            data = os.read(self.fd, INPUT_EVENT_SIZE)
+        except (BlockingIOError, OSError):
+            return None
+        if len(data) < INPUT_EVENT_SIZE:
+            return None
+        _, _, etype, code, value = struct.unpack(INPUT_EVENT_FORMAT, data)
+
+        if etype == EV_UINPUT and code == UI_FF_UPLOAD:
+            buf = bytearray(UINPUT_FF_UPLOAD_SIZE)
+            struct.pack_into("<I", buf, 0, value & 0xFFFFFFFF)
+            try:
+                fcntl.ioctl(self.fd, UI_BEGIN_FF_UPLOAD, buf)
+                eff_type, eff_id = struct.unpack_from("<HH", buf,
+                                                      FF_EFFECT_OFFSET)
+                if eff_type == FF_RUMBLE:
+                    strong, weak = struct.unpack_from(
+                        "<HH", buf, FF_EFFECT_OFFSET + FF_RUMBLE_UNION_OFFSET)
+                    self._effects[eff_id] = (strong, weak)
+                struct.pack_into("<i", buf, 4, 0)  # retval = success
+                fcntl.ioctl(self.fd, UI_END_FF_UPLOAD, buf)
+            except OSError:
+                pass
+            return None
+
+        if etype == EV_UINPUT and code == UI_FF_ERASE:
+            buf = bytearray(UINPUT_FF_ERASE_SIZE)
+            struct.pack_into("<I", buf, 0, value & 0xFFFFFFFF)
+            try:
+                fcntl.ioctl(self.fd, UI_BEGIN_FF_ERASE, buf)
+                (effect_id,) = struct.unpack_from("<I", buf, 8)
+                self._effects.pop(effect_id, None)
+                struct.pack_into("<i", buf, 4, 0)
+                fcntl.ioctl(self.fd, UI_END_FF_ERASE, buf)
+            except OSError:
+                pass
+            return None
+
+        if etype == EV_FF:
+            if code in (FF_GAIN, FF_AUTOCENTER):
+                return None  # device-level knobs; nothing to forward
+            if value:
+                return self._effects.get(code, (0, 0))
+            return (0, 0)
+
+        return None
 
     def close(self):
         if self.fd is not None:
@@ -509,8 +646,24 @@ def main(argv=None):  # pragma: no cover - integration entry point
         FRAME_FORMAT, FRAME_MAGIC0, FRAME_MAGIC1, args.pad_index,
         0, 0, 0, 0, 0, 0, 0, 0))))
 
+    # The uinput sink exposes a second readable fd that carries the kernel's
+    # force-feedback requests; rumble magnitudes go back to the Windows host
+    # over stdout (the reverse channel of the bridge pipe).
+    ff_fd = pad.ff_fileno()
+    watch = [0] if ff_fd is None else [0, ff_fd]
+
     try:
         while True:
+            readable, _, _ = select.select(watch, [], [])
+
+            if ff_fd is not None and ff_fd in readable:
+                rumble = pad.handle_ff_io()
+                if rumble is not None:
+                    sys.stdout.buffer.write(pack_rumble(*rumble))
+                    sys.stdout.buffer.flush()
+
+            if 0 not in readable:
+                continue
             data = os.read(0, 4096)
             if not data:
                 sys.stderr.write("EOF on stdin. Exiting.\n")

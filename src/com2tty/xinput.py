@@ -20,8 +20,19 @@ FRAME_MAGIC1 = 0xCD
 FRAME_FORMAT = "<BBBBHBBhhhh"
 FRAME_SIZE = struct.calcsize(FRAME_FORMAT)  # 16
 
+# Reverse-channel rumble frame (WSL -> Windows), see pad_bridge.py.
+RUMBLE_MAGIC0 = 0xFB
+RUMBLE_MAGIC1 = 0xFE
+RUMBLE_FORMAT = "<BBHH"
+RUMBLE_SIZE = struct.calcsize(RUMBLE_FORMAT)  # 6
+
 ERROR_SUCCESS = 0
 ERROR_DEVICE_NOT_CONNECTED = 1167
+
+# The Guide (Xbox logo) button is only reported by the undocumented
+# XInputGetStateEx, exported by ordinal 100 from xinput1_3/xinput1_4.
+GUIDE_BUTTON_MASK = 0x0400
+_GET_STATE_EX_ORDINAL = 100
 
 # Candidate XInput DLLs, newest first.
 _XINPUT_DLLS = ("xinput1_4", "xinput1_3", "xinput9_1_0")
@@ -44,6 +55,43 @@ class _XINPUT_STATE(ctypes.Structure):
         ("dwPacketNumber", ctypes.c_uint),
         ("Gamepad", _XINPUT_GAMEPAD),
     ]
+
+
+class _XINPUT_VIBRATION(ctypes.Structure):
+    _fields_ = [
+        ("wLeftMotorSpeed", ctypes.c_ushort),
+        ("wRightMotorSpeed", ctypes.c_ushort),
+    ]
+
+
+class RumbleReader:
+    """Resynchronising parser for the 6-byte rumble frames coming back from
+    the WSL helper's stdout (the reverse channel of the gamepad bridge)."""
+
+    def __init__(self):
+        self._buf = bytearray()
+
+    def feed(self, data):
+        """Add raw bytes, yield every complete (left, right) rumble pair."""
+        self._buf.extend(data)
+        frames = []
+        while True:
+            start = self._buf.find(RUMBLE_MAGIC0)
+            if start == -1:
+                self._buf.clear()
+                break
+            if start > 0:
+                del self._buf[:start]
+            if len(self._buf) < RUMBLE_SIZE:
+                break
+            if self._buf[1] != RUMBLE_MAGIC1:
+                del self._buf[0]
+                continue
+            _, _, left, right = struct.unpack(
+                RUMBLE_FORMAT, bytes(self._buf[:RUMBLE_SIZE]))
+            del self._buf[:RUMBLE_SIZE]
+            frames.append((left, right))
+        return frames
 
 
 def pack_frame(index, connected, buttons=0, lt=0, rt=0,
@@ -79,8 +127,25 @@ class GamepadSource:
             raise ValueError("pad index must be 0-3")
         self.index = index
         self._xinput = _load_xinput()
+        # Prefer the hidden XInputGetStateEx (ordinal 100), which also
+        # reports the Guide button; fall back to the documented call when
+        # the loaded DLL does not export it (xinput9_1_0).
+        try:
+            self._get_state = self._xinput[_GET_STATE_EX_ORDINAL]
+        except Exception:
+            self._get_state = self._xinput.XInputGetState
         self._last_packet = None
         self._last_connected = None
+
+    def set_rumble(self, left, right):
+        """Drive the controller motors (0-65535 each; left is the heavy,
+        low-frequency motor). Returns True when XInput accepted the state."""
+        vib = _XINPUT_VIBRATION(left & 0xFFFF, right & 0xFFFF)
+        try:
+            return self._xinput.XInputSetState(
+                self.index, ctypes.byref(vib)) == ERROR_SUCCESS
+        except Exception:
+            return False
 
     def poll(self):
         """Read current state.
@@ -90,7 +155,7 @@ class GamepadSource:
         poll (so the host can send-on-change and avoid flooding the pipe).
         """
         st = _XINPUT_STATE()
-        res = self._xinput.XInputGetState(self.index, ctypes.byref(st))
+        res = self._get_state(self.index, ctypes.byref(st))
         connected = (res == ERROR_SUCCESS)
 
         if connected:

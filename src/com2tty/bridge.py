@@ -93,16 +93,103 @@ def cleanup_picotool_interceptor():
         except Exception as e:
             sys.stderr.write(f"Warning: Failed to restore {picotool_path}: {e}\n")
 
+def restore_orphaned_picotools():
+    """Restore picotool binaries left intercepted by a previous, crashed session.
+
+    setup_picotool_interceptor renames the real binary to ``picotool.real`` and
+    replaces ``picotool`` with a symlink to our wrapper, relying on the in-process
+    cleanup to undo it. If the bridge is killed (e.g. ``wsl --shutdown`` or a host
+    ``proc.kill()``) before cleanup runs, that swap persists and the user's
+    PlatformIO uploads silently break. This runs on startup and reverses any such
+    orphaned swap so the tool self-heals on the next launch.
+    """
+    home = os.path.expanduser("~")
+    search_pattern = os.path.join(home, ".platformio", "packages", "tool-picotool*", "picotool.real")
+    for real_path in glob.glob(search_pattern):
+        picotool_path = real_path[:-len(".real")]
+        try:
+            # Only reclaim when the live path is gone or is a symlink we left
+            # behind; never clobber a genuine binary the user reinstalled.
+            if os.path.islink(picotool_path) or not os.path.exists(picotool_path):
+                if os.path.lexists(picotool_path):
+                    os.remove(picotool_path)
+                os.rename(real_path, picotool_path)
+                sys.stderr.write(f"Restored orphaned picotool at {picotool_path}\n")
+                sys.stderr.flush()
+        except Exception as e:
+            sys.stderr.write(f"Warning: could not restore orphaned picotool {picotool_path}: {e}\n")
+            sys.stderr.flush()
+
 baud_map = {getattr(termios, k): int(k[1:]) for k in dir(termios) if k.startswith('B') and k[1:].isdigit()}
+
+def md5_hexdigest(data):
+    import hashlib
+    try:
+        return hashlib.md5(data, usedforsecurity=False).hexdigest()
+    except TypeError:  # Python < 3.9 has no usedforsecurity flag
+        return hashlib.md5(data).hexdigest()
 
 MARKER_START = "# === COM2TTY INJECTION START ==="
 MARKER_END   = "# === COM2TTY INJECTION END ==="
 
 def get_rc_files():
     home = os.path.expanduser("~")
-    return [os.path.join(home, ".bashrc")]
+    files = [os.path.join(home, ".bashrc")]
+    # zsh users never source .bashrc, so the injected PlatformIO variables
+    # would silently be missing in their shells.
+    zshrc = os.path.join(home, ".zshrc")
+    if os.environ.get("SHELL", "").endswith("zsh") or os.path.exists(zshrc):
+        files.append(zshrc)
+    return files
+
+def get_fish_conf_path():
+    """Path for the fish snippet, or None when fish is not in use.
+
+    fish does not read .bashrc/.zshrc; files in ~/.config/fish/conf.d/ are
+    sourced automatically by every new fish shell, so a dedicated snippet
+    there is the idiomatic equivalent of the rc-file block.
+    """
+    home = os.path.expanduser("~")
+    fish_dir = os.path.join(home, ".config", "fish")
+    if os.environ.get("SHELL", "").endswith("fish") or os.path.isdir(fish_dir):
+        return os.path.join(fish_dir, "conf.d", "com2tty.fish")
+    return None
+
+
+def clean_fish_conf():
+    path = get_fish_conf_path()
+    if not path or not os.path.exists(path):
+        return
+    try:
+        os.remove(path)
+        sys.stderr.write(f"Removed {path}\n")
+        sys.stderr.flush()
+    except Exception as e:
+        sys.stderr.write(f"Warning: could not remove {path}: {e}\n")
+        sys.stderr.flush()
+
+
+def inject_fish_conf(port, monitor_path="/tmp/ttyUSB0"):
+    path = get_fish_conf_path()
+    if not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(
+                "# Written by com2tty; removed automatically when it exits.\n"
+                f"set -gx PLATFORMIO_UPLOAD_PORT rfc2217://127.0.0.1:{port}\n"
+                f"set -gx PLATFORMIO_MONITOR_PORT {monitor_path}\n"
+            )
+        sys.stderr.write(f"Injected environment variables to {path}\n")
+        sys.stderr.flush()
+    except Exception as e:
+        sys.stderr.write(f"Warning: could not write {path}: {e}\n")
+        sys.stderr.flush()
+
 
 def clean_rc():
+    clean_fish_conf()
     for rc_path in get_rc_files():
         if not os.path.exists(rc_path):
             continue
@@ -113,6 +200,9 @@ def clean_rc():
             in_block = False
             for line in lines:
                 if MARKER_START in line:
+                    idx = line.find(MARKER_START)
+                    if idx > 0 and line[:idx].strip():
+                        new_lines.append(line[:idx] + "\n")
                     in_block = True
                     continue
                 if MARKER_END in line:
@@ -128,18 +218,25 @@ def clean_rc():
             sys.stderr.write(f"Warning: could not clean {rc_path}: {e}\n")
             sys.stderr.flush()
 
-def inject_rc(port):
+def inject_rc(port, monitor_path="/tmp/ttyUSB0"):
     clean_rc()
+    inject_fish_conf(port, monitor_path)
     block = (
         f"{MARKER_START}\n"
         f"export PLATFORMIO_UPLOAD_PORT=rfc2217://127.0.0.1:{port}\n"
-        f"export PLATFORMIO_MONITOR_PORT=/tmp/ttyUSB0\n"
+        f"export PLATFORMIO_MONITOR_PORT={monitor_path}\n"
         f"{MARKER_END}\n"
     )
     for rc_path in get_rc_files():
         try:
+            prefix = ""
+            if os.path.exists(rc_path):
+                with open(rc_path, "r") as f:
+                    content = f.read()
+                    if content and not content.endswith("\n"):
+                        prefix = "\n"
             with open(rc_path, "a") as f:
-                f.write(block)
+                f.write(prefix + block)
             sys.stderr.write(f"Injected environment variables to {rc_path}\n")
             sys.stderr.flush()
         except Exception as e:
@@ -175,28 +272,69 @@ def cleanup_symlink(path):
         sys.stderr.write(f"Warning: Failed to remove symlink {path}: {e}\n")
         sys.stderr.flush()
 
+def kill_leftover_listener(port):
+    """Reclaim a TCP port held by a *com2tty* listener from a previous session.
+
+    Only processes whose command line references this bridge are killed, so an
+    unrelated service that happens to use the same port is never terminated.
+    (The previous implementation ran ``fuser -k`` which killed any owner.)
+    """
+    import subprocess as sp
+    import time
+    try:
+        res = sp.run(["fuser", f"{port}/tcp"], capture_output=True, timeout=3)
+    except FileNotFoundError:
+        # Minimal distros ship without psmisc; the bind below will then fail
+        # loudly if a leftover listener is still holding the port.
+        sys.stderr.write(
+            f"Note: 'fuser' not found (install package 'psmisc'); cannot "
+            f"auto-clean leftover listeners on port {port}.\n")
+        sys.stderr.flush()
+        return
+    except Exception:
+        return
+
+    pids = res.stdout.decode("utf-8", "replace").split()
+    killed = False
+    for pid in pids:
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmdline = f.read().replace(b"\x00", b" ").decode("utf-8", "replace")
+        except Exception:
+            continue
+        # Reclaim the port only from another com2tty bridge instance.
+        if "bridge.py" in cmdline or "com2tty" in cmdline:
+            try:
+                os.kill(int(pid), signal.SIGKILL)
+                killed = True
+            except Exception:
+                pass
+        else:
+            sys.stderr.write(
+                f"Note: port {port} is held by an unrelated process (PID {pid}); "
+                f"not killing it. Choose a different --rfc2217-port if bind fails.\n")
+            sys.stderr.flush()
+    if killed:
+        time.sleep(0.3)
+
 def run_rfc2217_server_thread(port, rfc2217_active):
     """
     Long-lived TCP forwarder that runs as a thread inside the main bridge process.
     Accepts esptool connections and relays data through stdin/stdout (shared with
     the PTY bridge, coordinated by the rfc2217_active event).
     """
-    import subprocess as sp
-
-    # Kill any leftover process from a previous com2tty session
-    try:
-        sp.run(["fuser", "-k", f"{port}/tcp"], capture_output=True, timeout=3)
-        import time
-        time.sleep(0.3)
-    except Exception:
-        pass
+    kill_leftover_listener(port)
 
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         s.bind(('127.0.0.1', port))
     except Exception as e:
-        sys.stderr.write(f"[CONTROL] RFC2217_ERROR: bind failed: {e}\n")
+        sys.stderr.write(
+            f"[CONTROL] RFC2217_ERROR: bind failed: {e}. Port {port} may be "
+            f"in use; choose another with --rfc2217-port.\n")
         sys.stderr.flush()
         return
     s.listen(1)
@@ -261,22 +399,18 @@ def run_uf2_relay_thread(port, uf2_active):
     TCP server inside WSL that receives UF2 data from the picotool wrapper
     and relays it to the Windows host through stdout pipe with control messages.
     """
-    import subprocess as sp
     import time
 
-    # Kill any leftover process from a previous com2tty session
-    try:
-        sp.run(["fuser", "-k", f"{port}/tcp"], capture_output=True, timeout=3)
-        time.sleep(0.3)
-    except Exception:
-        pass
+    kill_leftover_listener(port)
 
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         s.bind(('127.0.0.1', port))
     except Exception as e:
-        sys.stderr.write(f"[CONTROL] UF2_ERROR: bind failed on port {port}: {e}\n")
+        sys.stderr.write(
+            f"[CONTROL] UF2_ERROR: bind failed on port {port}: {e}. The UF2 "
+            f"relay uses --rfc2217-port + 1; choose another --rfc2217-port.\n")
         sys.stderr.flush()
         return
     s.listen(1)
@@ -307,8 +441,7 @@ def run_uf2_relay_thread(port, uf2_active):
             finally:
                 conn.close()
 
-            import hashlib
-            md5_hash = hashlib.md5(uf2_data).hexdigest()
+            md5_hash = md5_hexdigest(uf2_data)
 
             sys.stderr.write(f"[CONTROL] UF2_UPLOAD_START:{len(uf2_data)}:{md5_hash}\n")
             sys.stderr.flush()
@@ -366,7 +499,15 @@ def main():
         type=int,
         help="TCP port for RFC 2217 server to inject into bashrc and listen on"
     )
+    parser.add_argument(
+        "--no-env-setup",
+        action="store_true",
+        help="Skip PlatformIO env-var injection and picotool interception. "
+             "Used for secondary bridges in multi-port mode so they do not "
+             "overwrite the primary bridge's shell configuration."
+    )
     args = parser.parse_args()
+    env_setup = args.rfc2217_port and not args.no_env_setup
 
     target_path = args.symlink
     created_symlink = None
@@ -377,8 +518,11 @@ def main():
     master_fd = None
     slave_fd = None
 
-    if args.rfc2217_port:
-        inject_rc(args.rfc2217_port)
+    if env_setup:
+        # Self-heal anything a previous, crashed session left behind before we
+        # set up our own interceptors. inject_rc already clears stale rc blocks.
+        restore_orphaned_picotools()
+        inject_rc(args.rfc2217_port, args.symlink)
 
     # Events to coordinate stdin/stdout access between PTY bridge, RFC 2217, and UF2 relay
     rfc2217_active = threading.Event()
@@ -422,7 +566,8 @@ def main():
         # Start RFC 2217 server thread if port is specified
         if args.rfc2217_port:
             uf2_port = args.rfc2217_port + 1
-            setup_picotool_interceptor(uf2_port)
+            if env_setup:
+                setup_picotool_interceptor(uf2_port)
             t_rfc2217 = threading.Thread(
                 target=run_rfc2217_server_thread,
                 args=(args.rfc2217_port, rfc2217_active),
@@ -494,12 +639,12 @@ def main():
     except KeyboardInterrupt: # pragma: no cover
         sys.stderr.write("WSL bridge interrupted by signal.\n")
         sys.stderr.flush()
-    except Exception as e: # pragma: no cover
+    except Exception: # pragma: no cover
         sys.stderr.write(f"WSL bridge error: {traceback.format_exc()}\n")
         sys.stderr.flush()
     finally:
         # Clean up symlink and file descriptors
-        if args.rfc2217_port:
+        if env_setup:
             clean_rc()
             cleanup_picotool_interceptor()
         if created_symlink:

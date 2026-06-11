@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import MagicMock, patch, PropertyMock, call
+from unittest.mock import MagicMock, patch
 import sys
 import os
 import tempfile
@@ -7,26 +7,63 @@ import threading
 import socket as stdlib_socket
 import hashlib
 
+import pytest
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
 import termios  # real on Linux, mock on Windows via conftest
+import com2tty.bridge
 from com2tty.bridge import (
     main, cleanup_symlink, get_rc_files, clean_rc, inject_rc,
     get_pty_settings, run_rfc2217_server_thread, run_uf2_relay_thread,
     setup_picotool_interceptor, cleanup_picotool_interceptor,
     intercepted_picotools, MARKER_START, MARKER_END,
-    PICOTOOL_WRAPPER_CONTENT,
+    kill_leftover_listener, md5_hexdigest,
+    restore_orphaned_picotools, get_fish_conf_path, clean_fish_conf,
+    inject_fish_conf,
 )
+
+# The autouse fixture below replaces com2tty.bridge.get_fish_conf_path for
+# every test; keep a handle on the real function so it can itself be tested.
+_real_get_fish_conf_path = get_fish_conf_path
+
+
+@pytest.fixture(autouse=True)
+def _no_real_fish_conf(monkeypatch):
+    """Keep clean_rc/inject_rc tests from touching a real fish config.
+
+    The fish snippet path resolves from the live HOME/SHELL; on a developer
+    machine with fish installed these tests would otherwise write and delete
+    a real ~/.config/fish/conf.d/com2tty.fish. Tests that exercise the fish
+    behaviour re-patch get_fish_conf_path themselves.
+    """
+    monkeypatch.setattr(com2tty.bridge, "get_fish_conf_path", lambda: None)
 
 
 # ── get_rc_files ──────────────────────────────────────────────────────────
 
 class TestGetRcFiles(unittest.TestCase):
 
-    def test_returns_bashrc_path(self):
+    @patch.dict(os.environ, {"SHELL": "/bin/bash"})
+    @patch("com2tty.bridge.os.path.exists", return_value=False)
+    def test_returns_bashrc_path(self, mock_exists):
         paths = get_rc_files()
         self.assertEqual(len(paths), 1)
         self.assertTrue(paths[0].endswith(".bashrc"))
+
+    @patch.dict(os.environ, {"SHELL": "/usr/bin/zsh"})
+    @patch("com2tty.bridge.os.path.exists", return_value=False)
+    def test_includes_zshrc_for_zsh_shell(self, mock_exists):
+        paths = get_rc_files()
+        self.assertEqual(len(paths), 2)
+        self.assertTrue(paths[1].endswith(".zshrc"))
+
+    @patch.dict(os.environ, {"SHELL": "/bin/bash"})
+    @patch("com2tty.bridge.os.path.exists", return_value=True)
+    def test_includes_zshrc_when_file_exists(self, mock_exists):
+        paths = get_rc_files()
+        self.assertEqual(len(paths), 2)
+        self.assertTrue(paths[1].endswith(".zshrc"))
 
 
 # ── clean_rc ──────────────────────────────────────────────────────────────
@@ -52,6 +89,22 @@ class TestCleanRc(unittest.TestCase):
                 text = f.read()
             self.assertIn("before", text)
             self.assertIn("after", text)
+            self.assertNotIn("COM2TTY", text)
+        finally:
+            os.unlink(path)
+
+    def test_preserves_content_before_inline_marker(self):
+        # A start marker appended to an existing command line must keep the
+        # user's code prefix while dropping the injected block.
+        path = self._make_tmp(
+            f"echo hi {MARKER_START}\nexport X=1\n{MARKER_END}\n")
+        try:
+            with patch("com2tty.bridge.get_rc_files", return_value=[path]):
+                clean_rc()
+            with open(path) as f:
+                text = f.read()
+            self.assertIn("echo hi", text)
+            self.assertNotIn("export X=1", text)
             self.assertNotIn("COM2TTY", text)
         finally:
             os.unlink(path)
@@ -99,6 +152,38 @@ class TestInjectRc(unittest.TestCase):
             self.assertIn("PLATFORMIO_UPLOAD_PORT=rfc2217://127.0.0.1:4000", text)
             self.assertIn("PLATFORMIO_MONITOR_PORT=/tmp/ttyUSB0", text)
             self.assertIn(MARKER_START, text)
+        finally:
+            os.unlink(f.name)
+
+    def test_adds_newline_when_file_lacks_trailing_newline(self):
+        # A user rc file not ending in a newline must not get the injection
+        # block glued onto the last line.
+        f = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".bashrc", delete=False
+        )
+        f.write("last line no newline")  # deliberately no trailing \n
+        f.close()
+        try:
+            with patch("com2tty.bridge.get_rc_files", return_value=[f.name]):
+                inject_rc(4000)
+            with open(f.name) as fh:
+                text = fh.read()
+            self.assertIn("last line no newline\n" + MARKER_START, text)
+        finally:
+            os.unlink(f.name)
+
+    def test_injects_custom_monitor_path(self):
+        f = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".bashrc", delete=False
+        )
+        f.write("old\n")
+        f.close()
+        try:
+            with patch("com2tty.bridge.get_rc_files", return_value=[f.name]):
+                inject_rc(4000, "/tmp/ttyACM5")
+            with open(f.name) as fh:
+                text = fh.read()
+            self.assertIn("PLATFORMIO_MONITOR_PORT=/tmp/ttyACM5", text)
         finally:
             os.unlink(f.name)
 
@@ -168,6 +253,179 @@ class TestCleanupSymlink(unittest.TestCase):
     @patch("os.unlink", create=True, side_effect=Exception("fail"))
     def test_handles_exception(self, mock_unlink, mock_lex):
         cleanup_symlink("/tmp/tty")  # should not raise
+
+
+# ── kill_leftover_listener ────────────────────────────────────────────────
+
+class TestKillLeftoverListener(unittest.TestCase):
+
+    # signal.SIGKILL is absent on Windows (this runs only inside WSL/Linux in
+    # production); create it for the tests so the kill path is exercised here.
+    @patch("com2tty.bridge.signal.SIGKILL", 9, create=True)
+    @patch("time.sleep")
+    @patch("com2tty.bridge.os.kill")
+    @patch("builtins.open", new_callable=MagicMock)
+    @patch("subprocess.run")
+    def test_kills_only_com2tty_process(self, mock_sp, mock_open, mock_kill,
+                                        mock_sleep):
+        """A PID whose cmdline references our bridge is killed."""
+        mock_sp.return_value = MagicMock(stdout=b" 1234\n")
+        handle = mock_open.return_value.__enter__.return_value
+        handle.read.return_value = b"python3\x00bridge.py\x00--symlink"
+        kill_leftover_listener(4000)
+        mock_kill.assert_called_once()
+        self.assertEqual(mock_kill.call_args[0][0], 1234)
+        mock_sleep.assert_called_once_with(0.3)
+
+    @patch("com2tty.bridge.sys.stderr")
+    @patch("time.sleep")
+    @patch("com2tty.bridge.os.kill")
+    @patch("builtins.open", new_callable=MagicMock)
+    @patch("subprocess.run")
+    def test_spares_unrelated_process(self, mock_sp, mock_open, mock_kill,
+                                      mock_sleep, mock_stderr):
+        """A PID owned by an unrelated process is NOT killed."""
+        mock_sp.return_value = MagicMock(stdout=b" 5678\n")
+        handle = mock_open.return_value.__enter__.return_value
+        handle.read.return_value = b"/usr/bin/nginx\x00-g\x00daemon off;"
+        kill_leftover_listener(4000)
+        mock_kill.assert_not_called()
+        mock_sleep.assert_not_called()
+        written = "".join(c.args[0] for c in mock_stderr.write.call_args_list)
+        self.assertIn("unrelated process", written)
+
+    @patch("time.sleep")
+    @patch("com2tty.bridge.os.kill")
+    @patch("builtins.open", side_effect=FileNotFoundError("no proc"))
+    @patch("subprocess.run")
+    def test_skips_pid_with_unreadable_cmdline(self, mock_sp, mock_open,
+                                               mock_kill, mock_sleep):
+        """A PID whose /proc cmdline cannot be read is skipped."""
+        mock_sp.return_value = MagicMock(stdout=b"9999\n")
+        kill_leftover_listener(4000)
+        mock_kill.assert_not_called()
+
+    @patch("com2tty.bridge.signal.SIGKILL", 9, create=True)
+    @patch("time.sleep")
+    @patch("com2tty.bridge.os.kill", side_effect=ProcessLookupError())
+    @patch("builtins.open", new_callable=MagicMock)
+    @patch("subprocess.run")
+    def test_kill_exception_swallowed(self, mock_sp, mock_open, mock_kill,
+                                      mock_sleep):
+        """os.kill raising (process already gone) is tolerated."""
+        mock_sp.return_value = MagicMock(stdout=b"1234\n")
+        handle = mock_open.return_value.__enter__.return_value
+        handle.read.return_value = b"bridge.py"
+        kill_leftover_listener(4000)  # should not raise
+
+    @patch("time.sleep")
+    @patch("subprocess.run")
+    def test_no_pids_no_sleep(self, mock_sp, mock_sleep):
+        """Empty fuser output means nothing to kill and no sleep."""
+        mock_sp.return_value = MagicMock(stdout=b"")
+        kill_leftover_listener(4000)
+        mock_sleep.assert_not_called()
+
+    @patch("time.sleep")
+    @patch("com2tty.bridge.os.kill")
+    @patch("subprocess.run")
+    def test_non_numeric_pid_skipped(self, mock_sp, mock_kill, mock_sleep):
+        """Non-numeric tokens in fuser output are ignored."""
+        mock_sp.return_value = MagicMock(stdout=b"notapid\n")
+        kill_leftover_listener(4000)
+        mock_kill.assert_not_called()
+
+    @patch("com2tty.bridge.sys.stderr")
+    @patch("subprocess.run", side_effect=FileNotFoundError("no fuser"))
+    def test_fuser_missing_prints_note(self, mock_sp, mock_stderr):
+        kill_leftover_listener(4000)
+        written = "".join(c.args[0] for c in mock_stderr.write.call_args_list)
+        self.assertIn("psmisc", written)
+
+    @patch("subprocess.run", side_effect=Exception("boom"))
+    def test_generic_exception_ignored(self, mock_sp):
+        kill_leftover_listener(4000)  # should not raise
+
+
+# ── restore_orphaned_picotools ────────────────────────────────────────────
+
+class TestRestoreOrphanedPicotools(unittest.TestCase):
+
+    @patch("com2tty.bridge.os.rename")
+    @patch("com2tty.bridge.os.remove")
+    @patch("com2tty.bridge.os.path.lexists", return_value=True)
+    @patch("com2tty.bridge.os.path.exists", return_value=False)
+    @patch("com2tty.bridge.os.path.islink", return_value=True)
+    @patch("com2tty.bridge.glob.glob")
+    def test_restores_orphan(self, mock_glob, mock_islink, mock_exists,
+                             mock_lexists, mock_remove, mock_rename):
+        real = "/home/u/.platformio/packages/tool-picotool-rp2040/picotool.real"
+        mock_glob.return_value = [real]
+        restore_orphaned_picotools()
+        picotool = real[:-len(".real")]
+        mock_remove.assert_called_once_with(picotool)
+        mock_rename.assert_called_once_with(real, picotool)
+
+    @patch("com2tty.bridge.os.rename")
+    @patch("com2tty.bridge.os.path.exists", return_value=True)
+    @patch("com2tty.bridge.os.path.islink", return_value=False)
+    @patch("com2tty.bridge.glob.glob")
+    def test_skips_when_real_binary_present(self, mock_glob, mock_islink,
+                                            mock_exists, mock_rename):
+        """If a genuine binary occupies the live path, do not clobber it."""
+        mock_glob.return_value = [
+            "/home/u/.platformio/packages/tool-picotool-rp2040/picotool.real"]
+        restore_orphaned_picotools()
+        mock_rename.assert_not_called()
+
+    @patch("com2tty.bridge.os.rename")
+    @patch("com2tty.bridge.os.remove")
+    @patch("com2tty.bridge.os.path.lexists", return_value=False)
+    @patch("com2tty.bridge.os.path.exists", return_value=False)
+    @patch("com2tty.bridge.os.path.islink", return_value=False)
+    @patch("com2tty.bridge.glob.glob")
+    def test_restores_when_live_path_absent(self, mock_glob, mock_islink,
+                                            mock_exists, mock_lexists,
+                                            mock_remove, mock_rename):
+        """Live picotool path is gone entirely: rename .real back, no remove."""
+        real = "/home/u/.platformio/packages/tool-picotool-rp2040/picotool.real"
+        mock_glob.return_value = [real]
+        restore_orphaned_picotools()
+        mock_remove.assert_not_called()
+        mock_rename.assert_called_once_with(real, real[:-len(".real")])
+
+    @patch("com2tty.bridge.os.path.islink", side_effect=OSError("boom"))
+    @patch("com2tty.bridge.os.path.exists", return_value=False)
+    @patch("com2tty.bridge.glob.glob")
+    def test_exception_swallowed(self, mock_glob, mock_exists, mock_islink):
+        mock_glob.return_value = [
+            "/home/u/.platformio/packages/tool-picotool-rp2040/picotool.real"]
+        restore_orphaned_picotools()  # should not raise
+
+    @patch("com2tty.bridge.glob.glob", return_value=[])
+    def test_no_orphans(self, mock_glob):
+        restore_orphaned_picotools()  # nothing to do
+
+
+# ── md5_hexdigest ─────────────────────────────────────────────────────────
+
+class TestMd5Hexdigest(unittest.TestCase):
+
+    def test_matches_hashlib(self):
+        self.assertEqual(md5_hexdigest(b"data"),
+                         hashlib.md5(b"data").hexdigest())
+
+    def test_fallback_without_usedforsecurity(self):
+        real_md5 = hashlib.md5
+
+        def legacy_md5(data, **kwargs):
+            if kwargs:
+                raise TypeError("usedforsecurity not supported")
+            return real_md5(data)
+
+        with patch("hashlib.md5", side_effect=legacy_md5):
+            self.assertEqual(md5_hexdigest(b"data"),
+                             real_md5(b"data").hexdigest())
 
 
 # ── run_rfc2217_server_thread ─────────────────────────────────────────────
@@ -244,6 +502,34 @@ class TestRunRfc2217ServerThread(unittest.TestCase):
         mock_wr.assert_called_with(1, b"world")
         conn.close.assert_called()
         self.assertFalse(evt.is_set())
+
+    @patch("time.sleep")
+    @patch("subprocess.run")
+    @patch("com2tty.bridge.socket.socket")
+    @patch("com2tty.bridge.select.select")
+    @patch("com2tty.bridge.os.read")
+    def test_session_loops_when_only_stdin_ready(self, mock_rd, mock_sel,
+                                                 mock_sock_cls, mock_sp, mock_sl):
+        """An iteration where only stdin is ready (conn not in the readset) must
+        forward and loop again (covers the conn-not-ready arc)."""
+        sock = MagicMock()
+        mock_sock_cls.return_value = sock
+        conn = MagicMock()
+        sock.accept.side_effect = [
+            (conn, ("127.0.0.1", 9999)),
+            OSError("exit"),
+        ]
+        # iter1: only stdin ready, real data -> sendall, conn not ready -> loop
+        # iter2: only stdin ready, EOF -> break
+        mock_sel.side_effect = [
+            ([0], [], []),
+            ([0], [], []),
+        ]
+        mock_rd.side_effect = [b"data", b""]
+
+        run_rfc2217_server_thread(4000, threading.Event())
+        conn.sendall.assert_called_once_with(b"data")
+        conn.close.assert_called()
 
     @patch("time.sleep")
     @patch("subprocess.run")
@@ -601,6 +887,36 @@ class TestRunUf2RelayThread(unittest.TestCase):
     @patch("time.sleep")
     @patch("subprocess.run")
     @patch("com2tty.bridge.socket.socket")
+    @patch("time.time")
+    def test_ack_wait_loops_when_stdin_not_ready(self, mock_time, mock_sock_cls,
+                                                 mock_sp, mock_sleep,
+                                                 mock_os_read, mock_select,
+                                                 mock_stdout, mock_stderr):
+        """An ACK-wait iteration where stdin is not ready must loop and recheck
+        the deadline (covers the stdin-not-ready arc of the ACK loop)."""
+        sock = MagicMock()
+        mock_sock_cls.return_value = sock
+        conn = MagicMock()
+        conn.recv.side_effect = [b"data", b""]
+        sock.accept.side_effect = [
+            (conn, ("127.0.0.1", 12345)),
+            OSError("exit"),
+        ]
+        # timeout_time=105; iter1 101<105 -> enter loop; iter2 106 -> exit.
+        mock_time.side_effect = [100.0, 101.0, 106.0]
+        mock_select.return_value = ([], [], [])  # stdin never ready
+        mock_stdout.buffer = MagicMock()
+
+        run_uf2_relay_thread(5001, threading.Event())
+        mock_stdout.buffer.write.assert_not_called()
+
+    @patch("com2tty.bridge.sys.stderr")
+    @patch("com2tty.bridge.sys.stdout")
+    @patch("com2tty.bridge.select.select")
+    @patch("com2tty.bridge.os.read")
+    @patch("time.sleep")
+    @patch("subprocess.run")
+    @patch("com2tty.bridge.socket.socket")
     def test_uf2_receive_ack_but_stdout_write_fails(self, mock_sock_cls, mock_sp,
                                                       mock_sleep, mock_os_read,
                                                       mock_select, mock_stdout,
@@ -678,6 +994,35 @@ class TestRunUf2RelayThread(unittest.TestCase):
 
         sock.listen.assert_called_once_with(1)
         sock.close.assert_called_once()
+
+    @patch("com2tty.bridge.sys.stdout")
+    @patch("com2tty.bridge.select.select")
+    @patch("com2tty.bridge.os.read")
+    @patch("time.sleep")
+    @patch("subprocess.run")
+    @patch("com2tty.bridge.socket.socket")
+    def test_ack_wait_loops_over_non_ack_chunk(self, mock_sock_cls, mock_sp,
+                                               mock_sleep, mock_os_read,
+                                               mock_select, mock_stdout):
+        """A non-ACK chunk arriving first must loop and keep waiting until the
+        ACK is seen (covers the keep-waiting branch of the ACK loop)."""
+        sock = MagicMock()
+        mock_sock_cls.return_value = sock
+        conn = MagicMock()
+        conn.recv.side_effect = [b"firmware", b""]
+        sock.accept.side_effect = [
+            (conn, ("127.0.0.1", 12345)),
+            OSError("exit"),
+        ]
+        mock_select.return_value = ([0], [], [])
+        # First read has no ACK marker, second completes it.
+        mock_os_read.side_effect = [b"noise", b"[CONTROL] UF2_ACK\n"]
+
+        mock_buf = MagicMock()
+        mock_stdout.buffer = mock_buf
+
+        run_uf2_relay_thread(5001, threading.Event())
+        mock_buf.write.assert_called_once_with(bytearray(b"firmware"))
 
     @patch("com2tty.bridge.sys.stderr")
     @patch("com2tty.bridge.sys.stdout")
@@ -830,6 +1175,33 @@ class TestBridgeMain(unittest.TestCase):
 
         mock_symlink.assert_any_call("/dev/pts/1", "/tmp/ttyUSB0")
 
+    @patch("sys.argv", ["bridge.py", "--symlink", "/dev/ttyUSB0"])
+    @patch("os.openpty", create=True, return_value=(3, 4))
+    @patch("os.ttyname", create=True, return_value="/dev/pts/1")
+    @patch("os.path.lexists")
+    @patch("os.symlink", create=True)
+    @patch("select.select")
+    @patch("os.read", return_value=b"")
+    @patch("os.close")
+    @patch("os.unlink", create=True)
+    def test_permission_fallback_when_fallback_path_absent(
+            self, mock_unlink, mock_close, mock_read, mock_select,
+            mock_symlink, mock_lexists, mock_ttyname, mock_openpty):
+        # target lexists False, then fallback lexists False -> skip the unlink
+        # and symlink straight to the fallback path.
+        mock_lexists.side_effect = [False, False]
+
+        def fake_sym(src, dst):
+            if dst == "/dev/ttyUSB0":
+                raise PermissionError("denied")
+        mock_symlink.side_effect = fake_sym
+        mock_select.return_value = ([0], [], [])
+
+        main()
+
+        mock_symlink.assert_any_call("/dev/pts/1", "/tmp/ttyUSB0")
+        mock_unlink.assert_not_called()
+
     # -- EIO + EOF on PTY master -------------------------------------------
 
     @patch("sys.argv", ["bridge.py", "--symlink", "/tmp/tty"])
@@ -955,8 +1327,50 @@ class TestBridgeMain(unittest.TestCase):
 
         main()
 
-        mock_inj.assert_called_once_with(4000)
+        mock_inj.assert_called_once_with(4000, "/tmp/tty")
         mock_clean.assert_called_once()
+        mock_thread_cls.assert_called()
+
+    # -- multi-port secondary: --no-env-setup ------------------------------
+
+    @patch("sys.argv", ["bridge.py", "--symlink", "/tmp/tty",
+                         "--rfc2217-port", "4002", "--no-env-setup"])
+    @patch("com2tty.bridge.restore_orphaned_picotools")
+    @patch("com2tty.bridge.setup_picotool_interceptor")
+    @patch("com2tty.bridge.inject_rc")
+    @patch("com2tty.bridge.clean_rc")
+    @patch("com2tty.bridge.cleanup_symlink")
+    @patch("com2tty.bridge.threading.Event")
+    @patch("com2tty.bridge.threading.Thread")
+    @patch("os.openpty", create=True, return_value=(3, 4))
+    @patch("os.ttyname", create=True, return_value="/dev/pts/1")
+    @patch("os.path.lexists", return_value=False)
+    @patch("os.symlink", create=True)
+    @patch("com2tty.bridge.get_pty_settings",
+           return_value=(None, None, None, None))
+    @patch("select.select")
+    @patch("os.read", return_value=b"")
+    @patch("os.close")
+    @patch("time.sleep")
+    def test_no_env_setup_skips_injection_and_interception(
+        self, mock_sleep, mock_close, mock_read, mock_select, mock_gps,
+        mock_symlink, mock_lexists, mock_ttyname, mock_openpty,
+        mock_thread_cls, mock_event_cls, mock_cleanup, mock_clean, mock_inj,
+        mock_intercept, mock_restore,
+    ):
+        mock_evt = MagicMock()
+        mock_evt.is_set.side_effect = [True, False, False]
+        mock_event_cls.return_value = mock_evt
+        mock_select.return_value = ([0], [], [])
+
+        main()
+
+        # No shell-rc or picotool changes for a secondary bridge...
+        mock_restore.assert_not_called()
+        mock_inj.assert_not_called()
+        mock_intercept.assert_not_called()
+        mock_clean.assert_not_called()
+        # ...but the RFC 2217 / UF2 relay threads still start.
         mock_thread_cls.assert_called()
 
     # -- post-select rfc2217 check (line 464) ------------------------------
@@ -1064,6 +1478,94 @@ class TestBridgeMain(unittest.TestCase):
         mock_select.return_value = ([0], [], [])
 
         main()
+
+
+class TestFishConf(unittest.TestCase):
+
+    @patch.dict(os.environ, {"SHELL": "/usr/bin/fish"})
+    @patch("com2tty.bridge.os.path.isdir", return_value=False)
+    def test_path_for_fish_shell(self, mock_isdir):
+        path = _real_get_fish_conf_path()
+        self.assertTrue(path.endswith(os.path.join("conf.d", "com2tty.fish")))
+
+    @patch.dict(os.environ, {"SHELL": "/bin/bash"})
+    @patch("com2tty.bridge.os.path.isdir", return_value=True)
+    def test_path_when_fish_dir_exists(self, mock_isdir):
+        self.assertIsNotNone(_real_get_fish_conf_path())
+
+    @patch.dict(os.environ, {"SHELL": "/bin/bash"})
+    @patch("com2tty.bridge.os.path.isdir", return_value=False)
+    def test_no_path_without_fish(self, mock_isdir):
+        self.assertIsNone(_real_get_fish_conf_path())
+
+    def test_inject_writes_set_gx_lines(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "conf.d", "com2tty.fish")
+            with patch("com2tty.bridge.get_fish_conf_path", return_value=path):
+                inject_fish_conf(4000, "/tmp/ttyACM5")
+            with open(path) as f:
+                content = f.read()
+            self.assertIn("set -gx PLATFORMIO_UPLOAD_PORT rfc2217://127.0.0.1:4000",
+                          content)
+            self.assertIn("set -gx PLATFORMIO_MONITOR_PORT /tmp/ttyACM5", content)
+
+    def test_inject_noop_without_fish(self):
+        with patch("com2tty.bridge.get_fish_conf_path", return_value=None):
+            inject_fish_conf(4000)  # should not raise, nothing to assert
+
+    def test_inject_write_failure_is_tolerated(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "conf.d", "com2tty.fish")
+            with patch("com2tty.bridge.get_fish_conf_path", return_value=path), \
+                 patch("builtins.open", side_effect=OSError("read-only")):
+                inject_fish_conf(4000)  # should not raise
+
+    def test_clean_removes_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "com2tty.fish")
+            with open(path, "w") as f:
+                f.write("set -gx X 1\n")
+            with patch("com2tty.bridge.get_fish_conf_path", return_value=path):
+                clean_fish_conf()
+            self.assertFalse(os.path.exists(path))
+
+    def test_clean_noop_when_absent(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "com2tty.fish")
+            with patch("com2tty.bridge.get_fish_conf_path", return_value=path):
+                clean_fish_conf()  # should not raise
+
+    def test_clean_noop_without_fish(self):
+        with patch("com2tty.bridge.get_fish_conf_path", return_value=None):
+            clean_fish_conf()  # should not raise
+
+    def test_clean_remove_failure_is_tolerated(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "com2tty.fish")
+            with open(path, "w") as f:
+                f.write("x\n")
+            with patch("com2tty.bridge.get_fish_conf_path", return_value=path), \
+                 patch("com2tty.bridge.os.remove", side_effect=OSError("busy")):
+                clean_fish_conf()  # should not raise
+
+    def test_clean_rc_also_cleans_fish(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "com2tty.fish")
+            with open(path, "w") as f:
+                f.write("x\n")
+            with patch("com2tty.bridge.get_fish_conf_path", return_value=path), \
+                 patch("com2tty.bridge.get_rc_files", return_value=[]):
+                clean_rc()
+            self.assertFalse(os.path.exists(path))
+
+    def test_inject_rc_also_writes_fish(self):
+        with tempfile.TemporaryDirectory() as d:
+            fish_path = os.path.join(d, "conf.d", "com2tty.fish")
+            rc_path = os.path.join(d, ".bashrc")
+            with patch("com2tty.bridge.get_fish_conf_path", return_value=fish_path), \
+                 patch("com2tty.bridge.get_rc_files", return_value=[rc_path]):
+                inject_rc(4000, "/tmp/ttyUSB0")
+            self.assertTrue(os.path.exists(fish_path))
 
 
 if __name__ == "__main__":

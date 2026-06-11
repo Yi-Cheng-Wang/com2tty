@@ -7,6 +7,22 @@ module on Windows so that ``bridge.py`` can be imported for testing.
 import sys
 import types
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolate_autoplay_marker(tmp_path, monkeypatch):
+    """Redirect the temp directory to a throwaway path for every test.
+
+    run_bridge() calls restore_orphaned_autoplay() at startup, which reads a
+    marker file from the system temp directory. Without isolation a real marker
+    left by an actual crashed session could make tests touch the live registry.
+    Patching tempfile.gettempdir keeps _autoplay_marker_path itself exercised
+    while pointing it at a per-test scratch directory.
+    """
+    import tempfile
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+
 # ---------------------------------------------------------------------------
 # Mock ``termios`` on platforms where it is unavailable (Windows).
 # This MUST happen at module level – before any test file imports bridge.py.

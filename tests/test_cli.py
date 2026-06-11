@@ -26,6 +26,8 @@ class TestCli(unittest.TestCase):
             rtscts=False,
             dsrdtr=False,
             rfc2217_port=4000,
+            distro=None,
+            board="auto",
         )
 
     @patch("com2tty.cli.run_bridge")
@@ -43,7 +45,17 @@ class TestCli(unittest.TestCase):
             rtscts=False,
             dsrdtr=False,
             rfc2217_port=4000,
+            distro=None,
+            board="auto",
         )
+
+    @patch("com2tty.cli.run_bridge")
+    @patch("sys.argv", ["com2tty", "COM2", "--distro", "Ubuntu-22.04",
+                         "--board", "esp32"])
+    def test_cli_distro_and_board(self, mock_run):
+        main()
+        self.assertEqual(mock_run.call_args[1]["distro"], "Ubuntu-22.04")
+        self.assertEqual(mock_run.call_args[1]["board"], "esp32")
 
     @patch("com2tty.cli.run_bridge")
     @patch("sys.argv", ["com2tty", "COM2", "--rfc2217-port", "5000"])
@@ -76,6 +88,63 @@ class TestCli(unittest.TestCase):
         mock_exit.assert_called_once_with(1)
 
 
+class TestCliMultiPort(unittest.TestCase):
+
+    @patch("com2tty.host.run_multi_bridge")
+    @patch("com2tty.cli.run_bridge")
+    @patch("sys.argv", ["com2tty", "COM3", "COM5"])
+    def test_two_ports_use_multi_bridge(self, mock_run, mock_multi):
+        main()
+        mock_run.assert_not_called()
+        mock_multi.assert_called_once()
+        self.assertEqual(mock_multi.call_args[1]["ports"], ["COM3", "COM5"])
+
+    @patch("com2tty.host.run_multi_bridge")
+    @patch("com2tty.cli.run_bridge")
+    @patch("sys.argv", ["com2tty", "COM3"])
+    def test_single_port_uses_run_bridge(self, mock_run, mock_multi):
+        main()
+        mock_multi.assert_not_called()
+        mock_run.assert_called_once()
+        self.assertEqual(mock_run.call_args[1]["port"], "COM3")
+
+    @patch("com2tty.host.run_multi_bridge")
+    @patch("sys.exit")
+    @patch("sys.argv", ["com2tty", "COM3", "COM5"])
+    def test_multi_keyboard_interrupt(self, mock_exit, mock_multi):
+        mock_multi.side_effect = KeyboardInterrupt()
+        main()
+        mock_exit.assert_called_once_with(0)
+
+
+class TestCliVersionAndList(unittest.TestCase):
+
+    @patch("sys.argv", ["com2tty", "--version"])
+    def test_version_exits_zero(self):
+        with self.assertRaises(SystemExit) as ctx:
+            main()
+        self.assertEqual(ctx.exception.code, 0)
+
+    @patch("com2tty.discovery.print_port_list")
+    @patch("sys.argv", ["com2tty", "--list"])
+    def test_list_calls_discovery(self, mock_list):
+        main()
+        mock_list.assert_called_once_with()
+
+    @patch("com2tty.discovery.print_port_list")
+    @patch("sys.argv", ["com2tty", "-l"])
+    def test_list_short_flag(self, mock_list):
+        main()
+        mock_list.assert_called_once_with()
+
+    @patch("com2tty.cli.run_bridge")
+    @patch("com2tty.discovery.print_port_list")
+    @patch("sys.argv", ["com2tty", "--list"])
+    def test_list_does_not_start_bridge(self, mock_list, mock_run):
+        main()
+        mock_run.assert_not_called()
+
+
 class TestCliGamepad(unittest.TestCase):
 
     @patch("com2tty.cli.run_gamepad_bridge")
@@ -88,6 +157,7 @@ class TestCliGamepad(unittest.TestCase):
             name="Microsoft X-Box 360 pad",
             use_uinput=False,
             tmp_path="/tmp/com2pad0",
+            distro=None,
         )
 
     @patch("com2tty.cli.run_gamepad_bridge")
@@ -102,6 +172,7 @@ class TestCliGamepad(unittest.TestCase):
             name="Custom Pad",
             use_uinput=True,
             tmp_path="/tmp/mypad",
+            distro=None,
         )
 
     @patch("com2tty.cli.run_gamepad_bridge")

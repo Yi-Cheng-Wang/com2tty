@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "com2tty"
-version = "0.1.3"
+version = "0.2.0"
 description = "A Windows COM port to WSL ttyUSB forwarder"
 readme = "README.md"
 authors = [
@@ -32,3 +32,16 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff]
+target-version = "py38"
+line-length = 120
+
+[tool.ruff.lint]
+# Correctness-focused: pyflakes plus the error-class pycodestyle checks.
+# Style rules are intentionally not enforced on this codebase.
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests import com2tty modules after an explicit sys.path mutation.
+"tests/*" = ["E402"]

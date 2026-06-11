@@ -2,7 +2,6 @@ import unittest
 from unittest.mock import MagicMock, patch
 import sys
 import os
-import threading
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
@@ -102,6 +101,22 @@ class TestRedirector(unittest.TestCase):
         r.reader()
         self.assertFalse(r.alive)
 
+    def test_reader_exception_after_alive_cleared(self, mock_pm):
+        # alive flips to False mid-read (e.g. concurrent stop()); the except
+        # handler then skips the error log and just breaks.
+        ser = MagicMock()
+        r = Redirector(ser, MagicMock())
+        r.alive = True
+        ser.in_waiting = 1
+
+        def boom(n):
+            r.alive = False
+            raise Exception("read err during stop")
+        ser.read.side_effect = boom
+
+        r.reader()
+        self.assertFalse(r.alive)
+
     # ── writer ───────────────────────────────────────────────────────────
 
     def test_writer_eof(self, mock_pm):
@@ -142,6 +157,20 @@ class TestRedirector(unittest.TestCase):
         r.alive = False
         # writer exits immediately because alive is False
         r.writer()
+
+    def test_writer_exception_after_alive_cleared(self, mock_pm):
+        # alive flips to False mid-recv; the except handler skips the log.
+        sock = MagicMock()
+        r = Redirector(MagicMock(), sock)
+        r.alive = True
+
+        def boom(n):
+            r.alive = False
+            raise Exception("recv err during stop")
+        sock.recv.side_effect = boom
+
+        r.writer()
+        self.assertFalse(r.alive)
 
     # ── statusline_poller ────────────────────────────────────────────────
 

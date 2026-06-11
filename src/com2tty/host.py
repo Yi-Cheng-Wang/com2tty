@@ -1,24 +1,54 @@
 import os
-import sys
 import time
 import logging
+import shutil
 import subprocess
 import threading
-import socket
 import queue
 import serial
 import serial.tools.list_ports
-import json
-try:
-    import winreg
-except ImportError:
-    winreg = None
 from .rfc2217_server import Redirector
+from .banner import enable_vt_mode, get_banner_colors  # noqa: F401 (re-export)
+from .boards import (  # noqa: F401 (re-exports kept for backwards compatibility)
+    BOARD_LABELS,
+    UF2_FAMILIES,
+    detect_board_type,
+    esp32_manual_reset,
+    get_usb_serial_number,
+    pico_manual_reset,
+    samd_touch_reset,
+    stm32_manual_reset,
+)
+from .uf2 import (  # noqa: F401 (re-exports kept for backwards compatibility)
+    AutoplaySuppressor,
+    get_drive_by_serial,
+    list_removable_drives,
+    md5_hexdigest,
+    restore_orphaned_autoplay,
+)
 
-def get_wsl_path(win_path):
-    cmd = ["wsl", "wslpath", "-u", win_path]
+def wsl_command(distro, *argv):
+    """Build a wsl.exe invocation that bypasses the WSL login shell.
+
+    Without ``--exec``, wsl.exe re-joins its arguments and hands them to the
+    distro's default shell, which re-splits on whitespace. Any path containing
+    a space (e.g. /mnt/c/Program Files/...) would break. ``--exec`` launches
+    the binary directly with the arguments preserved as-is.
+    """
+    cmd = ["wsl"]
+    if distro:
+        cmd += ["-d", distro]
+    cmd.append("--exec")
+    cmd.extend(argv)
+    return cmd
+
+def get_wsl_path(win_path, distro=None):
+    cmd = wsl_command(distro, "wslpath", "-u", win_path)
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        # wslpath emits UTF-8 regardless of the Windows locale; decoding with
+        # the ANSI codepage would corrupt non-ASCII paths (e.g. CJK usernames).
+        res = subprocess.run(cmd, capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", check=True)
         return res.stdout.strip()
     except Exception as e:
         logging.debug(f"wslpath failed: {e}. Using fallback conversion.")
@@ -26,6 +56,51 @@ def get_wsl_path(win_path):
         drive = win_path[0].lower()
         path = win_path[2:].replace("\\", "/")
         return f"/mnt/{drive}{path}"
+
+def check_wsl_environment(wsl_script_path=None, distro=None):
+    """Verify WSL prerequisites before spawning the bridge.
+
+    Each failure mode otherwise surfaces as a cryptic error (WinError 2, an
+    instantly-exiting subprocess, a 'No such file' from deep inside WSL), so
+    fail fast here with an actionable message instead.
+    """
+    target = f"WSL distribution '{distro}'" if distro else "the default WSL distribution"
+
+    if shutil.which("wsl") is None:
+        raise RuntimeError(
+            "wsl.exe was not found in PATH. com2tty requires Windows Subsystem "
+            "for Linux. Install it with 'wsl --install' and try again."
+        )
+
+    try:
+        res = subprocess.run(
+            wsl_command(distro, "python3", "--version"),
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=30,
+        )
+    except Exception as e:
+        raise RuntimeError(f"Failed to start {target}: {e}")
+
+    if res.returncode != 0:
+        detail = (res.stderr or res.stdout or "").strip()
+        raise RuntimeError(
+            f"'python3' is not available in {target} ({detail or 'no output'}). "
+            "Check 'wsl -l -v' for installed distributions, select one with "
+            "--distro, or install Python inside WSL (e.g. 'sudo apt install python3')."
+        )
+
+    if wsl_script_path:
+        res = subprocess.run(
+            wsl_command(distro, "test", "-r", wsl_script_path),
+            capture_output=True, timeout=30,
+        )
+        if res.returncode != 0:
+            raise RuntimeError(
+                f"The com2tty bridge script is not readable from WSL at "
+                f"{wsl_script_path}. Make sure Windows drive automounting is "
+                "enabled in WSL ([automount] in /etc/wsl.conf must not be "
+                "disabled) and that the install path is accessible from WSL."
+            )
 
 def get_serial_settings(bytesize, parity, stopbits):
     bytesize_map = {
@@ -56,11 +131,19 @@ def get_serial_settings(bytesize, parity, stopbits):
 def get_system_baudrate(port):
     import re
     try:
-        # mode.com prints system states for COM ports. 
-        # The keys may be localized, but the baudrate value is consistently the first large number.
-        res = subprocess.run(["mode.com", port], capture_output=True, text=True)
+        # mode.com prints the COM port state. The console codepage may not match
+        # Python's locale decoding; the digits we need are ASCII, so replace
+        # anything undecodable.
+        res = subprocess.run(["mode.com", port], capture_output=True, text=True,
+                             errors="replace")
         if res.returncode == 0:
-            match = re.search(r"\b(\d{3,7})\b", res.stdout)
+            # Prefer the number on the line that names the baud field. Most
+            # locales still print the English word "Baud", but other numbers
+            # (e.g. a localized date or the COM index) can precede it, so a
+            # bare "first large number" scan would mis-detect on those systems.
+            match = re.search(r"[Bb]aud[^0-9]*(\d{3,7})", res.stdout)
+            if not match:
+                match = re.search(r"\b(\d{3,7})\b", res.stdout)
             if match:
                 return int(match.group(1))
     except Exception as e:
@@ -93,8 +176,106 @@ def read_wsl_stdout(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_dat
     finally:
         shutdown_event.set()
 
-def read_com_port(ser, proc, shutdown_event, rfc2217_active_event, uf2_active_event):
+def reopen_serial_port(ser, usb_serial, shutdown_event, abort_events=(),
+                       max_attempts=None, poll_interval=0.5):
+    """Reopen a dead COM handle, following the device across re-enumeration.
+
+    Windows invalidates the open handle when a device is unplugged or reboots
+    (e.g. into a bootloader), and may assign a different COM number when it
+    returns. This closes the stale handle, then retries the original name and
+    falls back to locating the device by its USB serial number.
+
+    Returns True once the port is open again. Returns False when
+    ``max_attempts`` (None = unlimited) is exhausted, ``shutdown_event`` is
+    set, or any event in ``abort_events`` becomes set (used to yield to the
+    UF2 upload path, which manages its own reopen).
+    """
+    original_port = ser.port
+    try:
+        ser.close()
+    except Exception:
+        pass
+    # Never reopen at 1200 baud: that would immediately re-trigger the
+    # bootloader touch on boards that interpret it.
+    if getattr(ser, 'baudrate', 115200) == 1200:
+        ser.baudrate = 115200
+
+    attempts = 0
+    while not shutdown_event.is_set():
+        if any(evt.is_set() for evt in abort_events):
+            return False
+        if max_attempts is not None and attempts >= max_attempts:
+            return False
+        attempts += 1
+        time.sleep(poll_interval)
+
+        # First try the port under its current name.
+        try:
+            ser.open()
+            logging.info(f"{ser.port} reopened successfully.")
+            return True
+        except Exception:
+            pass
+
+        # The port number may have changed after re-enumeration; locate the
+        # device by USB serial number.
+        if usb_serial:
+            for p in serial.tools.list_ports.comports():
+                if p.serial_number == usb_serial and p.device != ser.port:
+                    logging.info(f"Device reappeared as {p.device} (was {original_port}).")
+                    ser.port = p.device
+                    try:
+                        ser.open()
+                        logging.info(f"{p.device} opened successfully.")
+                        return True
+                    except Exception:
+                        pass
+    return False
+
+
+def snapshot_ports():
+    """Set of COM port device names currently enumerated by Windows."""
+    return {p.device for p in serial.tools.list_ports.comports()}
+
+
+def acquire_new_port(ser, before_ports, shutdown_event, max_attempts=40,
+                     poll_interval=0.25):
+    """Open the port that newly appears after a bootloader touch.
+
+    A SAMD/Leonardo 1200-baud touch re-enumerates the board's bootloader as a
+    *new* COM port, typically with a different VID:PID and USB serial number
+    than the application port, so matching by serial number (as
+    ``reopen_serial_port`` does) is unreliable. Instead this diffs the live
+    port list against ``before_ports`` (snapshotted before the touch) and
+    opens whatever appeared -- the approach the Arduino tooling uses.
+
+    Leaves ``ser`` open on the new port and returns its name on success, or
+    restores ``ser.port`` and returns None when no new port appears.
+    """
+    original_port = ser.port
+    # Never reopen at 1200 baud: that would immediately re-trigger the touch.
+    if getattr(ser, 'baudrate', 115200) == 1200:
+        ser.baudrate = 115200
+
+    attempts = 0
+    while not shutdown_event.is_set() and attempts < max_attempts:
+        attempts += 1
+        time.sleep(poll_interval)
+        for device in sorted(snapshot_ports() - before_ports):
+            ser.port = device
+            try:
+                ser.open()
+                logging.info(f"[SAMD] Bootloader port appeared as {device} "
+                             f"(was {original_port}).")
+                return device
+            except Exception:
+                ser.port = original_port
+    return None
+
+
+def read_com_port(ser, proc, shutdown_event, rfc2217_active_event, uf2_active_event, usb_serial=None):
     logging.debug("COM-to-WSL thread started.")
+    consecutive_errors = 0
     try:
         while not shutdown_event.is_set():
             if rfc2217_active_event.is_set() or uf2_active_event.is_set():
@@ -104,11 +285,26 @@ def read_com_port(ser, proc, shutdown_event, rfc2217_active_event, uf2_active_ev
             # Short timeout allows periodic checking of shutdown_event
             try:
                 data = ser.read(1024)
+                consecutive_errors = 0
             except (PermissionError, OSError):
                 # COM port may be temporarily unavailable during board reset
-                # (e.g. Pico rebooting into BOOTSEL). Just retry.
-                if not shutdown_event.is_set():
+                # (e.g. Pico rebooting into BOOTSEL). Retry briefly; repeated
+                # failures mean the device was unplugged or re-enumerated, so
+                # follow it instead of spinning on the stale handle forever.
+                if shutdown_event.is_set():
+                    continue
+                consecutive_errors += 1
+                if consecutive_errors < 4:
                     time.sleep(0.5)
+                    continue
+                logging.warning(
+                    f"{ser.port} stopped responding; waiting for the device "
+                    f"to come back (unplugged or re-enumerating)...")
+                if reopen_serial_port(
+                        ser, usb_serial, shutdown_event,
+                        abort_events=(rfc2217_active_event, uf2_active_event)):
+                    logging.info(f"Bridge resumed on {ser.port}.")
+                consecutive_errors = 0
                 continue
 
             if data and not rfc2217_active_event.is_set() and not uf2_active_event.is_set():
@@ -186,106 +382,6 @@ class ResetProofSerial:
             setattr(object.__getattribute__(self, '_ser'), name, value)
 
 
-def esp32_manual_reset(ser):
-    """Execute the classic ESP32 auto-reset sequence directly on the COM port."""
-    logging.info("[ESP32] Executing manual reset for download mode...")
-    try:
-        ser.dtr = False  # IO0 = HIGH
-        ser.rts = True   # EN = LOW (hold in reset)
-        time.sleep(0.1)  # Let capacitor discharge
-        ser.dtr = True   # IO0 = LOW (download mode signal)
-        ser.rts = False  # EN = HIGH (release reset -> boot with IO0 LOW)
-        time.sleep(0.05) # Wait for boot
-        ser.dtr = False  # IO0 = HIGH (release GPIO0)
-        logging.info("[ESP32] Manual reset complete. Chip should be in download mode.")
-    except Exception as e:
-        logging.error(f"[ESP32] Manual reset failed: {e}")
-
-
-class AutoplaySuppressor:
-    """Temporarily disables Windows AutoPlay to prevent Explorer windows from popping up during device reboot."""
-    def __init__(self):
-        self.key_path = r"Software\Microsoft\Windows\CurrentVersion\Explorer\AutoplayHandlers"
-        self.value_name = "DisableAutoplay"
-        self.original_value = None
-        self.existed = False
-        self.modified = False
-
-    def __enter__(self):
-        if not winreg:
-            return self
-        try:
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.key_path, 0, winreg.KEY_READ | winreg.KEY_WRITE)
-            try:
-                self.original_value, val_type = winreg.QueryValueEx(key, self.value_name)
-                self.existed = True
-            except FileNotFoundError:
-                self.existed = False
-                self.original_value = 0
-            
-            winreg.SetValueEx(key, self.value_name, 0, winreg.REG_DWORD, 1)
-            winreg.CloseKey(key)
-            self.modified = True
-        except Exception as e:
-            logging.debug(f"Failed to temporarily disable AutoPlay: {e}")
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if not winreg or not self.modified:
-            return
-        try:
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.key_path, 0, winreg.KEY_WRITE)
-            if self.existed:
-                winreg.SetValueEx(key, self.value_name, 0, winreg.REG_DWORD, self.original_value)
-            else:
-                winreg.DeleteValue(key, self.value_name)
-            winreg.CloseKey(key)
-        except Exception as e:
-            logging.debug(f"Failed to restore AutoPlay settings: {e}")
-
-
-def pico_manual_reset(ser):
-    """Trigger RP2040/RP2350 BOOTSEL mode via the classic 1200-baud touch."""
-    logging.info("[UF2] Performing 1200-baud reset to enter BOOTSEL mode...")
-    try:
-        old_baud = getattr(ser, 'baudrate', 115200)
-        ser.dtr = True    # Ensure DTR HIGH first
-        ser.baudrate = 1200
-        time.sleep(0.1)
-        ser.dtr = False   # DTR LOW triggers BOOTSEL via CDC driver
-        time.sleep(0.5)   # Wait for device to reboot into BOOTSEL
-        
-        # The device has rebooted into BOOTSEL, so the old COM port handle is stale.
-        # We MUST close it and restore the original baudrate state. If we don't, 
-        # when we reopen the new COM port after the flash, pyserial will apply 
-        # baudrate=1200 again, which will IMMEDIATELY trigger another reboot 
-        # back into BOOTSEL mode!
-        try:
-            ser.close()
-        except Exception:
-            pass
-            
-        # Restore the baudrate and DTR properties safely while the port is closed.
-        ser.baudrate = old_baud if old_baud != 1200 else 115200
-        ser.dtr = True  # Ensure DTR is asserted when reopened so CDC driver sends data
-        
-        logging.info("[UF2] 1200-baud reset complete. Device should be in BOOTSEL mode.")
-    except Exception as e:
-        logging.error(f"[UF2] Failed to trigger BOOTSEL mode: {e}")
-
-
-def detect_board_type(port_name):
-    """Detect board type from USB VID/PID at startup. Much more reliable than runtime detection."""
-    for port in serial.tools.list_ports.comports():
-        if port.device == port_name:
-            if port.vid == 0x2E8A:  # Raspberry Pi USB VID
-                return 'pico'
-            elif port.vid in (0x10C4, 0x1A86, 0x0403, 0x067B, 0x303A):
-                # Silicon Labs, QinHeng, FTDI, Prolific, Espressif
-                return 'esp32'
-    return 'unknown'
-
-
 def read_wsl_stderr(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_data_queue, uf2_active_event, uf2_data_queue, usb_serial, board_type):
     """
     Reads control messages from WSL bridge's stderr.
@@ -295,9 +391,11 @@ def read_wsl_stderr(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_dat
 
     redirector_stop = None
     redirector_thread = None
+    # Application-port name to restore after a SAMD bootloader upload.
+    samd_app_port = None
 
     def _start_rfc2217_session():
-        nonlocal redirector_stop, redirector_thread
+        nonlocal redirector_stop, redirector_thread, samd_app_port
 
         logging.info("RFC 2217 client connected. PTY bridge suspended.")
         rfc2217_active_event.set()
@@ -306,6 +404,23 @@ def read_wsl_stderr(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_dat
         # Board-specific reset is done upfront based on VID detection
         if board_type == 'esp32':
             esp32_manual_reset(ser)
+        elif board_type == 'samd':
+            # Leonardo/SAMD-class boards enter their bootloader via the
+            # 1200-baud touch, which closes the application port and
+            # re-enumerates a separate bootloader port. Acquire that new
+            # port so the upload (bossac over RFC 2217) talks to it.
+            samd_app_port = ser.port
+            before_ports = snapshot_ports()
+            samd_touch_reset(ser)
+            if acquire_new_port(ser, before_ports, shutdown_event) is None:
+                logging.error("[SAMD] Bootloader port did not appear; the "
+                              "upload will likely fail. Re-opening the "
+                              "application port.")
+                ser.port = samd_app_port
+                try:
+                    ser.open()
+                except Exception:
+                    pass
 
         settings = ser.get_settings()
         redirector_stop = threading.Event()
@@ -327,7 +442,7 @@ def read_wsl_stderr(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_dat
         redirector_thread.start()
 
     def _stop_rfc2217_session():
-        nonlocal redirector_stop, redirector_thread
+        nonlocal redirector_stop, redirector_thread, samd_app_port
 
         if redirector_stop:
             redirector_stop.set()
@@ -346,8 +461,21 @@ def read_wsl_stderr(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_dat
                 time.sleep(0.1)
             except Exception:
                 pass
-        elif board_type == 'pico':
+        elif board_type in UF2_FAMILIES:
             pico_manual_reset(ser)
+        elif board_type == 'stm32':
+            stm32_manual_reset(ser)
+        elif board_type == 'samd':
+            # bossac resets the board back into the application when it
+            # finishes; the bootloader port disappears and the application
+            # port re-enumerates. Restore the original name and reopen.
+            if samd_app_port:
+                ser.port = samd_app_port
+            if not reopen_serial_port(ser, usb_serial, shutdown_event,
+                                      max_attempts=60):
+                logging.warning("[SAMD] Application port did not reappear "
+                                "after upload.")
+            samd_app_port = None
 
         logging.info("RFC 2217 client disconnected. PTY bridge resumed.")
         rfc2217_active_event.clear()
@@ -394,8 +522,7 @@ def read_wsl_stderr(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_dat
 
         # Verify MD5 checksum
         if expected_md5:
-            import hashlib
-            received_md5 = hashlib.md5(uf2_data).hexdigest()
+            received_md5 = md5_hexdigest(uf2_data)
             if received_md5 != expected_md5:
                 logging.error(f"[UF2] MD5 checksum mismatch! Expected: {expected_md5}, Got: {received_md5}")
                 return
@@ -427,11 +554,15 @@ def read_wsl_stderr(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_dat
                             title = ctypes.create_unicode_buffer(512)
                             GetWindowTextW(hwnd, title, 512)
                             t_val = title.value.upper()
-                            # Match known volume labels or the target drive letter
+                            # Match the BOOTSEL volume labels, or the target
+                            # drive only in the parenthesised "(X:)" form that
+                            # Explorer actually uses in window titles. A bare
+                            # "X:" substring would also hit unrelated windows
+                            # whose title merely contains that path prefix.
                             match = "RPI-RP2" in t_val or "RP2350" in t_val
                             if not match and target_letters:
                                 for dl in target_letters:
-                                    if f"{dl}:" in t_val or f"({dl}:)" in t_val:
+                                    if f"({dl}:)" in t_val:
                                         match = True
                                         break
                             if match:
@@ -453,7 +584,7 @@ def read_wsl_stderr(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_dat
             # Trigger BOOTSEL mode directly from host — this is the reliable path.
             # The RFC2217 1200bps open/close from PlatformIO may not reliably
             # reach the COM port through the relay chain, so we do it ourselves.
-            if board_type == 'pico':
+            if board_type in UF2_FAMILIES:
                 pico_manual_reset(ser)
 
             logging.info("[UF2] Locating target drive...")
@@ -479,7 +610,9 @@ def read_wsl_stderr(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_dat
             SW_HIDE = 0
 
             dl = drive_letter[0].upper()
-            targets = ["RPI-RP2", "RP2350", f"{dl}:", f"({dl}:)"]
+            # Use the parenthesised "(X:)" form Explorer renders in titles; a
+            # bare "X:" would also match unrelated windows showing that path.
+            targets = ["RPI-RP2", "RP2350", f"({dl}:)"]
 
             def foreach_window(hwnd, lParam):
                 class_name = ctypes.create_unicode_buffer(256)
@@ -501,7 +634,6 @@ def read_wsl_stderr(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_dat
 
     def _flash_uf2(uf2_data, usb_serial_num, target_letters=None):
         """Find the correct UF2 drive and write the firmware."""
-        import string
         target_drive = None
         for attempt in range(20):  # Up to 10 seconds
             if usb_serial_num:
@@ -509,8 +641,7 @@ def read_wsl_stderr(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_dat
 
             # Fallback: scan for INFO_UF2.TXT
             if not target_drive:
-                drives = [f"{d}:\\" for d in string.ascii_uppercase if os.path.exists(f"{d}:\\")]
-                for d in drives:
+                for d in list_removable_drives():
                     if os.path.exists(os.path.join(d, "INFO_UF2.TXT")):
                         target_drive = d
                         break
@@ -623,6 +754,12 @@ def read_wsl_stderr(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_dat
 
             elif line_str.startswith("[CONTROL] RFC2217_ERROR"):
                 logging.warning(f"[WSL] {line_str}")
+                if "bind failed" in line_str:
+                    logging.warning(
+                        "The RFC 2217 TCP port could not be opened in WSL "
+                        "(already in use?). Uploads will not work; pick a "
+                        "free port with --rfc2217-port."
+                    )
 
             elif line_str.startswith("[CONTROL] UF2_READY"):
                 port_str = line_str.split(":")[1] if ":" in line_str else "?"
@@ -638,58 +775,26 @@ def read_wsl_stderr(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_dat
                 # permanently stale (ERROR_BAD_COMMAND). We must close
                 # and reopen it. uf2_active_event is still set here, so
                 # read_com_port and read_wsl_stdout won't touch ser.
-                if board_type == 'pico':
-                    port_name = ser.port
-                    logging.info(f"[UF2] Reopening {port_name} after device reboot...")
-                    try:
-                        ser.close()
-                    except Exception:
-                        pass
-                        
-                    # Double check that we don't trigger BOOTSEL during reconnect!
-                    if getattr(ser, 'baudrate', 115200) == 1200:
-                        ser.baudrate = 115200
-                        
-                    reopened = False
-                    # Pico reboot after UF2 flash can take 15-20 seconds:
-                    #   - UF2 processing on mass storage drive
-                    #   - Device reboot
-                    #   - USB CDC re-enumeration by Windows
-                    for i in range(60):  # Up to 30 seconds
-                        time.sleep(0.5)
-                        # First try the original port name
-                        try:
-                            ser.open()
-                            logging.info(f"[UF2] {port_name} reopened successfully.")
-                            reopened = True
-                            break
-                        except Exception:
-                            pass
-                            
-                        # If original port didn't work, scan by USB serial number
-                        # (port number may have changed after reboot)
-                        if usb_serial:
-                            for p in serial.tools.list_ports.comports():
-                                if p.serial_number == usb_serial and p.device != port_name:
-                                    logging.info(f"[UF2] Device reappeared as {p.device} (was {port_name}).")
-                                    ser.port = p.device
-                                    try:
-                                        ser.open()
-                                        logging.info(f"[UF2] {p.device} opened successfully.")
-                                        reopened = True
-                                        break
-                                    except Exception:
-                                        pass
-                            if reopened:
-                                break
-                                
-                    if not reopened:
-                        logging.error(f"[UF2] COM port did not reappear after 30s. Bridge may not function until device reconnects.")
+                if board_type in UF2_FAMILIES:
+                    logging.info(f"[UF2] Reopening {ser.port} after device reboot...")
+                    # Reboot after a UF2 flash can take 15-20 seconds: UF2
+                    # processing on the mass-storage drive, device reboot,
+                    # then USB CDC re-enumeration by Windows.
+                    if not reopen_serial_port(ser, usb_serial, shutdown_event,
+                                              max_attempts=60):  # up to 30 s
+                        logging.error("[UF2] COM port did not reappear after 30s. Bridge may not function until device reconnects.")
                 uf2_active_event.clear()
                 logging.info("[UF2] Upload pipeline complete.")
 
             elif line_str.startswith("[CONTROL] UF2_ERROR"):
                 logging.warning(f"[WSL] {line_str}")
+                if "bind failed" in line_str:
+                    logging.warning(
+                        "The UF2 relay TCP port could not be opened in WSL "
+                        "(already in use?). UF2 uploads will not work; the "
+                        "relay listens on --rfc2217-port + 1, so pick a "
+                        "different --rfc2217-port."
+                    )
 
             else:
                 logging.info(f"[WSL] {line_str}")
@@ -699,55 +804,8 @@ def read_wsl_stderr(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_dat
             logging.debug(f"Error in WSL stderr thread: {e}")
 
 
-def get_usb_serial_number(port_name):
-    """Find the USB Serial Number (hwid SER=...) for a given COM port."""
-    for port in serial.tools.list_ports.comports():
-        if port.device == port_name:
-            # hwid format example: USB VID:PID=2E8A:F00F SER=98C4FFA253A63FB7 LOCATION=1-6:x.0
-            if 'SER=' in port.hwid:
-                parts = port.hwid.split()
-                for part in parts:
-                    if part.startswith('SER='):
-                        return part[4:]
-    return None
-
-
-def get_drive_by_serial(serial_num):
-    """Use PowerShell/CIM to map a USB Serial Number to a logical Windows Drive Letter."""
-    ps_cmd = r'''
-$drives = Get-CimInstance Win32_DiskDrive
-$partitions = Get-Partition
-$result = @()
-foreach ($d in $drives) {
-    if ($d.PNPDeviceID -match "%s") {
-        foreach ($p in $partitions) {
-            if ($p.DiskNumber -eq $d.Index -and $p.DriveLetter) {
-                $result += [PSCustomObject]@{DriveLetter=($p.DriveLetter + ":\"); PNPDeviceID=$d.PNPDeviceID}
-            }
-        }
-    }
-}
-$result | ConvertTo-Json -Compress
-    ''' % serial_num.replace("'", "''")
-    try:
-        res = subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd], capture_output=True, text=True, creationflags=0x08000000)
-        output = res.stdout.strip()
-        if not output:
-            return None
-        
-        data = json.loads(output)
-        if isinstance(data, dict):
-            return data.get('DriveLetter')
-        elif isinstance(data, list) and len(data) > 0:
-            return data[0].get('DriveLetter')
-    except Exception as e:
-        logging.debug(f"Failed to map USB serial to drive: {e}")
-    return None
-
-
-
 def run_gamepad_bridge(pad_index=0, poll_hz=250, name="Microsoft X-Box 360 pad",
-                       use_uinput=False, tmp_path="/tmp/com2pad0"):
+                       use_uinput=False, tmp_path="/tmp/com2pad0", distro=None):
     """
     Forward a Windows XInput controller into WSL as a virtual gamepad.
 
@@ -774,12 +832,14 @@ def run_gamepad_bridge(pad_index=0, poll_hz=250, name="Microsoft X-Box 360 pad",
     if not os.path.exists(pad_script):
         raise FileNotFoundError(f"WSL gamepad bridge script not found at: {pad_script}")
 
-    wsl_pad_path = get_wsl_path(pad_script)
+    wsl_pad_path = get_wsl_path(pad_script, distro)
     logging.info(f"WSL gamepad bridge script resolved to: {wsl_pad_path}")
 
-    cmd = ["wsl", "python3", "-u", wsl_pad_path,
-           "--pad-index", str(pad_index), "--name", name,
-           "--tmp-path", tmp_path]
+    check_wsl_environment(wsl_pad_path, distro)
+
+    cmd = wsl_command(distro, "python3", "-u", wsl_pad_path,
+                      "--pad-index", str(pad_index), "--name", name,
+                      "--tmp-path", tmp_path)
     if use_uinput:
         cmd.append("--uinput")
     logging.info(f"Spawning WSL process: {' '.join(cmd)}")
@@ -813,11 +873,20 @@ def run_gamepad_bridge(pad_index=0, poll_hz=250, name="Microsoft X-Box 360 pad",
             shutdown_event.set()
 
     def drain_wsl_stdout():
-        """Reverse channel (reserved for future rumble); drain to avoid blocking."""
+        """Reverse channel: rumble (force feedback) frames from the WSL helper.
+
+        The uinput sink forwards effect playback as 6-byte frames; anything
+        else on the pipe is discarded by the resynchronising reader.
+        """
+        from .xinput import RumbleReader
+        reader = RumbleReader()
         try:
             while not shutdown_event.is_set():
-                if not proc.stdout.read(1):
+                data = proc.stdout.read(64)
+                if not data:
                     break
+                for left, right in reader.feed(data):
+                    src.set_rumble(left, right)
         except Exception:
             pass
 
@@ -826,10 +895,7 @@ def run_gamepad_bridge(pad_index=0, poll_hz=250, name="Microsoft X-Box 360 pad",
     t_logs.start()
     t_out.start()
 
-    yellow = "\033[93m"
-    cyan = "\033[96m"
-    green = "\033[92m"
-    reset = "\033[0m"
+    yellow, cyan, green, reset = get_banner_colors()
     if use_uinput:
         sink_mode = "uinput (real /dev/input device, one-time root)"
         sink_node = "/dev/input/event* (SDL2-ready)"
@@ -886,9 +952,86 @@ def run_gamepad_bridge(pad_index=0, poll_hz=250, name="Microsoft X-Box 360 pad",
         logging.info("Gamepad bridge stopped successfully.")
 
 
-def run_bridge(port, baud, wsl_tty, bytesize, parity, stopbits, xonxoff, rtscts, dsrdtr, rfc2217_port):
+def _derive_indexed_path(base, index):
+    """Per-port WSL symlink path for multi-port mode.
+
+    Increments a trailing number when present (/tmp/ttyUSB0 -> /tmp/ttyUSB1),
+    otherwise appends the index, so each bridge gets a distinct endpoint.
+    """
+    if index == 0:
+        return base
+    import re
+    m = re.match(r"^(.*?)(\d+)$", base)
+    if m:
+        return f"{m.group(1)}{int(m.group(2)) + index}"
+    return f"{base}{index}"
+
+
+def run_multi_bridge(ports, baud, wsl_tty, bytesize, parity, stopbits,
+                     xonxoff, rtscts, dsrdtr, rfc2217_port, distro=None,
+                     board="auto"):
+    """Bridge several COM ports concurrently from a single invocation.
+
+    Each port gets its own WSL helper, a distinct symlink path (derived from
+    --wsl-tty by incrementing its trailing number), and a distinct RFC 2217
+    port (base + 2*i, because every bridge also reserves its port + 1 for the
+    UF2 relay). Only the first port performs the PlatformIO environment-var
+    injection and picotool interception, so the bridges do not overwrite each
+    other's shell configuration.
+    """
+    stop_event = threading.Event()
+    threads = []
+
+    def _runner(index, port_name):
+        try:
+            run_bridge(
+                port=port_name, baud=baud,
+                wsl_tty=_derive_indexed_path(wsl_tty, index),
+                bytesize=bytesize, parity=parity, stopbits=stopbits,
+                xonxoff=xonxoff, rtscts=rtscts, dsrdtr=dsrdtr,
+                rfc2217_port=rfc2217_port + 2 * index,
+                distro=distro, board=board,
+                env_setup=(index == 0), stop_event=stop_event)
+        except Exception as e:
+            logging.error(f"Bridge for {port_name} failed: {e}")
+
+    for i, port_name in enumerate(ports):
+        t = threading.Thread(target=_runner, args=(i, port_name), daemon=True)
+        t.start()
+        threads.append(t)
+
+    try:
+        while any(t.is_alive() for t in threads):
+            time.sleep(0.5)
+        logging.info("All bridges have stopped.")
+    except KeyboardInterrupt:
+        logging.info("Stopping all bridges...")
+    finally:
+        stop_event.set()
+        for t in threads:
+            t.join(timeout=5.0)
+
+
+def run_bridge(port, baud, wsl_tty, bytesize, parity, stopbits, xonxoff,
+               rtscts, dsrdtr, rfc2217_port, distro=None, board="auto",
+               env_setup=True, stop_event=None):
+    # Recover any AutoPlay setting a previous run left disabled after a crash.
+    restore_orphaned_autoplay()
+
     # Resolve serial settings
     ser_bytesize, ser_parity, ser_stopbits = get_serial_settings(bytesize, parity, stopbits)
+
+    # Locate WSL bridge.py script and verify the WSL environment before
+    # touching the serial port, so a broken WSL setup fails fast and clean.
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    bridge_script = os.path.join(current_dir, "bridge.py")
+    if not os.path.exists(bridge_script):
+        raise FileNotFoundError(f"WSL bridge script not found at: {bridge_script}")
+
+    wsl_bridge_path = get_wsl_path(bridge_script, distro)
+    logging.info(f"WSL bridge script resolved to: {wsl_bridge_path}")
+
+    check_wsl_environment(wsl_bridge_path, distro)
 
     if str(baud).lower() == "auto":
         detected_baud = get_system_baudrate(port)
@@ -914,16 +1057,12 @@ def run_bridge(port, baud, wsl_tty, bytesize, parity, stopbits, xonxoff, rtscts,
         timeout=0.2 # Enable timeout for shutdown check
     )
 
-    # Locate WSL bridge.py script
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    bridge_script = os.path.join(current_dir, "bridge.py")
-    if not os.path.exists(bridge_script):
-        raise FileNotFoundError(f"WSL bridge script not found at: {bridge_script}")
-
-    wsl_bridge_path = get_wsl_path(bridge_script)
-    logging.info(f"WSL bridge script resolved to: {wsl_bridge_path}")
-
-    cmd = ["wsl", "python3", "-u", wsl_bridge_path, "--symlink", wsl_tty, "--rfc2217-port", str(rfc2217_port)]
+    cmd = wsl_command(distro, "python3", "-u", wsl_bridge_path,
+                      "--symlink", wsl_tty, "--rfc2217-port", str(rfc2217_port))
+    if not env_setup:
+        # Secondary bridge in multi-port mode: do not overwrite the primary
+        # bridge's PlatformIO env vars or picotool interception.
+        cmd.append("--no-env-setup")
     logging.info(f"Spawning WSL process: {' '.join(cmd)}")
 
     # Use CREATE_NO_WINDOW to prevent wsl.exe from modifying the Windows console mode,
@@ -943,9 +1082,14 @@ def run_bridge(port, baud, wsl_tty, bytesize, parity, stopbits, xonxoff, rtscts,
     rfc2217_data_queue = queue.Queue()
     uf2_active_event = threading.Event()
     uf2_data_queue = queue.Queue()
-    # Detect board type from USB VID/PID
-    board_type = detect_board_type(port)
-    logging.info(f"Detected board type: {board_type} (VID-based)")
+    # Detect board type from USB VID/PID, unless overridden via --board
+    # (covers boards whose USB-UART chip is not in the VID whitelist).
+    if board and board != "auto":
+        board_type = "unknown" if board == "none" else board
+        logging.info(f"Board type set manually: {board_type}")
+    else:
+        board_type = detect_board_type(port)
+        logging.info(f"Detected board type: {board_type} (VID-based)")
 
     # Determine USB Serial Number for hardware path matching
     usb_serial = get_usb_serial_number(port)
@@ -956,18 +1100,15 @@ def run_bridge(port, baud, wsl_tty, bytesize, parity, stopbits, xonxoff, rtscts,
 
     # Start thread routing
     t_wsl_to_com = threading.Thread(target=read_wsl_stdout, args=(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_data_queue, uf2_active_event, uf2_data_queue), daemon=True)
-    t_com_to_wsl = threading.Thread(target=read_com_port, args=(ser, proc, shutdown_event, rfc2217_active_event, uf2_active_event), daemon=True)
+    t_com_to_wsl = threading.Thread(target=read_com_port, args=(ser, proc, shutdown_event, rfc2217_active_event, uf2_active_event, usb_serial), daemon=True)
     t_wsl_stderr = threading.Thread(target=read_wsl_stderr, args=(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_data_queue, uf2_active_event, uf2_data_queue, usb_serial, board_type), daemon=True)
 
     t_wsl_to_com.start()
     t_com_to_wsl.start()
     t_wsl_stderr.start()
 
-    yellow = "\033[93m"
-    cyan = "\033[96m"
-    green = "\033[92m"
-    reset = "\033[0m"
-    board_label = {'pico': 'RP2040/RP2350 (Pico)', 'esp32': 'ESP32', 'unknown': 'Unknown'}.get(board_type, board_type)
+    yellow, cyan, green, reset = get_banner_colors()
+    board_label = BOARD_LABELS.get(board_type, board_type)
     print(f"\n{yellow}========================================================================{reset}")
     print(f"{yellow}  com2tty Bridge Active - {port}{reset}")
     print(f"{yellow}------------------------------------------------------------------------{reset}")
@@ -975,16 +1116,22 @@ def run_bridge(port, baud, wsl_tty, bytesize, parity, stopbits, xonxoff, rtscts,
     print(f"{cyan}  RFC 2217 upload port : rfc2217://127.0.0.1:{rfc2217_port} (in WSL){reset}")
     print(f"{cyan}  UF2 relay port       : 127.0.0.1:{rfc2217_port + 1} (in WSL){reset}")
     print(f"{cyan}  USB Serial Number    : {usb_serial or 'N/A (fallback mode)'}{reset}")
-    print(f"{cyan}  Picotool interceptor : {'Active' if board_type == 'pico' else 'N/A'}{reset}")
+    print(f"{cyan}  Picotool interceptor : {'Active' if board_type in UF2_FAMILIES else 'N/A'}{reset}")
     print(f"{yellow}------------------------------------------------------------------------{reset}")
-    print(f"{yellow}  [WARNING] Environment variables injected into ~/.bashrc{reset}")
-    print(f"{yellow}  Please OPEN A NEW WSL TERMINAL or run `source ~/.bashrc`{reset}")
+    if env_setup:
+        print(f"{yellow}  [WARNING] Environment variables injected into your WSL shell rc (~/.bashrc, ~/.zshrc){reset}")
+        print(f"{yellow}  Please OPEN A NEW WSL TERMINAL or run `source ~/.bashrc` (or ~/.zshrc){reset}")
+    else:
+        print(f"{cyan}  Secondary bridge: PlatformIO env vars are owned by the first port.{reset}")
     print(f"{yellow}========================================================================{reset}\n")
 
     logging.info("Bridge is fully active. Press Ctrl+C to stop.")
 
     try:
         while not shutdown_event.is_set():
+            if stop_event is not None and stop_event.is_set():
+                logging.info(f"Stop requested; shutting down bridge for {port}.")
+                break
             # Wait and check if the WSL process is still running
             if proc.poll() is not None:
                 logging.info("WSL subprocess exited unexpectedly.")

@@ -1,6 +1,8 @@
 import argparse
 import sys
 import logging
+from com2tty import __version__
+from com2tty.boards import BOARD_CHOICES
 from com2tty.host import run_bridge, run_gamepad_bridge
 
 def main():
@@ -10,9 +12,24 @@ def main():
 
     parser.add_argument(
         "port",
-        nargs="?",
-        help="Windows COM port to connect to (e.g. COM3 or COM1). "
-             "Not required in --gamepad mode."
+        nargs="*",
+        help="Windows COM port(s) to bridge (e.g. COM3, or COM3 COM5 to "
+             "bridge several at once). Not required in --gamepad or "
+             "--list mode."
+    )
+
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"com2tty {__version__}"
+    )
+
+    parser.add_argument(
+        "-l", "--list",
+        dest="list_ports",
+        action="store_true",
+        help="List the serial ports Windows can see (device, VID:PID, USB bus "
+             "id, serial number, detected board) and exit."
     )
 
     parser.add_argument(
@@ -77,6 +94,21 @@ def main():
         default=4000,
         help="TCP port for RFC 2217 server (default: 4000)."
     )
+
+    parser.add_argument(
+        "--distro",
+        default=None,
+        help="WSL distribution to use (default: the WSL default distro). "
+             "Useful when the default distro lacks python3 (e.g. docker-desktop)."
+    )
+
+    parser.add_argument(
+        "--board",
+        choices=BOARD_CHOICES,
+        default="auto",
+        help="Override USB VID board detection for reset/upload handling "
+             "(default: auto). Use 'none' to disable board-specific resets."
+    )
     
     parser.add_argument(
         "--bytesize",
@@ -125,10 +157,16 @@ def main():
         help="Enable debug logging output."
     )
     
-    args = parser.add_argument_group("advanced")
-    
-    parsed_args = parser.parse_args()
-    
+    # Expand @profile tokens (saved argument sets from com2tty.ini) before
+    # parsing; arguments given after the token override the profile's values.
+    from com2tty.profiles import ProfileError, expand_profiles
+    try:
+        argv = expand_profiles(sys.argv[1:])
+    except ProfileError as e:
+        parser.error(str(e))
+
+    parsed_args = parser.parse_args(argv)
+
     # Configure logging
     log_level = logging.DEBUG if parsed_args.debug else logging.INFO
     logging.basicConfig(
@@ -137,7 +175,12 @@ def main():
         datefmt="%H:%M:%S",
         stream=sys.stderr
     )
-    
+
+    if parsed_args.list_ports:
+        from com2tty.discovery import print_port_list
+        print_port_list()
+        return
+
     if parsed_args.gamepad:
         try:
             run_gamepad_bridge(
@@ -146,6 +189,7 @@ def main():
                 name=parsed_args.pad_name,
                 use_uinput=parsed_args.uinput,
                 tmp_path=parsed_args.wsl_pad,
+                distro=parsed_args.distro,
             )
         except KeyboardInterrupt:
             logging.info("Interrupted by user. Exiting.")
@@ -159,21 +203,40 @@ def main():
         return
 
     if not parsed_args.port:
-        parser.error("the 'port' argument is required unless --gamepad is used")
+        parser.error("the 'port' argument is required unless --gamepad or --list is used")
 
     try:
-        run_bridge(
-            port=parsed_args.port,
-            baud=parsed_args.baud,
-            wsl_tty=parsed_args.wsl_tty,
-            bytesize=parsed_args.bytesize,
-            parity=parsed_args.parity,
-            stopbits=parsed_args.stopbits,
-            xonxoff=parsed_args.xonxoff,
-            rtscts=parsed_args.rtscts,
-            dsrdtr=parsed_args.dsrdtr,
-            rfc2217_port=parsed_args.rfc2217_port
-        )
+        if len(parsed_args.port) > 1:
+            from com2tty.host import run_multi_bridge
+            run_multi_bridge(
+                ports=parsed_args.port,
+                baud=parsed_args.baud,
+                wsl_tty=parsed_args.wsl_tty,
+                bytesize=parsed_args.bytesize,
+                parity=parsed_args.parity,
+                stopbits=parsed_args.stopbits,
+                xonxoff=parsed_args.xonxoff,
+                rtscts=parsed_args.rtscts,
+                dsrdtr=parsed_args.dsrdtr,
+                rfc2217_port=parsed_args.rfc2217_port,
+                distro=parsed_args.distro,
+                board=parsed_args.board
+            )
+        else:
+            run_bridge(
+                port=parsed_args.port[0],
+                baud=parsed_args.baud,
+                wsl_tty=parsed_args.wsl_tty,
+                bytesize=parsed_args.bytesize,
+                parity=parsed_args.parity,
+                stopbits=parsed_args.stopbits,
+                xonxoff=parsed_args.xonxoff,
+                rtscts=parsed_args.rtscts,
+                dsrdtr=parsed_args.dsrdtr,
+                rfc2217_port=parsed_args.rfc2217_port,
+                distro=parsed_args.distro,
+                board=parsed_args.board
+            )
     except KeyboardInterrupt:
         logging.info("Interrupted by user. Exiting.")
         sys.exit(0)

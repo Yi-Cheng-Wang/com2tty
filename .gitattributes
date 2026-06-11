@@ -1,0 +1,6 @@
+# Normalise line endings. Python tolerates CRLF, but the WSL-side helper
+# scripts are executed inside Linux and may grow shell shebangs or generate
+# files that assume LF, so pin them (and all Python sources) to LF regardless
+# of the contributor's core.autocrlf setting.
+* text=auto eol=lf
+*.py text eol=lf
