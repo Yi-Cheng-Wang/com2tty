@@ -418,6 +418,14 @@ class UinputGamepad(GamepadSink):
     def open(self):
         if fcntl is None:  # pragma: no cover
             raise OSError("fcntl unavailable (not running on Linux)")
+        # The ioctl numbers and struct layouts here assume a 64-bit (LP64)
+        # kernel ABI (true for both x86_64 and aarch64 WSL). On a 32-bit ABI
+        # the uinput_user_dev/input_event packing would be wrong; fail clearly
+        # so _open_sink falls back to the portable /tmp stream instead.
+        if struct.calcsize("P") != 8:
+            raise OSError(
+                "uinput mode requires a 64-bit (LP64) kernel ABI; this "
+                "interpreter is not 64-bit. Use the default /tmp stream.")
         # O_WRONLY | O_NONBLOCK
         self.fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
 

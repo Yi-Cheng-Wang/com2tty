@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import logging
+import shutil
 import subprocess
 import threading
 import socket
@@ -15,10 +16,28 @@ except ImportError:
     winreg = None
 from .rfc2217_server import Redirector
 
-def get_wsl_path(win_path):
-    cmd = ["wsl", "wslpath", "-u", win_path]
+def wsl_command(distro, *argv):
+    """Build a wsl.exe invocation that bypasses the WSL login shell.
+
+    Without ``--exec``, wsl.exe re-joins its arguments and hands them to the
+    distro's default shell, which re-splits on whitespace. Any path containing
+    a space (e.g. /mnt/c/Program Files/...) would break. ``--exec`` launches
+    the binary directly with the arguments preserved as-is.
+    """
+    cmd = ["wsl"]
+    if distro:
+        cmd += ["-d", distro]
+    cmd.append("--exec")
+    cmd.extend(argv)
+    return cmd
+
+def get_wsl_path(win_path, distro=None):
+    cmd = wsl_command(distro, "wslpath", "-u", win_path)
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        # wslpath emits UTF-8 regardless of the Windows locale; decoding with
+        # the ANSI codepage would corrupt non-ASCII paths (e.g. CJK usernames).
+        res = subprocess.run(cmd, capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", check=True)
         return res.stdout.strip()
     except Exception as e:
         logging.debug(f"wslpath failed: {e}. Using fallback conversion.")
@@ -26,6 +45,108 @@ def get_wsl_path(win_path):
         drive = win_path[0].lower()
         path = win_path[2:].replace("\\", "/")
         return f"/mnt/{drive}{path}"
+
+def check_wsl_environment(wsl_script_path=None, distro=None):
+    """Verify WSL prerequisites before spawning the bridge.
+
+    Each failure mode otherwise surfaces as a cryptic error (WinError 2, an
+    instantly-exiting subprocess, a 'No such file' from deep inside WSL), so
+    fail fast here with an actionable message instead.
+    """
+    target = f"WSL distribution '{distro}'" if distro else "the default WSL distribution"
+
+    if shutil.which("wsl") is None:
+        raise RuntimeError(
+            "wsl.exe was not found in PATH. com2tty requires Windows Subsystem "
+            "for Linux. Install it with 'wsl --install' and try again."
+        )
+
+    try:
+        res = subprocess.run(
+            wsl_command(distro, "python3", "--version"),
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=30,
+        )
+    except Exception as e:
+        raise RuntimeError(f"Failed to start {target}: {e}")
+
+    if res.returncode != 0:
+        detail = (res.stderr or res.stdout or "").strip()
+        raise RuntimeError(
+            f"'python3' is not available in {target} ({detail or 'no output'}). "
+            "Check 'wsl -l -v' for installed distributions, select one with "
+            "--distro, or install Python inside WSL (e.g. 'sudo apt install python3')."
+        )
+
+    if wsl_script_path:
+        res = subprocess.run(
+            wsl_command(distro, "test", "-r", wsl_script_path),
+            capture_output=True, timeout=30,
+        )
+        if res.returncode != 0:
+            raise RuntimeError(
+                f"The com2tty bridge script is not readable from WSL at "
+                f"{wsl_script_path}. Make sure Windows drive automounting is "
+                "enabled in WSL ([automount] in /etc/wsl.conf must not be "
+                "disabled) and that the install path is accessible from WSL."
+            )
+
+def enable_vt_mode():
+    """Enable ANSI escape processing on the Windows console (legacy conhost
+    does not interpret VT sequences unless this flag is set)."""
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        if not kernel32.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING):
+            return False
+        return True
+    except Exception:
+        return False
+
+def get_banner_colors():
+    """Return (yellow, cyan, green, reset) ANSI codes, or empty strings when
+    they would render as garbage (redirected output, NO_COLOR, legacy conhost
+    without VT support)."""
+    if os.environ.get("NO_COLOR"):
+        colored = False
+    elif not (hasattr(sys.stdout, "isatty") and sys.stdout.isatty()):
+        colored = False
+    elif os.name == "nt":
+        colored = enable_vt_mode()
+    else:
+        colored = True
+    if colored:
+        return "\033[93m", "\033[96m", "\033[92m", "\033[0m"
+    return "", "", "", ""
+
+def md5_hexdigest(data):
+    import hashlib
+    try:
+        return hashlib.md5(data, usedforsecurity=False).hexdigest()
+    except TypeError:  # Python < 3.9 has no usedforsecurity flag
+        return hashlib.md5(data).hexdigest()
+
+def list_removable_drives():
+    """Candidate roots for the BOOTSEL mass-storage drive.
+
+    Checking the drive type first keeps the scan off disconnected network
+    drives, where os.path.exists can block for tens of seconds.
+    """
+    import string
+    try:
+        import ctypes
+        get_drive_type = ctypes.windll.kernel32.GetDriveTypeW
+        DRIVE_REMOVABLE = 2
+        return [f"{d}:\\" for d in string.ascii_uppercase
+                if get_drive_type(f"{d}:\\") == DRIVE_REMOVABLE]
+    except Exception:
+        return [f"{d}:\\" for d in string.ascii_uppercase
+                if os.path.exists(f"{d}:\\")]
 
 def get_serial_settings(bytesize, parity, stopbits):
     bytesize_map = {
@@ -56,11 +177,19 @@ def get_serial_settings(bytesize, parity, stopbits):
 def get_system_baudrate(port):
     import re
     try:
-        # mode.com prints system states for COM ports. 
-        # The keys may be localized, but the baudrate value is consistently the first large number.
-        res = subprocess.run(["mode.com", port], capture_output=True, text=True)
+        # mode.com prints the COM port state. The console codepage may not match
+        # Python's locale decoding; the digits we need are ASCII, so replace
+        # anything undecodable.
+        res = subprocess.run(["mode.com", port], capture_output=True, text=True,
+                             errors="replace")
         if res.returncode == 0:
-            match = re.search(r"\b(\d{3,7})\b", res.stdout)
+            # Prefer the number on the line that names the baud field. Most
+            # locales still print the English word "Baud", but other numbers
+            # (e.g. a localized date or the COM index) can precede it, so a
+            # bare "first large number" scan would mis-detect on those systems.
+            match = re.search(r"[Bb]aud[^0-9]*(\d{3,7})", res.stdout)
+            if not match:
+                match = re.search(r"\b(\d{3,7})\b", res.stdout)
             if match:
                 return int(match.group(1))
     except Exception as e:
@@ -202,11 +331,59 @@ def esp32_manual_reset(ser):
         logging.error(f"[ESP32] Manual reset failed: {e}")
 
 
+_AUTOPLAY_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Explorer\AutoplayHandlers"
+_AUTOPLAY_VALUE_NAME = "DisableAutoplay"
+
+def _autoplay_marker_path():
+    import tempfile
+    return os.path.join(tempfile.gettempdir(), "com2tty_autoplay_state.json")
+
+def _restore_autoplay_state(existed, original_value):
+    """Write the AutoPlay registry value back to a known prior state."""
+    if not winreg:
+        return
+    key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _AUTOPLAY_KEY_PATH, 0, winreg.KEY_WRITE)
+    try:
+        if existed:
+            winreg.SetValueEx(key, _AUTOPLAY_VALUE_NAME, 0, winreg.REG_DWORD, original_value)
+        else:
+            try:
+                winreg.DeleteValue(key, _AUTOPLAY_VALUE_NAME)
+            except FileNotFoundError:
+                pass
+    finally:
+        winreg.CloseKey(key)
+
+def restore_orphaned_autoplay():
+    """Recover AutoPlay if a previous run was killed while it was suppressed.
+
+    AutoplaySuppressor persists the pre-modification state to a marker file
+    before touching the registry. If the process dies before __exit__ runs, the
+    DisableAutoplay value stays forced on; this reads that marker on the next
+    startup, restores the saved state, and removes the marker.
+    """
+    marker = _autoplay_marker_path()
+    if not os.path.exists(marker):
+        return
+    try:
+        with open(marker, "r") as f:
+            state = json.load(f)
+        _restore_autoplay_state(state.get("existed", False), state.get("original_value", 0))
+        logging.info("Recovered AutoPlay setting left disabled by a previous session.")
+    except Exception as e:
+        logging.debug(f"Failed to recover orphaned AutoPlay state: {e}")
+    finally:
+        try:
+            os.remove(marker)
+        except Exception:
+            pass
+
+
 class AutoplaySuppressor:
     """Temporarily disables Windows AutoPlay to prevent Explorer windows from popping up during device reboot."""
     def __init__(self):
-        self.key_path = r"Software\Microsoft\Windows\CurrentVersion\Explorer\AutoplayHandlers"
-        self.value_name = "DisableAutoplay"
+        self.key_path = _AUTOPLAY_KEY_PATH
+        self.value_name = _AUTOPLAY_VALUE_NAME
         self.original_value = None
         self.existed = False
         self.modified = False
@@ -222,7 +399,16 @@ class AutoplaySuppressor:
             except FileNotFoundError:
                 self.existed = False
                 self.original_value = 0
-            
+
+            # Persist the prior state BEFORE modifying, so a kill mid-flash can
+            # be self-healed on the next startup (see restore_orphaned_autoplay).
+            try:
+                with open(_autoplay_marker_path(), "w") as f:
+                    json.dump({"existed": self.existed,
+                               "original_value": self.original_value}, f)
+            except Exception as e:
+                logging.debug(f"Failed to write AutoPlay recovery marker: {e}")
+
             winreg.SetValueEx(key, self.value_name, 0, winreg.REG_DWORD, 1)
             winreg.CloseKey(key)
             self.modified = True
@@ -234,14 +420,14 @@ class AutoplaySuppressor:
         if not winreg or not self.modified:
             return
         try:
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.key_path, 0, winreg.KEY_WRITE)
-            if self.existed:
-                winreg.SetValueEx(key, self.value_name, 0, winreg.REG_DWORD, self.original_value)
-            else:
-                winreg.DeleteValue(key, self.value_name)
-            winreg.CloseKey(key)
+            _restore_autoplay_state(self.existed, self.original_value)
         except Exception as e:
             logging.debug(f"Failed to restore AutoPlay settings: {e}")
+        finally:
+            try:
+                os.remove(_autoplay_marker_path())
+            except Exception:
+                pass
 
 
 def pico_manual_reset(ser):
@@ -394,8 +580,7 @@ def read_wsl_stderr(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_dat
 
         # Verify MD5 checksum
         if expected_md5:
-            import hashlib
-            received_md5 = hashlib.md5(uf2_data).hexdigest()
+            received_md5 = md5_hexdigest(uf2_data)
             if received_md5 != expected_md5:
                 logging.error(f"[UF2] MD5 checksum mismatch! Expected: {expected_md5}, Got: {received_md5}")
                 return
@@ -427,11 +612,15 @@ def read_wsl_stderr(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_dat
                             title = ctypes.create_unicode_buffer(512)
                             GetWindowTextW(hwnd, title, 512)
                             t_val = title.value.upper()
-                            # Match known volume labels or the target drive letter
+                            # Match the BOOTSEL volume labels, or the target
+                            # drive only in the parenthesised "(X:)" form that
+                            # Explorer actually uses in window titles. A bare
+                            # "X:" substring would also hit unrelated windows
+                            # whose title merely contains that path prefix.
                             match = "RPI-RP2" in t_val or "RP2350" in t_val
                             if not match and target_letters:
                                 for dl in target_letters:
-                                    if f"{dl}:" in t_val or f"({dl}:)" in t_val:
+                                    if f"({dl}:)" in t_val:
                                         match = True
                                         break
                             if match:
@@ -479,7 +668,9 @@ def read_wsl_stderr(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_dat
             SW_HIDE = 0
 
             dl = drive_letter[0].upper()
-            targets = ["RPI-RP2", "RP2350", f"{dl}:", f"({dl}:)"]
+            # Use the parenthesised "(X:)" form Explorer renders in titles; a
+            # bare "X:" would also match unrelated windows showing that path.
+            targets = ["RPI-RP2", "RP2350", f"({dl}:)"]
 
             def foreach_window(hwnd, lParam):
                 class_name = ctypes.create_unicode_buffer(256)
@@ -501,7 +692,6 @@ def read_wsl_stderr(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_dat
 
     def _flash_uf2(uf2_data, usb_serial_num, target_letters=None):
         """Find the correct UF2 drive and write the firmware."""
-        import string
         target_drive = None
         for attempt in range(20):  # Up to 10 seconds
             if usb_serial_num:
@@ -509,8 +699,7 @@ def read_wsl_stderr(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_dat
 
             # Fallback: scan for INFO_UF2.TXT
             if not target_drive:
-                drives = [f"{d}:\\" for d in string.ascii_uppercase if os.path.exists(f"{d}:\\")]
-                for d in drives:
+                for d in list_removable_drives():
                     if os.path.exists(os.path.join(d, "INFO_UF2.TXT")):
                         target_drive = d
                         break
@@ -623,6 +812,12 @@ def read_wsl_stderr(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_dat
 
             elif line_str.startswith("[CONTROL] RFC2217_ERROR"):
                 logging.warning(f"[WSL] {line_str}")
+                if "bind failed" in line_str:
+                    logging.warning(
+                        "The RFC 2217 TCP port could not be opened in WSL "
+                        "(already in use?). Uploads will not work; pick a "
+                        "free port with --rfc2217-port."
+                    )
 
             elif line_str.startswith("[CONTROL] UF2_READY"):
                 port_str = line_str.split(":")[1] if ":" in line_str else "?"
@@ -690,6 +885,13 @@ def read_wsl_stderr(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_dat
 
             elif line_str.startswith("[CONTROL] UF2_ERROR"):
                 logging.warning(f"[WSL] {line_str}")
+                if "bind failed" in line_str:
+                    logging.warning(
+                        "The UF2 relay TCP port could not be opened in WSL "
+                        "(already in use?). UF2 uploads will not work; the "
+                        "relay listens on --rfc2217-port + 1, so pick a "
+                        "different --rfc2217-port."
+                    )
 
             else:
                 logging.info(f"[WSL] {line_str}")
@@ -713,13 +915,23 @@ def get_usb_serial_number(port_name):
 
 
 def get_drive_by_serial(serial_num):
-    """Use PowerShell/CIM to map a USB Serial Number to a logical Windows Drive Letter."""
+    """Use PowerShell/CIM to map a USB Serial Number to a logical Windows Drive Letter.
+
+    The serial number originates from an external USB device descriptor and is
+    therefore untrusted input. It is handed to PowerShell through an environment
+    variable -- never interpolated into the script text -- and matched as a
+    regex-escaped literal, so a hostile serial (containing quotes, ``$(...)``,
+    backticks, or regex metacharacters) cannot inject PowerShell or corrupt the
+    match.
+    """
     ps_cmd = r'''
+$serial = $env:COM2TTY_TARGET_SERIAL
+$escaped = [regex]::Escape($serial)
 $drives = Get-CimInstance Win32_DiskDrive
 $partitions = Get-Partition
 $result = @()
 foreach ($d in $drives) {
-    if ($d.PNPDeviceID -match "%s") {
+    if ($d.PNPDeviceID -match $escaped) {
         foreach ($p in $partitions) {
             if ($p.DiskNumber -eq $d.Index -and $p.DriveLetter) {
                 $result += [PSCustomObject]@{DriveLetter=($p.DriveLetter + ":\"); PNPDeviceID=$d.PNPDeviceID}
@@ -728,9 +940,13 @@ foreach ($d in $drives) {
     }
 }
 $result | ConvertTo-Json -Compress
-    ''' % serial_num.replace("'", "''")
+    '''
     try:
-        res = subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd], capture_output=True, text=True, creationflags=0x08000000)
+        env = dict(os.environ)
+        env["COM2TTY_TARGET_SERIAL"] = serial_num
+        res = subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd],
+                             capture_output=True, text=True,
+                             creationflags=0x08000000, env=env)
         output = res.stdout.strip()
         if not output:
             return None
@@ -747,7 +963,7 @@ $result | ConvertTo-Json -Compress
 
 
 def run_gamepad_bridge(pad_index=0, poll_hz=250, name="Microsoft X-Box 360 pad",
-                       use_uinput=False, tmp_path="/tmp/com2pad0"):
+                       use_uinput=False, tmp_path="/tmp/com2pad0", distro=None):
     """
     Forward a Windows XInput controller into WSL as a virtual gamepad.
 
@@ -774,12 +990,14 @@ def run_gamepad_bridge(pad_index=0, poll_hz=250, name="Microsoft X-Box 360 pad",
     if not os.path.exists(pad_script):
         raise FileNotFoundError(f"WSL gamepad bridge script not found at: {pad_script}")
 
-    wsl_pad_path = get_wsl_path(pad_script)
+    wsl_pad_path = get_wsl_path(pad_script, distro)
     logging.info(f"WSL gamepad bridge script resolved to: {wsl_pad_path}")
 
-    cmd = ["wsl", "python3", "-u", wsl_pad_path,
-           "--pad-index", str(pad_index), "--name", name,
-           "--tmp-path", tmp_path]
+    check_wsl_environment(wsl_pad_path, distro)
+
+    cmd = wsl_command(distro, "python3", "-u", wsl_pad_path,
+                      "--pad-index", str(pad_index), "--name", name,
+                      "--tmp-path", tmp_path)
     if use_uinput:
         cmd.append("--uinput")
     logging.info(f"Spawning WSL process: {' '.join(cmd)}")
@@ -826,10 +1044,7 @@ def run_gamepad_bridge(pad_index=0, poll_hz=250, name="Microsoft X-Box 360 pad",
     t_logs.start()
     t_out.start()
 
-    yellow = "\033[93m"
-    cyan = "\033[96m"
-    green = "\033[92m"
-    reset = "\033[0m"
+    yellow, cyan, green, reset = get_banner_colors()
     if use_uinput:
         sink_mode = "uinput (real /dev/input device, one-time root)"
         sink_node = "/dev/input/event* (SDL2-ready)"
@@ -886,9 +1101,24 @@ def run_gamepad_bridge(pad_index=0, poll_hz=250, name="Microsoft X-Box 360 pad",
         logging.info("Gamepad bridge stopped successfully.")
 
 
-def run_bridge(port, baud, wsl_tty, bytesize, parity, stopbits, xonxoff, rtscts, dsrdtr, rfc2217_port):
+def run_bridge(port, baud, wsl_tty, bytesize, parity, stopbits, xonxoff, rtscts, dsrdtr, rfc2217_port, distro=None, board="auto"):
+    # Recover any AutoPlay setting a previous run left disabled after a crash.
+    restore_orphaned_autoplay()
+
     # Resolve serial settings
     ser_bytesize, ser_parity, ser_stopbits = get_serial_settings(bytesize, parity, stopbits)
+
+    # Locate WSL bridge.py script and verify the WSL environment before
+    # touching the serial port, so a broken WSL setup fails fast and clean.
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    bridge_script = os.path.join(current_dir, "bridge.py")
+    if not os.path.exists(bridge_script):
+        raise FileNotFoundError(f"WSL bridge script not found at: {bridge_script}")
+
+    wsl_bridge_path = get_wsl_path(bridge_script, distro)
+    logging.info(f"WSL bridge script resolved to: {wsl_bridge_path}")
+
+    check_wsl_environment(wsl_bridge_path, distro)
 
     if str(baud).lower() == "auto":
         detected_baud = get_system_baudrate(port)
@@ -914,16 +1144,8 @@ def run_bridge(port, baud, wsl_tty, bytesize, parity, stopbits, xonxoff, rtscts,
         timeout=0.2 # Enable timeout for shutdown check
     )
 
-    # Locate WSL bridge.py script
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    bridge_script = os.path.join(current_dir, "bridge.py")
-    if not os.path.exists(bridge_script):
-        raise FileNotFoundError(f"WSL bridge script not found at: {bridge_script}")
-
-    wsl_bridge_path = get_wsl_path(bridge_script)
-    logging.info(f"WSL bridge script resolved to: {wsl_bridge_path}")
-
-    cmd = ["wsl", "python3", "-u", wsl_bridge_path, "--symlink", wsl_tty, "--rfc2217-port", str(rfc2217_port)]
+    cmd = wsl_command(distro, "python3", "-u", wsl_bridge_path,
+                      "--symlink", wsl_tty, "--rfc2217-port", str(rfc2217_port))
     logging.info(f"Spawning WSL process: {' '.join(cmd)}")
 
     # Use CREATE_NO_WINDOW to prevent wsl.exe from modifying the Windows console mode,
@@ -943,9 +1165,14 @@ def run_bridge(port, baud, wsl_tty, bytesize, parity, stopbits, xonxoff, rtscts,
     rfc2217_data_queue = queue.Queue()
     uf2_active_event = threading.Event()
     uf2_data_queue = queue.Queue()
-    # Detect board type from USB VID/PID
-    board_type = detect_board_type(port)
-    logging.info(f"Detected board type: {board_type} (VID-based)")
+    # Detect board type from USB VID/PID, unless overridden via --board
+    # (covers boards whose USB-UART chip is not in the VID whitelist).
+    if board and board != "auto":
+        board_type = "unknown" if board == "none" else board
+        logging.info(f"Board type set manually: {board_type}")
+    else:
+        board_type = detect_board_type(port)
+        logging.info(f"Detected board type: {board_type} (VID-based)")
 
     # Determine USB Serial Number for hardware path matching
     usb_serial = get_usb_serial_number(port)
@@ -963,10 +1190,7 @@ def run_bridge(port, baud, wsl_tty, bytesize, parity, stopbits, xonxoff, rtscts,
     t_com_to_wsl.start()
     t_wsl_stderr.start()
 
-    yellow = "\033[93m"
-    cyan = "\033[96m"
-    green = "\033[92m"
-    reset = "\033[0m"
+    yellow, cyan, green, reset = get_banner_colors()
     board_label = {'pico': 'RP2040/RP2350 (Pico)', 'esp32': 'ESP32', 'unknown': 'Unknown'}.get(board_type, board_type)
     print(f"\n{yellow}========================================================================{reset}")
     print(f"{yellow}  com2tty Bridge Active - {port}{reset}")
@@ -977,8 +1201,8 @@ def run_bridge(port, baud, wsl_tty, bytesize, parity, stopbits, xonxoff, rtscts,
     print(f"{cyan}  USB Serial Number    : {usb_serial or 'N/A (fallback mode)'}{reset}")
     print(f"{cyan}  Picotool interceptor : {'Active' if board_type == 'pico' else 'N/A'}{reset}")
     print(f"{yellow}------------------------------------------------------------------------{reset}")
-    print(f"{yellow}  [WARNING] Environment variables injected into ~/.bashrc{reset}")
-    print(f"{yellow}  Please OPEN A NEW WSL TERMINAL or run `source ~/.bashrc`{reset}")
+    print(f"{yellow}  [WARNING] Environment variables injected into your WSL shell rc (~/.bashrc, ~/.zshrc){reset}")
+    print(f"{yellow}  Please OPEN A NEW WSL TERMINAL or run `source ~/.bashrc` (or ~/.zshrc){reset}")
     print(f"{yellow}========================================================================{reset}\n")
 
     logging.info("Bridge is fully active. Press Ctrl+C to stop.")
