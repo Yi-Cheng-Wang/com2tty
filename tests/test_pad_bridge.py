@@ -398,6 +398,195 @@ class TestUinputGamepad(unittest.TestCase):
         sink = pb.UinputGamepad()
         sink.close()  # fd is None branch, no-op
 
+    @patch("com2tty.pad_bridge.os.O_NONBLOCK", 2048, create=True)
+    @patch("com2tty.pad_bridge.os.write")
+    @patch("com2tty.pad_bridge.os.open", return_value=9)
+    def test_open_declares_force_feedback(self, m_open, m_write):
+        fake_fcntl = MagicMock()
+        with patch("com2tty.pad_bridge.fcntl", fake_fcntl):
+            sink = pb.UinputGamepad()
+            sink.open()
+        calls = [c.args[1] for c in fake_fcntl.ioctl.call_args_list]
+        self.assertIn(pb.UI_SET_FFBIT, calls)
+        # ff_effects_max must be non-zero in the written uinput_user_dev.
+        dev = m_write.call_args.args[1]
+        (ff_max,) = struct.unpack_from("<I", dev, pb.UINPUT_MAX_NAME_SIZE + 8)
+        self.assertEqual(ff_max, pb.FF_MAX_EFFECTS)
+
+
+class TestUinputForceFeedback(unittest.TestCase):
+    """The kernel-driven FF handshake on the uinput fd."""
+
+    def _sink(self):
+        sink = pb.UinputGamepad()
+        sink.fd = 9
+        return sink
+
+    @staticmethod
+    def _event(etype, code, value):
+        return struct.pack(pb.INPUT_EVENT_FORMAT, 0, 0, etype, code, value)
+
+    def test_ff_fileno_reports_fd(self):
+        self.assertEqual(self._sink().ff_fileno(), 9)
+
+    def test_tmp_stream_has_no_ff_channel(self):
+        self.assertIsNone(pb.TmpStreamGamepad().ff_fileno())
+        self.assertIsNone(pb.GamepadSink().ff_fileno())
+
+    def test_upload_stores_rumble_effect(self):
+        sink = self._sink()
+        request_id = 7
+
+        def fake_ioctl(fd, op, buf, *a):
+            if op == pb.UI_BEGIN_FF_UPLOAD:
+                # Kernel fills in the ff_effect for this request.
+                struct.pack_into("<HH", buf, pb.FF_EFFECT_OFFSET,
+                                 pb.FF_RUMBLE, 3)  # type, id
+                struct.pack_into(
+                    "<HH", buf,
+                    pb.FF_EFFECT_OFFSET + pb.FF_RUMBLE_UNION_OFFSET,
+                    0x8000, 0x4000)  # strong, weak
+
+        fake_fcntl = MagicMock()
+        fake_fcntl.ioctl.side_effect = fake_ioctl
+        with patch("com2tty.pad_bridge.fcntl", fake_fcntl), \
+             patch("com2tty.pad_bridge.os.read",
+                   return_value=self._event(pb.EV_UINPUT, pb.UI_FF_UPLOAD,
+                                            request_id)):
+            self.assertIsNone(sink.handle_ff_io())
+
+        self.assertEqual(sink._effects[3], (0x8000, 0x4000))
+        ops = [c.args[1] for c in fake_fcntl.ioctl.call_args_list]
+        self.assertEqual(ops, [pb.UI_BEGIN_FF_UPLOAD, pb.UI_END_FF_UPLOAD])
+
+    def test_upload_non_rumble_effect_ignored(self):
+        sink = self._sink()
+
+        def fake_ioctl(fd, op, buf, *a):
+            if op == pb.UI_BEGIN_FF_UPLOAD:
+                struct.pack_into("<HH", buf, pb.FF_EFFECT_OFFSET,
+                                 0x51, 4)  # FF_PERIODIC, id 4
+
+        fake_fcntl = MagicMock()
+        fake_fcntl.ioctl.side_effect = fake_ioctl
+        with patch("com2tty.pad_bridge.fcntl", fake_fcntl), \
+             patch("com2tty.pad_bridge.os.read",
+                   return_value=self._event(pb.EV_UINPUT, pb.UI_FF_UPLOAD, 1)):
+            sink.handle_ff_io()
+        self.assertEqual(sink._effects, {})
+
+    def test_upload_ioctl_failure_tolerated(self):
+        sink = self._sink()
+        fake_fcntl = MagicMock()
+        fake_fcntl.ioctl.side_effect = OSError("EINVAL")
+        with patch("com2tty.pad_bridge.fcntl", fake_fcntl), \
+             patch("com2tty.pad_bridge.os.read",
+                   return_value=self._event(pb.EV_UINPUT, pb.UI_FF_UPLOAD, 1)):
+            self.assertIsNone(sink.handle_ff_io())
+
+    def test_erase_removes_effect(self):
+        sink = self._sink()
+        sink._effects[5] = (1, 2)
+
+        def fake_ioctl(fd, op, buf, *a):
+            if op == pb.UI_BEGIN_FF_ERASE:
+                struct.pack_into("<I", buf, 8, 5)  # effect_id
+
+        fake_fcntl = MagicMock()
+        fake_fcntl.ioctl.side_effect = fake_ioctl
+        with patch("com2tty.pad_bridge.fcntl", fake_fcntl), \
+             patch("com2tty.pad_bridge.os.read",
+                   return_value=self._event(pb.EV_UINPUT, pb.UI_FF_ERASE, 2)):
+            self.assertIsNone(sink.handle_ff_io())
+        self.assertEqual(sink._effects, {})
+        ops = [c.args[1] for c in fake_fcntl.ioctl.call_args_list]
+        self.assertEqual(ops, [pb.UI_BEGIN_FF_ERASE, pb.UI_END_FF_ERASE])
+
+    def test_erase_ioctl_failure_tolerated(self):
+        sink = self._sink()
+        fake_fcntl = MagicMock()
+        fake_fcntl.ioctl.side_effect = OSError("EINVAL")
+        with patch("com2tty.pad_bridge.fcntl", fake_fcntl), \
+             patch("com2tty.pad_bridge.os.read",
+                   return_value=self._event(pb.EV_UINPUT, pb.UI_FF_ERASE, 2)):
+            self.assertIsNone(sink.handle_ff_io())
+
+    def test_play_returns_magnitudes(self):
+        sink = self._sink()
+        sink._effects[3] = (0x8000, 0x4000)
+        with patch("com2tty.pad_bridge.os.read",
+                   return_value=self._event(pb.EV_FF, 3, 1)):
+            self.assertEqual(sink.handle_ff_io(), (0x8000, 0x4000))
+
+    def test_play_unknown_effect_is_neutral(self):
+        sink = self._sink()
+        with patch("com2tty.pad_bridge.os.read",
+                   return_value=self._event(pb.EV_FF, 9, 1)):
+            self.assertEqual(sink.handle_ff_io(), (0, 0))
+
+    def test_stop_returns_zero(self):
+        sink = self._sink()
+        sink._effects[3] = (0x8000, 0x4000)
+        with patch("com2tty.pad_bridge.os.read",
+                   return_value=self._event(pb.EV_FF, 3, 0)):
+            self.assertEqual(sink.handle_ff_io(), (0, 0))
+
+    def test_gain_event_ignored(self):
+        sink = self._sink()
+        with patch("com2tty.pad_bridge.os.read",
+                   return_value=self._event(pb.EV_FF, pb.FF_GAIN, 100)):
+            self.assertIsNone(sink.handle_ff_io())
+
+    def test_unrelated_event_ignored(self):
+        sink = self._sink()
+        with patch("com2tty.pad_bridge.os.read",
+                   return_value=self._event(pb.EV_KEY, 0x130, 1)):
+            self.assertIsNone(sink.handle_ff_io())
+
+    def test_short_read_ignored(self):
+        sink = self._sink()
+        with patch("com2tty.pad_bridge.os.read", return_value=b"\x00\x01"):
+            self.assertIsNone(sink.handle_ff_io())
+
+    def test_read_error_ignored(self):
+        sink = self._sink()
+        with patch("com2tty.pad_bridge.os.read",
+                   side_effect=BlockingIOError()):
+            self.assertIsNone(sink.handle_ff_io())
+
+
+class TestRumblePacking(unittest.TestCase):
+
+    def test_pack_rumble_layout(self):
+        blob = pb.pack_rumble(0x1234, 0xABCD)
+        self.assertEqual(len(blob), pb.RUMBLE_SIZE)
+        self.assertEqual(blob[0], pb.RUMBLE_MAGIC0)
+        self.assertEqual(blob[1], pb.RUMBLE_MAGIC1)
+        _, _, strong, weak = struct.unpack(pb.RUMBLE_FORMAT, blob)
+        self.assertEqual((strong, weak), (0x1234, 0xABCD))
+
+    def test_values_masked(self):
+        blob = pb.pack_rumble(0x1FFFF, -1)
+        _, _, strong, weak = struct.unpack(pb.RUMBLE_FORMAT, blob)
+        self.assertEqual((strong, weak), (0xFFFF, 0xFFFF))
+
+
+class TestGuideButton(unittest.TestCase):
+
+    def test_guide_maps_to_btn_mode(self):
+        state = pb.parse_frame(struct.pack(
+            pb.FRAME_FORMAT, pb.FRAME_MAGIC0, pb.FRAME_MAGIC1, 0,
+            0x01, 0x0400, 0, 0, 0, 0, 0, 0))
+        events = pb.state_to_events(state)
+        self.assertIn((pb.EV_KEY, pb.BTN_MODE, 1), events)
+
+    def test_guide_released(self):
+        state = pb.parse_frame(struct.pack(
+            pb.FRAME_FORMAT, pb.FRAME_MAGIC0, pb.FRAME_MAGIC1, 0,
+            0x01, 0x0000, 0, 0, 0, 0, 0, 0))
+        events = pb.state_to_events(state)
+        self.assertIn((pb.EV_KEY, pb.BTN_MODE, 0), events)
+
 
 class TestOpenSink(unittest.TestCase):
 

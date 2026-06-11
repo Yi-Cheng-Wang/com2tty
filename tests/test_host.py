@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import MagicMock, patch, PropertyMock, call
+from unittest.mock import MagicMock, patch, PropertyMock
 import serial
 import sys
 import os
@@ -114,9 +114,9 @@ class TestGetSystemBaudrate(unittest.TestCase):
         self.assertEqual(get_system_baudrate("COM1"), 57600)
 
     def test_winreg_import_error(self):
-        import com2tty.host
-        code = compile(open(com2tty.host.__file__, encoding='utf-8').read(), com2tty.host.__file__, 'exec')
-        ns = {'__name__': 'com2tty.host'}
+        import com2tty.uf2
+        code = compile(open(com2tty.uf2.__file__, encoding='utf-8').read(), com2tty.uf2.__file__, 'exec')
+        ns = {'__name__': 'com2tty.uf2'}
         with patch.dict('sys.modules', {'winreg': None}):
             exec(code, ns)
         self.assertIsNone(ns.get('winreg'))
@@ -342,6 +342,325 @@ class TestReadComPort(unittest.TestCase):
 
 # ?? QueuePipeConnection ?????????????????????????????????????????????????
 
+class TestReopenSerialPort(unittest.TestCase):
+
+    def _events(self):
+        return threading.Event()
+
+    @patch("com2tty.host.time.sleep")
+    def test_reopen_same_port_first_try(self, mock_sleep):
+        from com2tty.host import reopen_serial_port
+        ser = MagicMock()
+        ser.port = "COM3"
+        ser.baudrate = 115200
+        self.assertTrue(reopen_serial_port(ser, None, self._events()))
+        ser.close.assert_called_once()
+        ser.open.assert_called_once()
+
+    @patch("com2tty.host.time.sleep")
+    def test_close_exception_tolerated(self, mock_sleep):
+        from com2tty.host import reopen_serial_port
+        ser = MagicMock()
+        ser.port = "COM3"
+        ser.baudrate = 115200
+        ser.close.side_effect = Exception("already closed")
+        self.assertTrue(reopen_serial_port(ser, None, self._events()))
+
+    @patch("com2tty.host.time.sleep")
+    def test_1200_baud_guard(self, mock_sleep):
+        from com2tty.host import reopen_serial_port
+        ser = MagicMock()
+        ser.port = "COM3"
+        ser.baudrate = 1200
+        reopen_serial_port(ser, None, self._events())
+        self.assertEqual(ser.baudrate, 115200)
+
+    @patch("com2tty.host.time.sleep")
+    def test_shutdown_aborts(self, mock_sleep):
+        from com2tty.host import reopen_serial_port
+        ser = MagicMock()
+        ser.port = "COM3"
+        ser.baudrate = 115200
+        sd = threading.Event()
+        sd.set()
+        self.assertFalse(reopen_serial_port(ser, None, sd))
+        ser.open.assert_not_called()
+
+    @patch("com2tty.host.time.sleep")
+    def test_abort_event_yields(self, mock_sleep):
+        from com2tty.host import reopen_serial_port
+        ser = MagicMock()
+        ser.port = "COM3"
+        ser.baudrate = 115200
+        uf2_evt = threading.Event()
+        uf2_evt.set()
+        self.assertFalse(reopen_serial_port(ser, None, self._events(),
+                                            abort_events=(uf2_evt,)))
+        ser.open.assert_not_called()
+
+    @patch("com2tty.host.time.sleep")
+    @patch("serial.tools.list_ports.comports", return_value=[])
+    def test_max_attempts_exhausted(self, mock_comports, mock_sleep):
+        from com2tty.host import reopen_serial_port
+        ser = MagicMock()
+        ser.port = "COM3"
+        ser.baudrate = 115200
+        ser.open.side_effect = Exception("gone")
+        self.assertFalse(reopen_serial_port(ser, "SER1", self._events(),
+                                            max_attempts=3))
+        self.assertEqual(ser.open.call_count, 3)
+
+    @patch("com2tty.host.time.sleep")
+    @patch("serial.tools.list_ports.comports")
+    def test_follows_device_to_new_port(self, mock_comports, mock_sleep):
+        from com2tty.host import reopen_serial_port
+        ser = MagicMock()
+        ser.port = "COM3"
+        ser.baudrate = 115200
+        calls = [0]
+        def fake_open():
+            calls[0] += 1
+            if calls[0] == 1:
+                raise Exception("COM3 gone")
+        ser.open.side_effect = fake_open
+        new_port = MagicMock()
+        new_port.serial_number = "SER1"
+        new_port.device = "COM9"
+        mock_comports.return_value = [new_port]
+        self.assertTrue(reopen_serial_port(ser, "SER1", self._events()))
+        self.assertEqual(ser.port, "COM9")
+
+    @patch("com2tty.host.time.sleep")
+    @patch("serial.tools.list_ports.comports")
+    def test_scan_skips_non_matching_serial(self, mock_comports, mock_sleep):
+        from com2tty.host import reopen_serial_port
+        ser = MagicMock()
+        ser.port = "COM3"
+        ser.baudrate = 115200
+        ser.open.side_effect = Exception("gone")
+        other = MagicMock()
+        other.serial_number = "OTHER"
+        other.device = "COM9"
+        mock_comports.return_value = [other]
+        self.assertFalse(reopen_serial_port(ser, "SER1", self._events(),
+                                            max_attempts=2))
+        self.assertEqual(ser.port, "COM3")
+
+    @patch("com2tty.host.time.sleep")
+    @patch("serial.tools.list_ports.comports")
+    def test_new_port_open_failure_keeps_trying(self, mock_comports, mock_sleep):
+        from com2tty.host import reopen_serial_port
+        ser = MagicMock()
+        ser.port = "COM3"
+        ser.baudrate = 115200
+        ser.open.side_effect = Exception("gone")
+        new_port = MagicMock()
+        new_port.serial_number = "SER1"
+        new_port.device = "COM9"
+        mock_comports.return_value = [new_port]
+        self.assertFalse(reopen_serial_port(ser, "SER1", self._events(),
+                                            max_attempts=2))
+
+
+class TestAcquireNewPort(unittest.TestCase):
+
+    @patch("com2tty.host.time.sleep")
+    @patch("com2tty.host.snapshot_ports")
+    def test_opens_newly_appeared_port(self, mock_snap, mock_sleep):
+        from com2tty.host import acquire_new_port
+        ser = MagicMock()
+        ser.port = "COM3"
+        ser.baudrate = 1200
+        # First poll: nothing new yet. Second poll: COM9 appeared.
+        mock_snap.side_effect = [{"COM3"}, {"COM3", "COM9"}]
+        before = {"COM3"}
+        self.assertEqual(acquire_new_port(ser, before, threading.Event()),
+                         "COM9")
+        self.assertEqual(ser.port, "COM9")
+        # 1200-baud guard must have reset the rate before opening.
+        self.assertEqual(ser.baudrate, 115200)
+
+    @patch("com2tty.host.time.sleep")
+    @patch("com2tty.host.snapshot_ports")
+    def test_returns_none_and_restores_when_nothing_appears(self, mock_snap,
+                                                            mock_sleep):
+        from com2tty.host import acquire_new_port
+        ser = MagicMock()
+        ser.port = "COM3"
+        ser.baudrate = 115200
+        mock_snap.return_value = {"COM3"}
+        self.assertIsNone(acquire_new_port(ser, {"COM3"}, threading.Event(),
+                                           max_attempts=3))
+        self.assertEqual(ser.port, "COM3")
+        ser.open.assert_not_called()
+
+    @patch("com2tty.host.time.sleep")
+    @patch("com2tty.host.snapshot_ports")
+    def test_open_failure_restores_original_port(self, mock_snap, mock_sleep):
+        from com2tty.host import acquire_new_port
+        ser = MagicMock()
+        ser.port = "COM3"
+        ser.baudrate = 115200
+        ser.open.side_effect = Exception("not ready")
+        mock_snap.return_value = {"COM3", "COM9"}
+        self.assertIsNone(acquire_new_port(ser, {"COM3"}, threading.Event(),
+                                           max_attempts=2))
+        # Restored after each failed open attempt.
+        self.assertEqual(ser.port, "COM3")
+
+    @patch("com2tty.host.time.sleep")
+    @patch("com2tty.host.snapshot_ports")
+    def test_shutdown_aborts(self, mock_snap, mock_sleep):
+        from com2tty.host import acquire_new_port
+        ser = MagicMock()
+        ser.port = "COM3"
+        ser.baudrate = 115200
+        sd = threading.Event()
+        sd.set()
+        self.assertIsNone(acquire_new_port(ser, {"COM3"}, sd))
+        ser.open.assert_not_called()
+
+    def test_snapshot_ports(self):
+        from com2tty.host import snapshot_ports
+        p1 = MagicMock(device="COM3")
+        p2 = MagicMock(device="COM9")
+        with patch("serial.tools.list_ports.comports", return_value=[p1, p2]):
+            self.assertEqual(snapshot_ports(), {"COM3", "COM9"})
+
+
+class TestSamdRfc2217Session(unittest.TestCase):
+    """SAMD acquires the re-enumerated bootloader port on connect and
+    restores the application port on disconnect."""
+
+    def _run(self, ser, lines, usb_serial=None):
+        proc = MagicMock()
+        proc.stderr.readline.side_effect = [ln.encode() for ln in lines] + [b""]
+        read_wsl_stderr(proc, ser, threading.Event(), threading.Event(),
+                        queue.Queue(), threading.Event(), queue.Queue(),
+                        usb_serial, "samd")
+
+    @patch("com2tty.host.reopen_serial_port", return_value=True)
+    @patch("com2tty.host.acquire_new_port", return_value="COM9")
+    @patch("com2tty.host.snapshot_ports", return_value={"COM3"})
+    @patch("com2tty.host.samd_touch_reset")
+    @patch("com2tty.host.Redirector")
+    @patch("com2tty.host.time.sleep")
+    def test_connect_acquires_bootloader_then_disconnect_restores(
+            self, mock_sleep, mock_redir, mock_touch, mock_snap,
+            mock_acquire, mock_reopen):
+        ser = MagicMock()
+        ser.port = "COM3"
+        ser.get_settings.return_value = {}
+        self._run(ser, ["[CONTROL] RFC2217_CONNECT\n",
+                        "[CONTROL] RFC2217_DISCONNECT\n"], usb_serial="SER1")
+
+        mock_touch.assert_called_once_with(ser)
+        mock_acquire.assert_called_once()
+        # Disconnect restored the original application port and reopened it.
+        self.assertEqual(ser.port, "COM3")
+        mock_reopen.assert_called_once()
+
+    @patch("com2tty.host.reopen_serial_port", return_value=False)
+    @patch("com2tty.host.acquire_new_port", return_value=None)
+    @patch("com2tty.host.snapshot_ports", return_value={"COM3"})
+    @patch("com2tty.host.samd_touch_reset")
+    @patch("com2tty.host.Redirector")
+    @patch("com2tty.host.time.sleep")
+    def test_connect_fallback_when_bootloader_absent(
+            self, mock_sleep, mock_redir, mock_touch, mock_snap,
+            mock_acquire, mock_reopen):
+        ser = MagicMock()
+        ser.port = "COM3"
+        ser.get_settings.return_value = {}
+        self._run(ser, ["[CONTROL] RFC2217_CONNECT\n",
+                        "[CONTROL] RFC2217_DISCONNECT\n"])
+        # Connect fell back to reopening the application port...
+        ser.open.assert_called()
+        # ...and disconnect's reopen returned False (warning path).
+        mock_reopen.assert_called_once()
+
+    @patch("com2tty.host.reopen_serial_port", return_value=True)
+    @patch("com2tty.host.acquire_new_port", return_value=None)
+    @patch("com2tty.host.snapshot_ports", return_value={"COM3"})
+    @patch("com2tty.host.samd_touch_reset")
+    @patch("com2tty.host.Redirector")
+    @patch("com2tty.host.time.sleep")
+    def test_connect_fallback_reopen_exception_tolerated(
+            self, mock_sleep, mock_redir, mock_touch, mock_snap,
+            mock_acquire, mock_reopen):
+        ser = MagicMock()
+        ser.port = "COM3"
+        ser.get_settings.return_value = {}
+        ser.open.side_effect = Exception("still gone")
+        self._run(ser, ["[CONTROL] RFC2217_CONNECT\n",
+                        "[CONTROL] RFC2217_DISCONNECT\n"])  # should not raise
+
+
+class TestReadComPortReconnect(unittest.TestCase):
+
+    @patch("com2tty.host.reopen_serial_port", return_value=True)
+    @patch("com2tty.host.time.sleep")
+    def test_repeated_errors_trigger_reopen(self, mock_sleep, mock_reopen):
+        proc, ser = MagicMock(), MagicMock()
+        ser.port = "COM3"
+        sd = threading.Event()
+
+        count = [0]
+        def fake_read(*a):
+            count[0] += 1
+            if count[0] <= 4:
+                raise OSError("device gone")
+            sd.set()
+            return b""
+        ser.read.side_effect = fake_read
+
+        read_com_port(ser, proc, sd, threading.Event(), threading.Event(),
+                      usb_serial="SER1")
+        mock_reopen.assert_called_once()
+        self.assertEqual(mock_reopen.call_args[0][1], "SER1")
+
+    @patch("com2tty.host.reopen_serial_port", return_value=False)
+    @patch("com2tty.host.time.sleep")
+    def test_reopen_failure_keeps_loop_alive(self, mock_sleep, mock_reopen):
+        proc, ser = MagicMock(), MagicMock()
+        ser.port = "COM3"
+        sd = threading.Event()
+
+        count = [0]
+        def fake_read(*a):
+            count[0] += 1
+            if count[0] <= 4:
+                raise OSError("device gone")
+            sd.set()
+            return b""
+        ser.read.side_effect = fake_read
+
+        read_com_port(ser, proc, sd, threading.Event(), threading.Event())
+        mock_reopen.assert_called_once()
+
+    @patch("com2tty.host.reopen_serial_port")
+    @patch("com2tty.host.time.sleep")
+    def test_successful_read_resets_error_count(self, mock_sleep, mock_reopen):
+        proc, ser = MagicMock(), MagicMock()
+        ser.port = "COM3"
+        sd = threading.Event()
+
+        # 3 errors, one good read, 3 errors: never reaches the threshold.
+        sequence = ([OSError("x")] * 3 + [b"ok"] + [OSError("x")] * 3)
+        def fake_read(*a):
+            if not sequence:
+                sd.set()
+                return b""
+            item = sequence.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+        ser.read.side_effect = fake_read
+
+        read_com_port(ser, proc, sd, threading.Event(), threading.Event())
+        mock_reopen.assert_not_called()
+
+
 class TestQueuePipeConnection(unittest.TestCase):
 
     def test_recv_returns_data(self):
@@ -545,11 +864,11 @@ class TestAutoplaySuppressor(unittest.TestCase):
 
     def setUp(self):
         # Keep the marker file out of the real temp dir during these tests.
-        import com2tty.host as host
+        import com2tty.uf2 as uf2
         self._marker = os.path.join(
             os.path.dirname(__file__), "_test_autoplay_marker.json")
         self._patcher = patch.object(
-            host, "_autoplay_marker_path", return_value=self._marker)
+            uf2, "_autoplay_marker_path", return_value=self._marker)
         self._patcher.start()
 
     def tearDown(self):
@@ -564,7 +883,7 @@ class TestAutoplaySuppressor(unittest.TestCase):
         self.assertFalse(sup.existed)
         self.assertFalse(sup.modified)
 
-    @patch("com2tty.host.winreg", None)
+    @patch("com2tty.uf2.winreg", None)
     def test_enter_no_winreg(self):
         """Line 215-216: winreg is None ??early return."""
         sup = AutoplaySuppressor()
@@ -572,13 +891,13 @@ class TestAutoplaySuppressor(unittest.TestCase):
         self.assertIs(result, sup)
         self.assertFalse(sup.modified)
 
-    @patch("com2tty.host.winreg", None)
+    @patch("com2tty.uf2.winreg", None)
     def test_exit_no_winreg(self):
         """Line 234: winreg is None ??exit does nothing."""
         sup = AutoplaySuppressor()
         sup.__exit__(None, None, None)
 
-    @patch("com2tty.host.winreg")
+    @patch("com2tty.uf2.winreg")
     def test_enter_existing_value(self, mock_winreg):
         """Lines 217-228: OpenKey succeeds, QueryValueEx returns existing value."""
         mock_key = MagicMock()
@@ -598,7 +917,7 @@ class TestAutoplaySuppressor(unittest.TestCase):
         mock_winreg.SetValueEx.assert_called_once()
         mock_winreg.CloseKey.assert_called_once_with(mock_key)
 
-    @patch("com2tty.host.winreg")
+    @patch("com2tty.uf2.winreg")
     def test_enter_file_not_found(self, mock_winreg):
         """Lines 222-224: QueryValueEx raises FileNotFoundError ??existed=False."""
         mock_key = MagicMock()
@@ -610,12 +929,12 @@ class TestAutoplaySuppressor(unittest.TestCase):
         mock_winreg.REG_DWORD = 4
 
         sup = AutoplaySuppressor()
-        result = sup.__enter__()
+        sup.__enter__()
         self.assertFalse(sup.existed)
         self.assertEqual(sup.original_value, 0)
         self.assertTrue(sup.modified)
 
-    @patch("com2tty.host.winreg")
+    @patch("com2tty.uf2.winreg")
     def test_enter_open_key_exception(self, mock_winreg):
         """Lines 229-230: OpenKey raises exception ??modified stays False."""
         mock_winreg.OpenKey.side_effect = OSError("access denied")
@@ -624,10 +943,10 @@ class TestAutoplaySuppressor(unittest.TestCase):
         mock_winreg.KEY_WRITE = 2
 
         sup = AutoplaySuppressor()
-        result = sup.__enter__()
+        sup.__enter__()
         self.assertFalse(sup.modified)
 
-    @patch("com2tty.host.winreg")
+    @patch("com2tty.uf2.winreg")
     def test_exit_restore_existing(self, mock_winreg):
         """Lines 236-242: Exit restores existing value."""
         mock_key = MagicMock()
@@ -645,7 +964,7 @@ class TestAutoplaySuppressor(unittest.TestCase):
         mock_winreg.SetValueEx.assert_called_once()
         mock_winreg.CloseKey.assert_called_once_with(mock_key)
 
-    @patch("com2tty.host.winreg")
+    @patch("com2tty.uf2.winreg")
     def test_exit_delete_value(self, mock_winreg):
         """Lines 240-241: Exit deletes value when it didn't exist before."""
         mock_key = MagicMock()
@@ -661,7 +980,7 @@ class TestAutoplaySuppressor(unittest.TestCase):
         mock_winreg.DeleteValue.assert_called_once()
         mock_winreg.CloseKey.assert_called_once_with(mock_key)
 
-    @patch("com2tty.host.winreg")
+    @patch("com2tty.uf2.winreg")
     def test_exit_not_modified(self, mock_winreg):
         """Line 234: modified is False ??exit early."""
         sup = AutoplaySuppressor()
@@ -669,7 +988,7 @@ class TestAutoplaySuppressor(unittest.TestCase):
         sup.__exit__(None, None, None)
         mock_winreg.OpenKey.assert_not_called()
 
-    @patch("com2tty.host.winreg")
+    @patch("com2tty.uf2.winreg")
     def test_exit_exception(self, mock_winreg):
         """Lines 243-244: Exit exception is swallowed."""
         mock_winreg.OpenKey.side_effect = OSError("fail")
@@ -680,7 +999,7 @@ class TestAutoplaySuppressor(unittest.TestCase):
         sup.modified = True
         sup.__exit__(None, None, None)  # should not raise
 
-    @patch("com2tty.host.winreg")
+    @patch("com2tty.uf2.winreg")
     def test_enter_writes_recovery_marker(self, mock_winreg):
         """__enter__ persists prior state to the marker file before modifying."""
         import json
@@ -699,7 +1018,7 @@ class TestAutoplaySuppressor(unittest.TestCase):
         self.assertTrue(state["existed"])
         self.assertEqual(state["original_value"], 3)
 
-    @patch("com2tty.host.winreg")
+    @patch("com2tty.uf2.winreg")
     def test_enter_marker_write_failure_is_tolerated(self, mock_winreg):
         """A failure writing the marker does not abort suppression."""
         mock_key = MagicMock()
@@ -710,7 +1029,7 @@ class TestAutoplaySuppressor(unittest.TestCase):
         mock_winreg.KEY_WRITE = 2
         mock_winreg.REG_DWORD = 4
 
-        with patch("com2tty.host.open", side_effect=OSError("disk full")):
+        with patch("com2tty.uf2.open", side_effect=OSError("disk full")):
             sup = AutoplaySuppressor()
             sup.__enter__()
         self.assertTrue(sup.modified)
@@ -719,11 +1038,11 @@ class TestAutoplaySuppressor(unittest.TestCase):
 class TestRestoreOrphanedAutoplay(unittest.TestCase):
 
     def setUp(self):
-        import com2tty.host as host
+        import com2tty.uf2 as uf2
         self._marker = os.path.join(
             os.path.dirname(__file__), "_test_orphan_marker.json")
         self._patcher = patch.object(
-            host, "_autoplay_marker_path", return_value=self._marker)
+            uf2, "_autoplay_marker_path", return_value=self._marker)
         self._patcher.start()
 
     def tearDown(self):
@@ -740,7 +1059,7 @@ class TestRestoreOrphanedAutoplay(unittest.TestCase):
         from com2tty.host import restore_orphaned_autoplay
         restore_orphaned_autoplay()  # should not raise
 
-    @patch("com2tty.host.winreg")
+    @patch("com2tty.uf2.winreg")
     def test_restores_existing_value_and_removes_marker(self, mock_winreg):
         from com2tty.host import restore_orphaned_autoplay
         mock_key = MagicMock()
@@ -755,7 +1074,7 @@ class TestRestoreOrphanedAutoplay(unittest.TestCase):
         mock_winreg.SetValueEx.assert_called_once()
         self.assertFalse(os.path.exists(self._marker))
 
-    @patch("com2tty.host.winreg")
+    @patch("com2tty.uf2.winreg")
     def test_restores_deleted_value(self, mock_winreg):
         from com2tty.host import restore_orphaned_autoplay
         mock_key = MagicMock()
@@ -769,7 +1088,7 @@ class TestRestoreOrphanedAutoplay(unittest.TestCase):
         mock_winreg.DeleteValue.assert_called_once()
         self.assertFalse(os.path.exists(self._marker))
 
-    @patch("com2tty.host.winreg")
+    @patch("com2tty.uf2.winreg")
     def test_restore_delete_value_not_found(self, mock_winreg):
         from com2tty.host import restore_orphaned_autoplay
         mock_key = MagicMock()
@@ -782,14 +1101,14 @@ class TestRestoreOrphanedAutoplay(unittest.TestCase):
         restore_orphaned_autoplay()  # should not raise
         self.assertFalse(os.path.exists(self._marker))
 
-    @patch("com2tty.host.winreg", None)
+    @patch("com2tty.uf2.winreg", None)
     def test_restore_no_winreg(self):
         from com2tty.host import restore_orphaned_autoplay
         self._write_marker({"existed": True, "original_value": 1})
         restore_orphaned_autoplay()
         self.assertFalse(os.path.exists(self._marker))
 
-    @patch("com2tty.host.winreg")
+    @patch("com2tty.uf2.winreg")
     def test_restore_corrupt_marker(self, mock_winreg):
         from com2tty.host import restore_orphaned_autoplay
         with open(self._marker, "w") as f:
@@ -912,7 +1231,7 @@ class TestReadWslStderr(unittest.TestCase):
         rfc_evt = threading.Event()
         q = queue.Queue()
         proc.stderr.readline.side_effect = [
-            l.encode() if isinstance(l, str) else l for l in lines
+            line.encode() if isinstance(line, str) else line for line in lines
         ] + [b""]
         uf2_evt = threading.Event()
         uf2_q = queue.Queue()
@@ -2111,6 +2430,109 @@ class TestHostEdgeCases(unittest.TestCase):
         mock_usb.assert_called_with("COM1")
 
 
+# == multi-port bridging ====================================================
+
+class TestDeriveIndexedPath(unittest.TestCase):
+
+    def test_index_zero_is_base(self):
+        from com2tty.host import _derive_indexed_path
+        self.assertEqual(_derive_indexed_path("/tmp/ttyUSB0", 0),
+                         "/tmp/ttyUSB0")
+
+    def test_trailing_number_incremented(self):
+        from com2tty.host import _derive_indexed_path
+        self.assertEqual(_derive_indexed_path("/tmp/ttyUSB0", 1),
+                         "/tmp/ttyUSB1")
+        self.assertEqual(_derive_indexed_path("/tmp/ttyUSB0", 2),
+                         "/tmp/ttyUSB2")
+
+    def test_no_trailing_number_appends_index(self):
+        from com2tty.host import _derive_indexed_path
+        self.assertEqual(_derive_indexed_path("/tmp/serial", 1),
+                         "/tmp/serial1")
+
+
+class TestRunMultiBridge(unittest.TestCase):
+
+    @patch("com2tty.host.time.sleep")
+    @patch("com2tty.host.run_bridge")
+    def test_spawns_one_bridge_per_port(self, mock_run, mock_sleep):
+        from com2tty.host import run_multi_bridge
+        run_multi_bridge(["COM3", "COM5"], "auto", "/tmp/ttyUSB0", 8, "N", 1,
+                         False, False, False, 4000)
+
+        self.assertEqual(mock_run.call_count, 2)
+        by_port = {c.kwargs["port"]: c.kwargs
+                   for c in mock_run.call_args_list}
+        self.assertEqual(by_port["COM3"]["wsl_tty"], "/tmp/ttyUSB0")
+        self.assertEqual(by_port["COM3"]["rfc2217_port"], 4000)
+        self.assertTrue(by_port["COM3"]["env_setup"])
+        self.assertEqual(by_port["COM5"]["wsl_tty"], "/tmp/ttyUSB1")
+        self.assertEqual(by_port["COM5"]["rfc2217_port"], 4002)
+        self.assertFalse(by_port["COM5"]["env_setup"])
+        # All bridges share one stop event.
+        self.assertIs(by_port["COM3"]["stop_event"],
+                      by_port["COM5"]["stop_event"])
+
+    @patch("com2tty.host.time.sleep")
+    @patch("com2tty.host.run_bridge", side_effect=Exception("open failed"))
+    def test_bridge_failure_is_logged_not_raised(self, mock_run, mock_sleep):
+        from com2tty.host import run_multi_bridge
+        run_multi_bridge(["COM3", "COM5"], "auto", "/tmp/ttyUSB0", 8, "N", 1,
+                         False, False, False, 4000)  # should not raise
+        self.assertEqual(mock_run.call_count, 2)
+
+    @patch("com2tty.host.time.sleep", side_effect=KeyboardInterrupt())
+    @patch("com2tty.host.run_bridge")
+    def test_keyboard_interrupt_sets_stop_event(self, mock_run, mock_sleep):
+        from com2tty.host import run_multi_bridge
+
+        def block_until_stopped(**kwargs):
+            kwargs["stop_event"].wait(timeout=5.0)
+        mock_run.side_effect = block_until_stopped
+
+        run_multi_bridge(["COM3", "COM5"], "auto", "/tmp/ttyUSB0", 8, "N", 1,
+                         False, False, False, 4000)
+        # Both bridges were released by the shared stop event (no timeout).
+        for c in mock_run.call_args_list:
+            self.assertTrue(c.kwargs["stop_event"].is_set())
+
+
+class TestRunBridgeSecondary(unittest.TestCase):
+
+    @patch("com2tty.host.get_system_baudrate", return_value=115200)
+    @patch("com2tty.host.get_wsl_path", return_value="/wsl/bridge.py")
+    @patch("serial.Serial")
+    @patch("subprocess.Popen")
+    @patch("os.path.exists", return_value=True)
+    @patch("threading.Thread")
+    @patch("com2tty.host.time.sleep")
+    @patch("builtins.print")
+    @patch("com2tty.host.get_usb_serial_number", return_value=None)
+    @patch("com2tty.host.check_wsl_environment")
+    def test_stop_event_and_no_env_setup(self, mock_check, mock_usb, mock_pr,
+                                         mock_sl, mock_thr, mock_ex,
+                                         mock_pop, mock_ser, mock_wsl,
+                                         mock_baud):
+        proc = MagicMock()
+        proc.poll.return_value = None  # would run forever without stop_event
+        mock_pop.return_value = proc
+
+        stop = threading.Event()
+        stop.set()
+        run_bridge("COM1", "auto", "/tmp/tty", 8, "N", 1, False, False, False,
+                   4002, env_setup=False, stop_event=stop)
+
+        cmd = mock_pop.call_args.args[0]
+        self.assertIn("--no-env-setup", cmd)
+        proc.terminate.assert_called()  # poll() None -> terminated in finally
+        # Secondary banner replaces the env-var warning.
+        printed = "\n".join(str(c.args[0]) for c in mock_pr.call_args_list
+                            if c.args)
+        self.assertIn("Secondary bridge", printed)
+        self.assertNotIn("Environment variables injected", printed)
+
+
 # == run_gamepad_bridge =====================================================
 
 class TestRunGamepadBridge(unittest.TestCase):
@@ -2173,6 +2595,28 @@ class TestRunGamepadBridge(unittest.TestCase):
         _time.sleep(0.05)  # let daemon threads finish for coverage
 
         proc.terminate.assert_called()  # poll None in finally -> terminate
+
+    @patch("builtins.print")
+    @patch("com2tty.host.get_wsl_path", return_value="/wsl/pad.py")
+    @patch("os.path.exists", return_value=True)
+    @patch("subprocess.Popen")
+    @patch("com2tty.xinput.GamepadSource")
+    @patch("com2tty.host.check_wsl_environment")
+    def test_drain_forwards_rumble_to_xinput(self, mock_check, mock_src_cls,
+                                             mock_pop, mock_ex, mock_wsl,
+                                             mock_pr):
+        from com2tty.pad_bridge import pack_rumble
+        src = self._fake_src()
+        mock_src_cls.return_value = src
+        proc = self._fake_proc(poll=None)
+        proc.stderr.readline.side_effect = self._slow_eof_readline([b"hi\n"])
+        proc.stdout.read.side_effect = [pack_rumble(0x8000, 0x4000), b""]
+        mock_pop.return_value = proc
+
+        run_gamepad_bridge(pad_index=0)
+        _time.sleep(0.05)  # let the drain thread process the frame
+
+        src.set_rumble.assert_called_with(0x8000, 0x4000)
 
     @patch("builtins.print")
     @patch("com2tty.host.get_wsl_path", return_value="/wsl/pad.py")
@@ -2406,31 +2850,31 @@ class TestBannerColors(unittest.TestCase):
         self.assertEqual(get_banner_colors(), ("", "", "", ""))
 
     @patch.dict("os.environ", {"NO_COLOR": ""})
-    @patch("com2tty.host.sys.stdout")
+    @patch("com2tty.banner.sys.stdout")
     def test_not_a_tty(self, mock_stdout):
         mock_stdout.isatty.return_value = False
         self.assertEqual(get_banner_colors(), ("", "", "", ""))
 
     @patch.dict("os.environ", {"NO_COLOR": ""})
-    @patch("com2tty.host.os.name", "posix")
-    @patch("com2tty.host.sys.stdout")
+    @patch("com2tty.banner.os.name", "posix")
+    @patch("com2tty.banner.sys.stdout")
     def test_posix_tty_colored(self, mock_stdout):
         mock_stdout.isatty.return_value = True
         self.assertEqual(get_banner_colors()[0], "\033[93m")
 
     @patch.dict("os.environ", {"NO_COLOR": ""})
-    @patch("com2tty.host.enable_vt_mode", return_value=True)
-    @patch("com2tty.host.os.name", "nt")
-    @patch("com2tty.host.sys.stdout")
+    @patch("com2tty.banner.enable_vt_mode", return_value=True)
+    @patch("com2tty.banner.os.name", "nt")
+    @patch("com2tty.banner.sys.stdout")
     def test_windows_vt_enabled(self, mock_stdout, mock_vt):
         mock_stdout.isatty.return_value = True
         self.assertEqual(get_banner_colors()[3], "\033[0m")
         mock_vt.assert_called_once()
 
     @patch.dict("os.environ", {"NO_COLOR": ""})
-    @patch("com2tty.host.enable_vt_mode", return_value=False)
-    @patch("com2tty.host.os.name", "nt")
-    @patch("com2tty.host.sys.stdout")
+    @patch("com2tty.banner.enable_vt_mode", return_value=False)
+    @patch("com2tty.banner.os.name", "nt")
+    @patch("com2tty.banner.sys.stdout")
     def test_windows_vt_unavailable(self, mock_stdout, mock_vt):
         mock_stdout.isatty.return_value = True
         self.assertEqual(get_banner_colors(), ("", "", "", ""))
@@ -2514,7 +2958,7 @@ class TestBindFailureHints(unittest.TestCase):
         proc = MagicMock()
         ser = MagicMock()
         proc.stderr.readline.side_effect = [
-            l.encode() for l in lines] + [b""]
+            line.encode() for line in lines] + [b""]
         read_wsl_stderr(proc, ser, threading.Event(), threading.Event(),
                         queue.Queue(), threading.Event(), queue.Queue(),
                         None, "unknown")
