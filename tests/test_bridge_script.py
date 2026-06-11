@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import MagicMock, patch, PropertyMock, call
+from unittest.mock import MagicMock, patch
 import sys
 import os
 import tempfile
@@ -7,17 +7,37 @@ import threading
 import socket as stdlib_socket
 import hashlib
 
+import pytest
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
 import termios  # real on Linux, mock on Windows via conftest
+import com2tty.bridge
 from com2tty.bridge import (
     main, cleanup_symlink, get_rc_files, clean_rc, inject_rc,
     get_pty_settings, run_rfc2217_server_thread, run_uf2_relay_thread,
     setup_picotool_interceptor, cleanup_picotool_interceptor,
     intercepted_picotools, MARKER_START, MARKER_END,
-    PICOTOOL_WRAPPER_CONTENT, kill_leftover_listener, md5_hexdigest,
-    restore_orphaned_picotools,
+    kill_leftover_listener, md5_hexdigest,
+    restore_orphaned_picotools, get_fish_conf_path, clean_fish_conf,
+    inject_fish_conf,
 )
+
+# The autouse fixture below replaces com2tty.bridge.get_fish_conf_path for
+# every test; keep a handle on the real function so it can itself be tested.
+_real_get_fish_conf_path = get_fish_conf_path
+
+
+@pytest.fixture(autouse=True)
+def _no_real_fish_conf(monkeypatch):
+    """Keep clean_rc/inject_rc tests from touching a real fish config.
+
+    The fish snippet path resolves from the live HOME/SHELL; on a developer
+    machine with fish installed these tests would otherwise write and delete
+    a real ~/.config/fish/conf.d/com2tty.fish. Tests that exercise the fish
+    behaviour re-patch get_fish_conf_path themselves.
+    """
+    monkeypatch.setattr(com2tty.bridge, "get_fish_conf_path", lambda: None)
 
 
 # ── get_rc_files ──────────────────────────────────────────────────────────
@@ -1311,6 +1331,48 @@ class TestBridgeMain(unittest.TestCase):
         mock_clean.assert_called_once()
         mock_thread_cls.assert_called()
 
+    # -- multi-port secondary: --no-env-setup ------------------------------
+
+    @patch("sys.argv", ["bridge.py", "--symlink", "/tmp/tty",
+                         "--rfc2217-port", "4002", "--no-env-setup"])
+    @patch("com2tty.bridge.restore_orphaned_picotools")
+    @patch("com2tty.bridge.setup_picotool_interceptor")
+    @patch("com2tty.bridge.inject_rc")
+    @patch("com2tty.bridge.clean_rc")
+    @patch("com2tty.bridge.cleanup_symlink")
+    @patch("com2tty.bridge.threading.Event")
+    @patch("com2tty.bridge.threading.Thread")
+    @patch("os.openpty", create=True, return_value=(3, 4))
+    @patch("os.ttyname", create=True, return_value="/dev/pts/1")
+    @patch("os.path.lexists", return_value=False)
+    @patch("os.symlink", create=True)
+    @patch("com2tty.bridge.get_pty_settings",
+           return_value=(None, None, None, None))
+    @patch("select.select")
+    @patch("os.read", return_value=b"")
+    @patch("os.close")
+    @patch("time.sleep")
+    def test_no_env_setup_skips_injection_and_interception(
+        self, mock_sleep, mock_close, mock_read, mock_select, mock_gps,
+        mock_symlink, mock_lexists, mock_ttyname, mock_openpty,
+        mock_thread_cls, mock_event_cls, mock_cleanup, mock_clean, mock_inj,
+        mock_intercept, mock_restore,
+    ):
+        mock_evt = MagicMock()
+        mock_evt.is_set.side_effect = [True, False, False]
+        mock_event_cls.return_value = mock_evt
+        mock_select.return_value = ([0], [], [])
+
+        main()
+
+        # No shell-rc or picotool changes for a secondary bridge...
+        mock_restore.assert_not_called()
+        mock_inj.assert_not_called()
+        mock_intercept.assert_not_called()
+        mock_clean.assert_not_called()
+        # ...but the RFC 2217 / UF2 relay threads still start.
+        mock_thread_cls.assert_called()
+
     # -- post-select rfc2217 check (line 464) ------------------------------
 
     @patch("sys.argv", ["bridge.py", "--symlink", "/tmp/tty",
@@ -1416,6 +1478,94 @@ class TestBridgeMain(unittest.TestCase):
         mock_select.return_value = ([0], [], [])
 
         main()
+
+
+class TestFishConf(unittest.TestCase):
+
+    @patch.dict(os.environ, {"SHELL": "/usr/bin/fish"})
+    @patch("com2tty.bridge.os.path.isdir", return_value=False)
+    def test_path_for_fish_shell(self, mock_isdir):
+        path = _real_get_fish_conf_path()
+        self.assertTrue(path.endswith(os.path.join("conf.d", "com2tty.fish")))
+
+    @patch.dict(os.environ, {"SHELL": "/bin/bash"})
+    @patch("com2tty.bridge.os.path.isdir", return_value=True)
+    def test_path_when_fish_dir_exists(self, mock_isdir):
+        self.assertIsNotNone(_real_get_fish_conf_path())
+
+    @patch.dict(os.environ, {"SHELL": "/bin/bash"})
+    @patch("com2tty.bridge.os.path.isdir", return_value=False)
+    def test_no_path_without_fish(self, mock_isdir):
+        self.assertIsNone(_real_get_fish_conf_path())
+
+    def test_inject_writes_set_gx_lines(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "conf.d", "com2tty.fish")
+            with patch("com2tty.bridge.get_fish_conf_path", return_value=path):
+                inject_fish_conf(4000, "/tmp/ttyACM5")
+            with open(path) as f:
+                content = f.read()
+            self.assertIn("set -gx PLATFORMIO_UPLOAD_PORT rfc2217://127.0.0.1:4000",
+                          content)
+            self.assertIn("set -gx PLATFORMIO_MONITOR_PORT /tmp/ttyACM5", content)
+
+    def test_inject_noop_without_fish(self):
+        with patch("com2tty.bridge.get_fish_conf_path", return_value=None):
+            inject_fish_conf(4000)  # should not raise, nothing to assert
+
+    def test_inject_write_failure_is_tolerated(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "conf.d", "com2tty.fish")
+            with patch("com2tty.bridge.get_fish_conf_path", return_value=path), \
+                 patch("builtins.open", side_effect=OSError("read-only")):
+                inject_fish_conf(4000)  # should not raise
+
+    def test_clean_removes_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "com2tty.fish")
+            with open(path, "w") as f:
+                f.write("set -gx X 1\n")
+            with patch("com2tty.bridge.get_fish_conf_path", return_value=path):
+                clean_fish_conf()
+            self.assertFalse(os.path.exists(path))
+
+    def test_clean_noop_when_absent(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "com2tty.fish")
+            with patch("com2tty.bridge.get_fish_conf_path", return_value=path):
+                clean_fish_conf()  # should not raise
+
+    def test_clean_noop_without_fish(self):
+        with patch("com2tty.bridge.get_fish_conf_path", return_value=None):
+            clean_fish_conf()  # should not raise
+
+    def test_clean_remove_failure_is_tolerated(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "com2tty.fish")
+            with open(path, "w") as f:
+                f.write("x\n")
+            with patch("com2tty.bridge.get_fish_conf_path", return_value=path), \
+                 patch("com2tty.bridge.os.remove", side_effect=OSError("busy")):
+                clean_fish_conf()  # should not raise
+
+    def test_clean_rc_also_cleans_fish(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "com2tty.fish")
+            with open(path, "w") as f:
+                f.write("x\n")
+            with patch("com2tty.bridge.get_fish_conf_path", return_value=path), \
+                 patch("com2tty.bridge.get_rc_files", return_value=[]):
+                clean_rc()
+            self.assertFalse(os.path.exists(path))
+
+    def test_inject_rc_also_writes_fish(self):
+        with tempfile.TemporaryDirectory() as d:
+            fish_path = os.path.join(d, "conf.d", "com2tty.fish")
+            rc_path = os.path.join(d, ".bashrc")
+            with patch("com2tty.bridge.get_fish_conf_path", return_value=fish_path), \
+                 patch("com2tty.bridge.get_rc_files", return_value=[rc_path]):
+                inject_rc(4000, "/tmp/ttyUSB0")
+            self.assertTrue(os.path.exists(fish_path))
 
 
 if __name__ == "__main__":

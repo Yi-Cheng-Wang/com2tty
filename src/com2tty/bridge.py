@@ -142,7 +142,54 @@ def get_rc_files():
         files.append(zshrc)
     return files
 
+def get_fish_conf_path():
+    """Path for the fish snippet, or None when fish is not in use.
+
+    fish does not read .bashrc/.zshrc; files in ~/.config/fish/conf.d/ are
+    sourced automatically by every new fish shell, so a dedicated snippet
+    there is the idiomatic equivalent of the rc-file block.
+    """
+    home = os.path.expanduser("~")
+    fish_dir = os.path.join(home, ".config", "fish")
+    if os.environ.get("SHELL", "").endswith("fish") or os.path.isdir(fish_dir):
+        return os.path.join(fish_dir, "conf.d", "com2tty.fish")
+    return None
+
+
+def clean_fish_conf():
+    path = get_fish_conf_path()
+    if not path or not os.path.exists(path):
+        return
+    try:
+        os.remove(path)
+        sys.stderr.write(f"Removed {path}\n")
+        sys.stderr.flush()
+    except Exception as e:
+        sys.stderr.write(f"Warning: could not remove {path}: {e}\n")
+        sys.stderr.flush()
+
+
+def inject_fish_conf(port, monitor_path="/tmp/ttyUSB0"):
+    path = get_fish_conf_path()
+    if not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(
+                "# Written by com2tty; removed automatically when it exits.\n"
+                f"set -gx PLATFORMIO_UPLOAD_PORT rfc2217://127.0.0.1:{port}\n"
+                f"set -gx PLATFORMIO_MONITOR_PORT {monitor_path}\n"
+            )
+        sys.stderr.write(f"Injected environment variables to {path}\n")
+        sys.stderr.flush()
+    except Exception as e:
+        sys.stderr.write(f"Warning: could not write {path}: {e}\n")
+        sys.stderr.flush()
+
+
 def clean_rc():
+    clean_fish_conf()
     for rc_path in get_rc_files():
         if not os.path.exists(rc_path):
             continue
@@ -173,6 +220,7 @@ def clean_rc():
 
 def inject_rc(port, monitor_path="/tmp/ttyUSB0"):
     clean_rc()
+    inject_fish_conf(port, monitor_path)
     block = (
         f"{MARKER_START}\n"
         f"export PLATFORMIO_UPLOAD_PORT=rfc2217://127.0.0.1:{port}\n"
@@ -451,7 +499,15 @@ def main():
         type=int,
         help="TCP port for RFC 2217 server to inject into bashrc and listen on"
     )
+    parser.add_argument(
+        "--no-env-setup",
+        action="store_true",
+        help="Skip PlatformIO env-var injection and picotool interception. "
+             "Used for secondary bridges in multi-port mode so they do not "
+             "overwrite the primary bridge's shell configuration."
+    )
     args = parser.parse_args()
+    env_setup = args.rfc2217_port and not args.no_env_setup
 
     target_path = args.symlink
     created_symlink = None
@@ -462,7 +518,7 @@ def main():
     master_fd = None
     slave_fd = None
 
-    if args.rfc2217_port:
+    if env_setup:
         # Self-heal anything a previous, crashed session left behind before we
         # set up our own interceptors. inject_rc already clears stale rc blocks.
         restore_orphaned_picotools()
@@ -510,7 +566,8 @@ def main():
         # Start RFC 2217 server thread if port is specified
         if args.rfc2217_port:
             uf2_port = args.rfc2217_port + 1
-            setup_picotool_interceptor(uf2_port)
+            if env_setup:
+                setup_picotool_interceptor(uf2_port)
             t_rfc2217 = threading.Thread(
                 target=run_rfc2217_server_thread,
                 args=(args.rfc2217_port, rfc2217_active),
@@ -582,12 +639,12 @@ def main():
     except KeyboardInterrupt: # pragma: no cover
         sys.stderr.write("WSL bridge interrupted by signal.\n")
         sys.stderr.flush()
-    except Exception as e: # pragma: no cover
+    except Exception: # pragma: no cover
         sys.stderr.write(f"WSL bridge error: {traceback.format_exc()}\n")
         sys.stderr.flush()
     finally:
         # Clean up symlink and file descriptors
-        if args.rfc2217_port:
+        if env_setup:
             clean_rc()
             cleanup_picotool_interceptor()
         if created_symlink:
