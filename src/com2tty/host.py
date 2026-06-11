@@ -233,6 +233,46 @@ def reopen_serial_port(ser, usb_serial, shutdown_event, abort_events=(),
     return False
 
 
+def snapshot_ports():
+    """Set of COM port device names currently enumerated by Windows."""
+    return {p.device for p in serial.tools.list_ports.comports()}
+
+
+def acquire_new_port(ser, before_ports, shutdown_event, max_attempts=40,
+                     poll_interval=0.25):
+    """Open the port that newly appears after a bootloader touch.
+
+    A SAMD/Leonardo 1200-baud touch re-enumerates the board's bootloader as a
+    *new* COM port, typically with a different VID:PID and USB serial number
+    than the application port, so matching by serial number (as
+    ``reopen_serial_port`` does) is unreliable. Instead this diffs the live
+    port list against ``before_ports`` (snapshotted before the touch) and
+    opens whatever appeared -- the approach the Arduino tooling uses.
+
+    Leaves ``ser`` open on the new port and returns its name on success, or
+    restores ``ser.port`` and returns None when no new port appears.
+    """
+    original_port = ser.port
+    # Never reopen at 1200 baud: that would immediately re-trigger the touch.
+    if getattr(ser, 'baudrate', 115200) == 1200:
+        ser.baudrate = 115200
+
+    attempts = 0
+    while not shutdown_event.is_set() and attempts < max_attempts:
+        attempts += 1
+        time.sleep(poll_interval)
+        for device in sorted(snapshot_ports() - before_ports):
+            ser.port = device
+            try:
+                ser.open()
+                logging.info(f"[SAMD] Bootloader port appeared as {device} "
+                             f"(was {original_port}).")
+                return device
+            except Exception:
+                ser.port = original_port
+    return None
+
+
 def read_com_port(ser, proc, shutdown_event, rfc2217_active_event, uf2_active_event, usb_serial=None):
     logging.debug("COM-to-WSL thread started.")
     consecutive_errors = 0
@@ -351,9 +391,11 @@ def read_wsl_stderr(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_dat
 
     redirector_stop = None
     redirector_thread = None
+    # Application-port name to restore after a SAMD bootloader upload.
+    samd_app_port = None
 
     def _start_rfc2217_session():
-        nonlocal redirector_stop, redirector_thread
+        nonlocal redirector_stop, redirector_thread, samd_app_port
 
         logging.info("RFC 2217 client connected. PTY bridge suspended.")
         rfc2217_active_event.set()
@@ -364,8 +406,21 @@ def read_wsl_stderr(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_dat
             esp32_manual_reset(ser)
         elif board_type == 'samd':
             # Leonardo/SAMD-class boards enter their bootloader via the
-            # 1200-baud touch; the upload then proceeds over RFC 2217.
+            # 1200-baud touch, which closes the application port and
+            # re-enumerates a separate bootloader port. Acquire that new
+            # port so the upload (bossac over RFC 2217) talks to it.
+            samd_app_port = ser.port
+            before_ports = snapshot_ports()
             samd_touch_reset(ser)
+            if acquire_new_port(ser, before_ports, shutdown_event) is None:
+                logging.error("[SAMD] Bootloader port did not appear; the "
+                              "upload will likely fail. Re-opening the "
+                              "application port.")
+                ser.port = samd_app_port
+                try:
+                    ser.open()
+                except Exception:
+                    pass
 
         settings = ser.get_settings()
         redirector_stop = threading.Event()
@@ -387,7 +442,7 @@ def read_wsl_stderr(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_dat
         redirector_thread.start()
 
     def _stop_rfc2217_session():
-        nonlocal redirector_stop, redirector_thread
+        nonlocal redirector_stop, redirector_thread, samd_app_port
 
         if redirector_stop:
             redirector_stop.set()
@@ -410,6 +465,17 @@ def read_wsl_stderr(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_dat
             pico_manual_reset(ser)
         elif board_type == 'stm32':
             stm32_manual_reset(ser)
+        elif board_type == 'samd':
+            # bossac resets the board back into the application when it
+            # finishes; the bootloader port disappears and the application
+            # port re-enumerates. Restore the original name and reopen.
+            if samd_app_port:
+                ser.port = samd_app_port
+            if not reopen_serial_port(ser, usb_serial, shutdown_event,
+                                      max_attempts=60):
+                logging.warning("[SAMD] Application port did not reappear "
+                                "after upload.")
+            samd_app_port = None
 
         logging.info("RFC 2217 client disconnected. PTY bridge resumed.")
         rfc2217_active_event.clear()
