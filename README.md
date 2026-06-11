@@ -37,8 +37,11 @@ to Linux tools running in WSL.
 The Windows host requires Python 3.8 or later. The `pyserial` package, version
 3.5 or later, is the only runtime dependency and is installed automatically with
 the package. A working WSL installation is required, and the WSL distribution
-must provide `python3` on its `PATH`. The WSL helper uses only the Python
-standard library and therefore needs no additional packages inside WSL.
+must provide `python3` on its `PATH`. By default the WSL default distribution
+is used; a specific one can be selected with `--distro`. The WSL helper uses
+only the Python standard library and therefore needs no additional packages
+inside WSL. These prerequisites are verified at startup and a specific,
+actionable error is reported when one is missing.
 
 Serial forwarding requires a COM port that Windows can open. Gamepad forwarding
 requires a controller that the Windows XInput driver recognises, which is the
@@ -84,10 +87,13 @@ is omitted in gamepad mode, which is selected with `--gamepad`.
 
 ### Options common to both modes
 
-The following option applies to both modes.
+The following options apply to both modes.
 
 ```text
 -d, --debug            Enable verbose debug logging on standard error.
+--distro NAME          WSL distribution to use (default: the WSL default
+                       distribution). Useful when the default distribution
+                       lacks python3, for example docker-desktop.
 ```
 
 ### Serial-mode options
@@ -108,6 +114,11 @@ port                   Windows COM port to bridge, for example COM3. Required
 --xonxoff              Enable software flow control (XON/XOFF).
 --rtscts               Enable hardware flow control (RTS/CTS).
 --dsrdtr               Enable hardware flow control (DSR/DTR).
+--board {auto,esp32,pico,none}
+                       Override USB VID board detection for reset and upload
+                       handling (default: auto). Use this when a board uses a
+                       USB-UART chip that com2tty does not recognise; "none"
+                       disables board-specific reset sequences entirely.
 ```
 
 ### Gamepad-mode options
@@ -193,11 +204,13 @@ involves three mechanisms.
 First, the WSL helper starts an RFC 2217 forwarder that listens on
 `127.0.0.1:<rfc2217-port>` inside WSL, where the port defaults to 4000. To make
 PlatformIO use it, the helper appends environment variables to the WSL user's
-`~/.bashrc`: `PLATFORMIO_UPLOAD_PORT` is set to
+shell startup file: `PLATFORMIO_UPLOAD_PORT` is set to
 `rfc2217://127.0.0.1:<rfc2217-port>` and `PLATFORMIO_MONITOR_PORT` is set to the
-serial symlink path. Because these variables are written to `~/.bashrc`, open a
-new WSL shell or run `source ~/.bashrc` after starting com2tty for them to take
-effect. The variables are removed when com2tty exits.
+serial symlink path. The variables are written to `~/.bashrc`, and also to
+`~/.zshrc` when zsh is in use or that file exists. Open a new WSL shell or run
+`source ~/.bashrc` (or `source ~/.zshrc`) after starting com2tty for them to take
+effect. The variables are removed when com2tty exits; if a session is killed
+before it can clean up, the next run removes the stale block on startup.
 
 Second, com2tty detects the connected board type from its USB vendor identifier
 and performs the appropriate hardware reset on the Windows side. For ESP32-class
@@ -211,11 +224,24 @@ transfers the image back to the Windows host over a relay that listens on
 `127.0.0.1:<rfc2217-port + 1>`. The host then triggers BOOTSEL mode, locates the
 board's mass-storage drive, verifies the transferred image against an MD5
 checksum, and writes the image to the drive. The original `picotool` is restored
-when com2tty exits.
+when com2tty exits; if a session is killed before it can restore it, the next run
+detects and reverses the leftover interception on startup, so PlatformIO uploads
+are not left broken.
 
 These mechanisms operate without any additional flags. The startup banner reports
 the detected board type, the RFC 2217 port, the UF2 relay port, and the board's
-USB serial number.
+USB serial number. If the detected board type is wrong (for example a board whose
+USB-UART chip is not recognised), override it with `--board`.
+
+The RFC 2217 forwarder and the UF2 relay listen on the loopback interface
+(`127.0.0.1`) inside the WSL distribution and perform no authentication. On a
+single-user machine this is not exposed to the network, but on a shared or
+multi-user WSL host any local user in the same distribution could connect to
+these ports during an upload. Run com2tty only on hosts you trust, and choose a
+non-default `--rfc2217-port` if another local service needs the default port. To
+reclaim a port left open by a previous com2tty session, the helper only
+terminates processes whose command line identifies them as a com2tty bridge; an
+unrelated service occupying the port is never killed.
 
 ### Gamepad mode
 
@@ -406,6 +432,40 @@ this. Add or update tests for any behavioural change. Open pull requests against
 `develop`.
 
 ## Troubleshooting
+
+At startup com2tty verifies the WSL environment and reports a specific error if
+a prerequisite is missing. The checks and their remedies are:
+
+- `wsl.exe` is not on `PATH`: install WSL with `wsl --install` from an elevated
+  prompt and reboot if requested.
+- `python3` is not available in the selected distribution: the WSL default
+  distribution may not be a regular Linux distribution (for example
+  `docker-desktop`). List distributions with `wsl -l -v` and either select a
+  suitable one with `--distro`, or install Python inside WSL with
+  `sudo apt install python3`.
+- The bridge script is not readable from WSL: Windows drive automounting is
+  disabled. Ensure `/etc/wsl.conf` does not disable the `[automount]` section,
+  then restart WSL with `wsl --shutdown`.
+
+If the helper reports that the RFC 2217 or UF2 relay port could not be bound,
+another process inside WSL is holding the TCP port. com2tty attempts to clean up
+leftover listeners automatically using `fuser`, which ships in the `psmisc`
+package; on minimal distributions install it with `sudo apt install psmisc`, or
+select a different port with `--rfc2217-port` (the UF2 relay always uses that
+port plus one).
+
+The serial-mode environment variables are written to `~/.bashrc`, and to
+`~/.zshrc` when zsh is detected or a `~/.zshrc` file exists. Users of other
+shells must export `PLATFORMIO_UPLOAD_PORT` and `PLATFORMIO_MONITOR_PORT`
+manually.
+
+The startup banner uses ANSI colours only when standard output is an
+interactive terminal that supports them; set the `NO_COLOR` environment
+variable to suppress colours entirely.
+
+If a board is not detected (the banner shows `Unknown`), its USB-UART chip is
+not in the VID whitelist. Force the board family with `--board esp32` or
+`--board pico` so that reset and upload handling still work.
 
 If the WSL helper reports a permission error while creating the serial symlink,
 the requested path under `/dev` is not writable; the helper falls back to `/tmp`
