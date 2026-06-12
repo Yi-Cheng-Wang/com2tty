@@ -224,15 +224,20 @@ class TestTmpStreamGamepad(unittest.TestCase):
     """
 
     @patch("com2tty.pad_bridge.os.O_NONBLOCK", 2048, create=True)
-    @patch("com2tty.pad_bridge.os.open", return_value=7)
+    @patch("com2tty.pad_bridge.os.open", side_effect=[7, 8])
     @patch("com2tty.pad_bridge.os.mkfifo", create=True)
     @patch("com2tty.pad_bridge.os.path.exists", return_value=False)
     @patch("com2tty.pad_bridge.os.path.lexists", return_value=False)
     def test_open_creates_fifo(self, m_lexists, m_exists, m_mkfifo, m_open):
         sink = pb.TmpStreamGamepad(path="/tmp/p")
         sink.open()
-        m_mkfifo.assert_called_once_with("/tmp/p", 0o666)
+        # Both the event FIFO and the .ff rumble FIFO are created.
+        m_mkfifo.assert_any_call("/tmp/p", 0o666)
+        m_mkfifo.assert_any_call("/tmp/p.ff", 0o666)
+        self.assertEqual(m_mkfifo.call_count, 2)
         self.assertEqual(sink.fd, 7)
+        self.assertEqual(sink.ff_fd, 8)
+        self.assertEqual(sink.ff_fileno(), 8)
 
     @patch("com2tty.pad_bridge.os.O_NONBLOCK", 2048, create=True)
     @patch("com2tty.pad_bridge.os.open", return_value=7)
@@ -246,7 +251,10 @@ class TestTmpStreamGamepad(unittest.TestCase):
                                           m_unlink, m_exists, m_mkfifo, m_open):
         sink = pb.TmpStreamGamepad(path="/tmp/p")
         sink.open()
-        m_unlink.assert_called_once_with("/tmp/p")
+        # Both stale paths (event FIFO and .ff FIFO) are replaced.
+        m_unlink.assert_any_call("/tmp/p")
+        m_unlink.assert_any_call("/tmp/p.ff")
+        self.assertEqual(m_unlink.call_count, 2)
         # exists() returned True so mkfifo is skipped.
         m_mkfifo.assert_not_called()
 
@@ -261,8 +269,9 @@ class TestTmpStreamGamepad(unittest.TestCase):
                                        m_exists, m_mkfifo, m_open):
         sink = pb.TmpStreamGamepad(path="/tmp/p")
         sink.open()
-        m_unlink.assert_called_once_with("/tmp/p")
-        m_mkfifo.assert_called_once()
+        m_unlink.assert_any_call("/tmp/p")
+        self.assertEqual(m_unlink.call_count, 2)  # event FIFO + .ff FIFO
+        self.assertEqual(m_mkfifo.call_count, 2)
 
     @patch("com2tty.pad_bridge.os.O_NONBLOCK", 2048, create=True)
     @patch("com2tty.pad_bridge.os.open", return_value=7)
@@ -306,10 +315,14 @@ class TestTmpStreamGamepad(unittest.TestCase):
     def test_close_unlinks(self, m_close, m_lexists, m_unlink):
         sink = pb.TmpStreamGamepad(path="/tmp/p")
         sink.fd = 7
+        sink.ff_fd = 8
         sink.close()
-        m_close.assert_called_once_with(7)
-        m_unlink.assert_called_once_with("/tmp/p")
+        m_close.assert_any_call(7)
+        m_close.assert_any_call(8)
+        m_unlink.assert_any_call("/tmp/p")
+        m_unlink.assert_any_call("/tmp/p.ff")
         self.assertIsNone(sink.fd)
+        self.assertIsNone(sink.ff_fd)
 
     @patch("com2tty.pad_bridge.os.close", side_effect=Exception("x"))
     @patch("com2tty.pad_bridge.os.path.lexists", return_value=False)
@@ -626,6 +639,84 @@ class TestOpenSink(unittest.TestCase):
              patch("com2tty.pad_bridge.TmpStreamGamepad", return_value=good):
             sink, msg = pb._open_sink(True, "/tmp/p", "Pad")
         self.assertIs(sink, good)
+
+
+# == RumbleFrameReader (the .ff FIFO frame parser) ==========================
+
+class TestRumbleFrameReader(unittest.TestCase):
+
+    def test_parses_single_frame(self):
+        reader = pb.RumbleFrameReader()
+        self.assertEqual(reader.feed(pb.pack_rumble(1000, 2000)),
+                         [(1000, 2000)])
+
+    def test_partial_then_complete(self):
+        reader = pb.RumbleFrameReader()
+        frame = pb.pack_rumble(7, 8)
+        self.assertEqual(reader.feed(frame[:3]), [])
+        self.assertEqual(reader.feed(frame[3:]), [(7, 8)])
+
+    def test_resyncs_after_garbage_prefix(self):
+        reader = pb.RumbleFrameReader()
+        data = b"\x00\x11\x22" + pb.pack_rumble(5, 6)
+        self.assertEqual(reader.feed(data), [(5, 6)])
+
+    def test_false_magic0_is_skipped(self):
+        reader = pb.RumbleFrameReader()
+        # A stray magic0 byte not followed by magic1, then a real frame.
+        data = bytes([pb.RUMBLE_MAGIC0, 0x00]) + pb.pack_rumble(9, 10)
+        self.assertEqual(reader.feed(data), [(9, 10)])
+
+    def test_no_magic_clears_buffer(self):
+        reader = pb.RumbleFrameReader()
+        self.assertEqual(reader.feed(b"\x01\x02\x03"), [])
+        self.assertEqual(len(reader._buf), 0)
+
+    def test_multiple_frames_in_one_read(self):
+        reader = pb.RumbleFrameReader()
+        data = pb.pack_rumble(1, 2) + pb.pack_rumble(3, 4)
+        self.assertEqual(reader.feed(data), [(1, 2), (3, 4)])
+
+
+# == TmpStreamGamepad force-feedback FIFO ===================================
+
+class TestTmpStreamForceFeedback(unittest.TestCase):
+
+    def _sink(self):
+        sink = pb.TmpStreamGamepad(path="/tmp/p")
+        sink.ff_fd = 9
+        return sink
+
+    def test_handle_ff_io_returns_latest_pair(self):
+        sink = self._sink()
+        data = pb.pack_rumble(1, 2) + pb.pack_rumble(3, 4)
+        with patch("com2tty.pad_bridge.os.read", return_value=data):
+            self.assertEqual(sink.handle_ff_io(), (3, 4))
+
+    def test_handle_ff_io_partial_frame_returns_none(self):
+        sink = self._sink()
+        frame = pb.pack_rumble(1, 2)
+        with patch("com2tty.pad_bridge.os.read", return_value=frame[:4]):
+            self.assertIsNone(sink.handle_ff_io())
+        # The remainder completes the frame on the next read.
+        with patch("com2tty.pad_bridge.os.read", return_value=frame[4:]):
+            self.assertEqual(sink.handle_ff_io(), (1, 2))
+
+    def test_handle_ff_io_would_block_returns_none(self):
+        sink = self._sink()
+        with patch("com2tty.pad_bridge.os.read",
+                   side_effect=BlockingIOError()):
+            self.assertIsNone(sink.handle_ff_io())
+
+    def test_handle_ff_io_oserror_returns_none(self):
+        sink = self._sink()
+        with patch("com2tty.pad_bridge.os.read", side_effect=OSError("x")):
+            self.assertIsNone(sink.handle_ff_io())
+
+    def test_handle_ff_io_eof_returns_none(self):
+        sink = self._sink()
+        with patch("com2tty.pad_bridge.os.read", return_value=b""):
+            self.assertIsNone(sink.handle_ff_io())
 
 
 if __name__ == "__main__":

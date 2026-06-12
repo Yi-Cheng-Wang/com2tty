@@ -13,11 +13,15 @@ from com2tty.host import (
     get_wsl_path,
     get_serial_settings,
     get_system_baudrate,
+    get_commstate_baudrate,
     read_wsl_stdout,
     read_com_port,
     read_wsl_stderr,
     run_bridge,
     run_gamepad_bridge,
+    run_multi_gamepad_bridge,
+    run_with_respawn,
+    _poll_wait,
     QueuePipeConnection,
     ResetProofSerial,
     esp32_manual_reset,
@@ -92,6 +96,22 @@ class TestSerialSettings(unittest.TestCase):
 
 class TestGetSystemBaudrate(unittest.TestCase):
 
+    def setUp(self):
+        # These tests exercise the mode.com fallback parser; keep the
+        # GetCommState fast path out of the way (and off any real COM port
+        # that may exist on the developer machine).
+        patcher = patch("com2tty.host.get_commstate_baudrate",
+                        return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @patch("subprocess.run")
+    def test_commstate_short_circuits_mode_com(self, m):
+        with patch("com2tty.host.get_commstate_baudrate",
+                   return_value=230400):
+            self.assertEqual(get_system_baudrate("COM1"), 230400)
+        m.assert_not_called()
+
     @patch("subprocess.run")
     def test_success(self, m):
         res = MagicMock(returncode=0, stdout="\n  Baud:  115200\n")
@@ -138,7 +158,77 @@ class TestGetSystemBaudrate(unittest.TestCase):
 
 # ?? read_wsl_stdout ??????????????????????????????????????????????????????
 
+class TestGetCommstateBaudrate(unittest.TestCase):
+    """Win32 GetCommState path, driven through an injected fake kernel32."""
+
+    INVALID_HANDLE = __import__("ctypes").c_void_p(-1).value
+
+    def _kernel32(self, handle=42, baud=115200, ok=1):
+        k32 = MagicMock()
+        k32.CreateFileW.return_value = handle
+
+        def fake_get_comm_state(h, dcb_ref):
+            dcb_ref._obj.BaudRate = baud
+            return ok
+        k32.GetCommState.side_effect = fake_get_comm_state
+        return k32
+
+    def test_reads_baudrate(self):
+        k32 = self._kernel32(baud=115200)
+        self.assertEqual(get_commstate_baudrate("COM3", _kernel32=k32), 115200)
+        k32.CloseHandle.assert_called_once_with(42)
+        # The \\.\ device-path prefix is required for COM10 and above.
+        self.assertEqual(k32.CreateFileW.call_args[0][0], "\\\\.\\COM3")
+
+    def test_invalid_handle_returns_none(self):
+        k32 = self._kernel32(handle=self.INVALID_HANDLE)
+        self.assertIsNone(get_commstate_baudrate("COM3", _kernel32=k32))
+        k32.CloseHandle.assert_not_called()
+
+    def test_null_handle_returns_none(self):
+        k32 = self._kernel32(handle=0)
+        self.assertIsNone(get_commstate_baudrate("COM3", _kernel32=k32))
+
+    def test_getcommstate_failure_returns_none(self):
+        k32 = self._kernel32(ok=0)
+        self.assertIsNone(get_commstate_baudrate("COM3", _kernel32=k32))
+        k32.CloseHandle.assert_called_once()
+
+    def test_zero_baudrate_returns_none(self):
+        k32 = self._kernel32(baud=0)
+        self.assertIsNone(get_commstate_baudrate("COM3", _kernel32=k32))
+
+    def test_exception_returns_none(self):
+        k32 = MagicMock()
+        k32.CreateFileW.side_effect = Exception("no win32")
+        self.assertIsNone(get_commstate_baudrate("COM3", _kernel32=k32))
+
+    def test_real_windll_lookup_is_tolerated(self):
+        # Without an injected kernel32 this touches ctypes.windll: absent on
+        # POSIX (AttributeError -> None) and an invalid handle for a
+        # nonexistent port on Windows -> None either way.
+        self.assertIsNone(get_commstate_baudrate("COM2TTYNOSUCHPORT"))
+
+
 class TestReadWslStdout(unittest.TestCase):
+
+    def test_com_write_failure_drops_data_and_keeps_running(self):
+        # A dead COM handle (device replugging) must not tear the bridge
+        # down; the data is dropped and the thread keeps relaying.
+        proc, ser = MagicMock(), MagicMock()
+        ser.port = "COM3"
+        sd = threading.Event()
+        proc.stdout.read.side_effect = [b"a", b"b", b"c", b""]
+        # Two consecutive failures (warning logged once), then recovery.
+        ser.write.side_effect = [OSError("gone"), OSError("gone"), None]
+
+        read_wsl_stdout(proc, ser, sd, threading.Event(), queue.Queue(),
+                        threading.Event(), queue.Queue())
+
+        # All three chunks were attempted; the loop survived the failures
+        # and only ended at EOF.
+        self.assertEqual(ser.write.call_count, 3)
+        self.assertTrue(sd.is_set())
 
     def test_normal_writes_to_com(self):
         proc, ser = MagicMock(), MagicMock()
@@ -643,6 +733,7 @@ class TestReadComPortReconnect(unittest.TestCase):
     def test_successful_read_resets_error_count(self, mock_sleep, mock_reopen):
         proc, ser = MagicMock(), MagicMock()
         ser.port = "COM3"
+        ser.in_waiting = 0  # one ser.read call per loop iteration
         sd = threading.Event()
 
         # 3 errors, one good read, 3 errors: never reaches the threshold.
@@ -659,6 +750,28 @@ class TestReadComPortReconnect(unittest.TestCase):
 
         read_com_port(ser, proc, sd, threading.Event(), threading.Event())
         mock_reopen.assert_not_called()
+
+    def test_drains_in_waiting_backlog(self):
+        # A read that leaves more bytes pending must drain them in the same
+        # iteration (the low-latency read path reads what is pending, then
+        # whatever arrived during that read).
+        proc, ser = MagicMock(), MagicMock()
+        sd = threading.Event()
+
+        waiting = [4, 4, 0]
+        type(ser).in_waiting = PropertyMock(side_effect=lambda: waiting[0])
+
+        reads = [b"h", b"ello"]
+        def fake_read(*a):
+            waiting.pop(0)
+            if reads:
+                return reads.pop(0)
+            sd.set()
+            return b""
+        ser.read.side_effect = fake_read
+
+        read_com_port(ser, proc, sd, threading.Event(), threading.Event())
+        proc.stdin.write.assert_called_with(b"hello")
 
 
 class TestQueuePipeConnection(unittest.TestCase):
@@ -3018,4 +3131,309 @@ class TestRunBridgeOverrides(unittest.TestCase):
         spawned_cmd = mocks[4].call_args[0][0]
         self.assertEqual(spawned_cmd[:3], ["wsl", "-d", "Ubuntu-22.04"])
         self.assertIn("--exec", spawned_cmd)
+
+
+# == run_bridge --wait ======================================================
+
+class TestRunBridgeWait(unittest.TestCase):
+
+    def _patches(self):
+        return [
+            patch("builtins.print"),
+            patch("com2tty.host.time.sleep"),
+            patch("threading.Thread"),
+            patch("os.path.exists", return_value=True),
+            patch("subprocess.Popen"),
+            patch("serial.Serial"),
+            patch("com2tty.host.get_wsl_path", return_value="/wsl/bridge.py"),
+            patch("com2tty.host.check_wsl_environment"),
+            patch("com2tty.host.snapshot_ports"),
+        ]
+
+    def test_wait_polls_until_port_appears(self):
+        patchers = self._patches()
+        mocks = [p.start() for p in patchers]
+        try:
+            proc = MagicMock()
+            proc.poll.return_value = 0
+            mocks[4].return_value = proc
+            # Absent on the first two polls, present afterwards.
+            mocks[8].side_effect = [set(), set(), {"COM1"}]
+            run_bridge("COM1", 9600, "/tmp/tty", 8, "N", 1, False, False,
+                       False, 4000, wait=True)
+            self.assertEqual(mocks[8].call_count, 3)
+            mocks[5].assert_called_once()  # serial.Serial opened in the end
+        finally:
+            for p in patchers:
+                p.stop()
+
+    def test_wait_aborts_on_stop_event(self):
+        patchers = self._patches()
+        mocks = [p.start() for p in patchers]
+        try:
+            mocks[8].return_value = set()  # port never appears
+            stop = threading.Event()
+            stop.set()
+            run_bridge("COM1", 9600, "/tmp/tty", 8, "N", 1, False, False,
+                       False, 4000, wait=True, stop_event=stop)
+            mocks[5].assert_not_called()  # never reached the serial open
+        finally:
+            for p in patchers:
+                p.stop()
+
+    def test_wait_with_port_present_skips_polling_loop(self):
+        patchers = self._patches()
+        mocks = [p.start() for p in patchers]
+        try:
+            proc = MagicMock()
+            proc.poll.return_value = 0
+            mocks[4].return_value = proc
+            mocks[8].return_value = {"COM1"}
+            run_bridge("COM1", 9600, "/tmp/tty", 8, "N", 1, False, False,
+                       False, 4000, wait=True)
+            self.assertEqual(mocks[8].call_count, 1)
+        finally:
+            for p in patchers:
+                p.stop()
+
+
+# == _poll_wait =============================================================
+
+class TestPollWait(unittest.TestCase):
+
+    @patch("com2tty.host.time.sleep")
+    def test_falls_back_to_plain_sleep_without_watcher(self, mock_sleep):
+        # The conftest stub returns no watcher.
+        _poll_wait(0.25)
+        mock_sleep.assert_called_once_with(0.25)
+
+    @patch("com2tty.host.time.sleep")
+    def test_uses_watcher_when_active(self, mock_sleep):
+        import com2tty.host as host_mod
+        fake_watcher = MagicMock()
+        host_mod.devnotify.get_watcher = lambda: fake_watcher
+        _poll_wait(0.25)
+        fake_watcher.wait.assert_called_once_with(0.25)
+        mock_sleep.assert_not_called()
+
+
+# == run_bridge exit reasons ================================================
+
+class TestRunBridgeExitReasons(unittest.TestCase):
+
+    def _patches(self):
+        return [
+            patch("builtins.print"),
+            patch("com2tty.host.time.sleep"),
+            patch("threading.Thread"),
+            patch("os.path.exists", return_value=True),
+            patch("subprocess.Popen"),
+            patch("serial.Serial"),
+            patch("com2tty.host.get_wsl_path", return_value="/wsl/bridge.py"),
+            patch("com2tty.host.check_wsl_environment"),
+        ]
+
+    def _run(self, proc_poll=0, stop=None, interrupt=False):
+        patchers = self._patches()
+        mocks = [p.start() for p in patchers]
+        try:
+            proc = MagicMock()
+            proc.poll.return_value = proc_poll
+            mocks[4].return_value = proc
+            if interrupt:
+                mocks[1].side_effect = KeyboardInterrupt()
+            return run_bridge("COM1", 9600, "/tmp/tty", 8, "N", 1, False,
+                              False, False, 4000, stop_event=stop)
+        finally:
+            for p in patchers:
+                p.stop()
+
+    def test_wsl_exit_reason(self):
+        self.assertEqual(self._run(proc_poll=0), "wsl-exited")
+
+    def test_stop_reason(self):
+        stop = threading.Event()
+        stop.set()
+        self.assertEqual(self._run(proc_poll=None, stop=stop), "stop")
+
+    def test_interrupt_reason(self):
+        self.assertEqual(self._run(proc_poll=None, interrupt=True),
+                         "interrupt")
+
+
+# == run_with_respawn =======================================================
+
+class TestRunWithRespawn(unittest.TestCase):
+
+    @patch("com2tty.host.time.sleep")
+    @patch("com2tty.host.check_wsl_environment")
+    def test_respawns_after_wsl_exit_until_interrupt(self, mock_check,
+                                                     mock_sleep):
+        target = MagicMock(side_effect=["wsl-exited", "interrupt"])
+        self.assertEqual(run_with_respawn(target, port="COM1"), "interrupt")
+        self.assertEqual(target.call_count, 2)
+        mock_check.assert_called_once_with(None, None)
+
+    def test_stop_reason_ends_immediately(self):
+        target = MagicMock(return_value="stop")
+        self.assertEqual(run_with_respawn(target), "stop")
+        target.assert_called_once()
+
+    @patch("com2tty.host.check_wsl_environment")
+    def test_stop_event_set_during_session_ends_loop(self, mock_check):
+        stop = threading.Event()
+
+        def fake_target(stop_event=None, **kw):
+            stop_event.set()
+            return "wsl-exited"
+
+        self.assertEqual(run_with_respawn(fake_target, stop_event=stop),
+                         "stop")
+        mock_check.assert_not_called()
+
+    @patch("com2tty.host.time.sleep")
+    @patch("com2tty.host.check_wsl_environment")
+    def test_waits_until_wsl_answers_again(self, mock_check, mock_sleep):
+        mock_check.side_effect = [RuntimeError("wsl is down"), None]
+        target = MagicMock(side_effect=["shutdown", "stop"])
+        self.assertEqual(run_with_respawn(target, distro="Ubuntu"), "stop")
+        self.assertEqual(mock_check.call_count, 2)
+        mock_check.assert_called_with(None, "Ubuntu")
+        mock_sleep.assert_called_once_with(2.0)
+
+    @patch("com2tty.host.time.sleep")
+    @patch("com2tty.host.check_wsl_environment",
+           side_effect=RuntimeError("down"))
+    def test_stop_event_aborts_wsl_wait(self, mock_check, mock_sleep):
+        stop = threading.Event()
+        mock_sleep.side_effect = lambda *_: stop.set()
+        target = MagicMock(return_value="wsl-exited")
+        self.assertEqual(run_with_respawn(target, stop_event=stop), "stop")
+        target.assert_called_once()
+
+
+# == run_multi_gamepad_bridge ===============================================
+
+class TestRunMultiGamepadBridge(unittest.TestCase):
+
+    @patch("com2tty.host.time.sleep")
+    @patch("com2tty.host.run_gamepad_bridge")
+    def test_spawns_one_bridge_per_slot_with_distinct_paths(self, mock_pad,
+                                                            mock_sleep):
+        run_multi_gamepad_bridge([0, 1], poll_hz=100, name="Pad",
+                                 use_uinput=True, tmp_path="/tmp/com2pad0",
+                                 distro="Ubuntu")
+        self.assertEqual(mock_pad.call_count, 2)
+        calls = {c.kwargs["pad_index"]: c.kwargs
+                 for c in mock_pad.call_args_list}
+        self.assertEqual(calls[0]["tmp_path"], "/tmp/com2pad0")
+        self.assertEqual(calls[1]["tmp_path"], "/tmp/com2pad1")
+        for kwargs in calls.values():
+            self.assertEqual(kwargs["poll_hz"], 100)
+            self.assertEqual(kwargs["name"], "Pad")
+            self.assertTrue(kwargs["use_uinput"])
+            self.assertEqual(kwargs["distro"], "Ubuntu")
+
+    @patch("com2tty.host.time.sleep")
+    @patch("com2tty.host.run_with_respawn")
+    def test_auto_respawn_wraps_each_bridge(self, mock_resp, mock_sleep):
+        run_multi_gamepad_bridge([0, 1], auto_respawn=True)
+        self.assertEqual(mock_resp.call_count, 2)
+        self.assertIs(mock_resp.call_args[0][0], run_gamepad_bridge)
+
+    @patch("com2tty.host.time.sleep")
+    @patch("com2tty.host.run_gamepad_bridge", side_effect=Exception("boom"))
+    def test_bridge_exception_is_logged_not_raised(self, mock_pad,
+                                                   mock_sleep):
+        run_multi_gamepad_bridge([0])  # must not raise
+
+    @patch("com2tty.host.run_gamepad_bridge")
+    def test_keyboard_interrupt_stops_all_bridges(self, mock_pad):
+        captured = {}
+
+        def fake_pad(stop_event=None, **kw):
+            captured["evt"] = stop_event
+            stop_event.wait(5)
+
+        mock_pad.side_effect = fake_pad
+        with patch("com2tty.host.time.sleep",
+                   side_effect=KeyboardInterrupt()):
+            run_multi_gamepad_bridge([0])
+        self.assertTrue(captured["evt"].is_set())
+
+
+# == run_multi_bridge auto-respawn wiring ===================================
+
+class TestRunMultiBridgeAutoRespawn(unittest.TestCase):
+
+    def _kwargs(self):
+        return dict(baud=9600, wsl_tty="/tmp/t", bytesize=8, parity="N",
+                    stopbits=1, xonxoff=False, rtscts=False, dsrdtr=False,
+                    rfc2217_port=4000)
+
+    @patch("com2tty.host.time.sleep")
+    @patch("com2tty.host.run_with_respawn")
+    def test_auto_respawn_uses_wrapper(self, mock_resp, mock_sleep):
+        from com2tty.host import run_multi_bridge
+        run_multi_bridge(ports=["COM1"], auto_respawn=True, **self._kwargs())
+        mock_resp.assert_called_once()
+        self.assertIs(mock_resp.call_args[0][0], run_bridge)
+        self.assertEqual(mock_resp.call_args[1]["port"], "COM1")
+
+    @patch("com2tty.host.time.sleep")
+    @patch("com2tty.host.run_with_respawn")
+    @patch("com2tty.host.run_bridge")
+    def test_default_does_not_use_wrapper(self, mock_run, mock_resp,
+                                          mock_sleep):
+        from com2tty.host import run_multi_bridge
+        run_multi_bridge(ports=["COM1"], **self._kwargs())
+        mock_run.assert_called_once()
+        mock_resp.assert_not_called()
+
+
+# == run_gamepad_bridge stop_event / exit reasons ===========================
+
+class TestRunGamepadBridgeReasons(unittest.TestCase):
+
+    def _patches(self):
+        return [
+            patch("builtins.print"),
+            patch("com2tty.host.time.sleep"),
+            patch("threading.Thread"),
+            patch("com2tty.host.get_wsl_path", return_value="/wsl/pad.py"),
+            patch("os.path.exists", return_value=True),
+            patch("subprocess.Popen"),
+            patch("com2tty.xinput.GamepadSource"),
+            patch("com2tty.host.check_wsl_environment"),
+        ]
+
+    def _run(self, proc_poll=None, stop=None, write_error=None):
+        patchers = self._patches()
+        mocks = [p.start() for p in patchers]
+        try:
+            src = MagicMock()
+            src.poll.return_value = (True, b"\xab\xcd" + b"\x00" * 14)
+            mocks[6].return_value = src
+            proc = MagicMock()
+            proc.poll.return_value = proc_poll
+            if write_error is not None:
+                proc.stdin.write.side_effect = write_error
+            mocks[5].return_value = proc
+            return run_gamepad_bridge(pad_index=0, stop_event=stop)
+        finally:
+            for p in patchers:
+                p.stop()
+
+    def test_stop_event_returns_stop(self):
+        stop = threading.Event()
+        stop.set()
+        self.assertEqual(self._run(proc_poll=None, stop=stop), "stop")
+
+    def test_wsl_exit_returns_wsl_exited(self):
+        self.assertEqual(self._run(proc_poll=1), "wsl-exited")
+
+    def test_broken_pipe_returns_wsl_exited(self):
+        self.assertEqual(
+            self._run(proc_poll=None, write_error=BrokenPipeError()),
+            "wsl-exited")
 

@@ -220,6 +220,28 @@ through the RFC 2217 forwarder and the UF2 relay. On minimal distributions the
 by a previous session; only processes whose command line identifies them as a
 com2tty bridge are terminated.
 
+The host-side polling loops (hot-plug reconnect, bootloader-port
+acquisition, and `--wait`) sleep through `devnotify.py`, which runs a
+hidden message-only window registered for `WM_DEVICECHANGE`
+device-interface notifications on a daemon thread; a plug or unplug wakes
+the loops immediately, and a plain timed sleep is the fallback whenever the
+watcher cannot start. With `--auto-respawn`, `run_with_respawn` in
+`host.py` re-runs the bridge entry function after the WSL helper dies,
+first polling `check_wsl_environment` until the distribution answers
+again, so a `wsl --shutdown` no longer ends the session.
+
+Shared resources are guarded by session-liveness markers so that two
+concurrently running sessions cannot reclaim each other's state. Each helper
+refreshes a per-port heartbeat file (`/tmp/com2tty_alive_<port>`) from its main
+loop; `kill_leftover_listener` treats a port whose heartbeat is fresh as
+belonging to a live session and refuses to kill its owner. The rc-file
+environment blocks and the fish snippet are tagged with the owning helper's
+PID (`[pid=N]` in the marker line), and cleanup removes only blocks that are
+owned by the cleaning session, untagged (written by an older version), or
+owned by a PID that no longer exists in `/proc`. The picotool interception
+records its owner in `/tmp/com2tty_picotool.owner`; startup orphan recovery
+leaves the interception in place while that owner is still running.
+
 ## Security considerations
 
 The RFC 2217 forwarder and the UF2 relay listen on the loopback interface inside

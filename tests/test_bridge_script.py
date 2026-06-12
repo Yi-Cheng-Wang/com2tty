@@ -17,11 +17,18 @@ from com2tty.bridge import (
     main, cleanup_symlink, get_rc_files, clean_rc, inject_rc,
     get_pty_settings, run_rfc2217_server_thread, run_uf2_relay_thread,
     setup_picotool_interceptor, cleanup_picotool_interceptor,
-    intercepted_picotools, MARKER_START, MARKER_END,
+    intercepted_picotools, marker_start, marker_end,
     kill_leftover_listener, md5_hexdigest,
     restore_orphaned_picotools, get_fish_conf_path, clean_fish_conf,
-    inject_fish_conf,
+    inject_fish_conf, alive_file_path, touch_alive_files, remove_alive_files,
+    is_port_session_alive, pid_alive, read_pid_file, _marker_pid,
+    _wait_until_clear, PICOTOOL_OWNER_FILE,
 )
+
+# This session's own (test-process) marker lines; clean_rc with no own_pid
+# removes any block, so most existing tests can keep composing with these.
+MARKER_START = marker_start()
+MARKER_END = marker_end()
 
 # The autouse fixture below replaces com2tty.bridge.get_fish_conf_path for
 # every test; keep a handle on the real function so it can itself be tested.
@@ -351,6 +358,12 @@ class TestKillLeftoverListener(unittest.TestCase):
 
 class TestRestoreOrphanedPicotools(unittest.TestCase):
 
+    def setUp(self):
+        # No ownership marker: the orphan-recovery path itself is under test.
+        patcher = patch("com2tty.bridge.read_pid_file", return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     @patch("com2tty.bridge.os.rename")
     @patch("com2tty.bridge.os.remove")
     @patch("com2tty.bridge.os.path.lexists", return_value=True)
@@ -618,8 +631,10 @@ class TestSetupPicotoolInterceptor(unittest.TestCase):
 
         setup_picotool_interceptor(5001)
 
-        # Wrapper file written and chmod'd
-        mock_open.assert_called_once_with("/tmp/com2tty_picotool.py", "w")
+        # Wrapper file written and chmod'd, ownership marker recorded
+        mock_open.assert_any_call("/tmp/com2tty_picotool.py", "w")
+        mock_open.assert_any_call(PICOTOOL_OWNER_FILE, "w")
+        self.assertEqual(mock_open.call_count, 2)
         mock_chmod.assert_called_once_with("/tmp/com2tty_picotool.py", 0o755)
 
         # picotool renamed and symlinked
@@ -736,12 +751,14 @@ class TestCleanupPicotoolInterceptor(unittest.TestCase):
     @patch("com2tty.bridge.os.path.lexists", return_value=True)
     def test_successful_restore(self, mock_lexists, mock_exists,
                                  mock_remove, mock_rename):
-        """Cleanup removes symlink and renames .real back to original."""
+        """Cleanup removes symlink, renames .real back, drops the owner marker."""
         intercepted_picotools.append(("/path/picotool", "/path/picotool.real"))
 
         cleanup_picotool_interceptor()
 
-        mock_remove.assert_called_once_with("/path/picotool")
+        mock_remove.assert_any_call("/path/picotool")
+        mock_remove.assert_any_call(PICOTOOL_OWNER_FILE)
+        self.assertEqual(mock_remove.call_count, 2)
         mock_rename.assert_called_once_with("/path/picotool.real", "/path/picotool")
 
     @patch("com2tty.bridge.os.path.lexists", side_effect=OSError("fail"))
@@ -762,7 +779,8 @@ class TestCleanupPicotoolInterceptor(unittest.TestCase):
 
         cleanup_picotool_interceptor()
 
-        mock_remove.assert_not_called()
+        # Only the ownership marker is removed; no picotool paths touched.
+        mock_remove.assert_called_once_with(PICOTOOL_OWNER_FILE)
         mock_rename.assert_not_called()
 
 
@@ -1566,6 +1584,356 @@ class TestFishConf(unittest.TestCase):
                  patch("com2tty.bridge.get_rc_files", return_value=[rc_path]):
                 inject_rc(4000, "/tmp/ttyUSB0")
             self.assertTrue(os.path.exists(fish_path))
+
+
+# == session liveness (heartbeat files, PID markers) ========================
+
+class TestSessionLiveness(unittest.TestCase):
+
+    def test_alive_file_roundtrip(self):
+        with tempfile.TemporaryDirectory() as d:
+            with patch("com2tty.bridge.alive_file_path",
+                       side_effect=lambda p: os.path.join(d, f"alive_{p}")):
+                touch_alive_files([4000, 4001])
+                path = os.path.join(d, "alive_4000")
+                self.assertTrue(os.path.exists(path))
+                with open(path) as f:
+                    self.assertEqual(int(f.read()), os.getpid())
+                self.assertTrue(is_port_session_alive(4000))
+                remove_alive_files([4000, 4001])
+                self.assertFalse(os.path.exists(path))
+                self.assertFalse(is_port_session_alive(4000))
+                remove_alive_files([4000])  # removing again is a no-op
+
+    def test_stale_alive_file_is_not_alive(self):
+        with tempfile.TemporaryDirectory() as d:
+            with patch("com2tty.bridge.alive_file_path",
+                       side_effect=lambda p: os.path.join(d, f"alive_{p}")):
+                touch_alive_files([4000])
+                old = __import__("time").time() - 120
+                os.utime(os.path.join(d, "alive_4000"), (old, old))
+                self.assertFalse(is_port_session_alive(4000))
+
+    def test_touch_failure_is_tolerated(self):
+        with patch("com2tty.bridge.alive_file_path",
+                   return_value="/no/such/dir/at/all/alive"):
+            touch_alive_files([4000])  # should not raise
+
+    def test_alive_file_path_layout(self):
+        self.assertEqual(alive_file_path(4000), "/tmp/com2tty_alive_4000")
+
+    @patch("com2tty.bridge.os.path.isdir")
+    def test_pid_alive_consults_proc(self, mock_isdir):
+        mock_isdir.return_value = True
+        self.assertTrue(pid_alive(123))
+        mock_isdir.assert_called_once_with("/proc/123")
+        mock_isdir.return_value = False
+        self.assertFalse(pid_alive(123))
+
+    def test_pid_alive_invalid_pid(self):
+        self.assertFalse(pid_alive("abc"))
+        self.assertFalse(pid_alive(None))
+
+    def test_read_pid_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "owner")
+            with open(path, "w") as f:
+                f.write(" 123 \n")
+            self.assertEqual(read_pid_file(path), 123)
+            with open(path, "w") as f:
+                f.write("junk")
+            self.assertIsNone(read_pid_file(path))
+            self.assertIsNone(read_pid_file(os.path.join(d, "missing")))
+
+    def test_marker_pid_parsing(self):
+        self.assertEqual(_marker_pid(marker_start(123)), 123)
+        self.assertEqual(_marker_pid(marker_start()), os.getpid())
+        self.assertIsNone(_marker_pid("# === COM2TTY INJECTION START ==="))
+        self.assertIsNone(_marker_pid("# leftover [pid=12"))
+        self.assertIsNone(_marker_pid("# === START [pid=xx] ==="))
+
+    @patch("subprocess.run")
+    @patch("com2tty.bridge.is_port_session_alive", return_value=True)
+    def test_kill_leftover_skips_live_session(self, mock_alive, mock_run):
+        # A fresh heartbeat means the port belongs to a *live* session
+        # (typically a second invocation with default ports); it must never
+        # be killed.
+        kill_leftover_listener(4000)
+        mock_run.assert_not_called()
+
+    def test_wait_until_clear(self):
+        _wait_until_clear(None)  # no event: immediate
+        evt = threading.Event()
+        _wait_until_clear(evt)  # already clear: immediate
+        evt.set()
+        with patch("com2tty.bridge.time.sleep",
+                   side_effect=lambda *_: evt.clear()):
+            _wait_until_clear(evt, timeout=5)
+        self.assertFalse(evt.is_set())
+
+    def test_wait_until_clear_times_out(self):
+        evt = threading.Event()
+        evt.set()
+        with patch("com2tty.bridge.time.sleep"):
+            _wait_until_clear(evt, timeout=0.01)
+        self.assertTrue(evt.is_set())  # gave up, event still set
+
+
+# == multi-session rc-block ownership =======================================
+
+class TestCleanRcOwnership(unittest.TestCase):
+
+    def _make_tmp(self, content):
+        f = tempfile.NamedTemporaryFile(mode="w", suffix=".bashrc",
+                                        delete=False)
+        f.write(content)
+        f.close()
+        return f.name
+
+    def _three_block_content(self, other_pid=424242):
+        own = marker_start(os.getpid())
+        other = marker_start(other_pid)
+        legacy_start = "# === COM2TTY INJECTION START ==="
+        legacy_end = "# === COM2TTY INJECTION END ==="
+        return (
+            "user line\n"
+            f"{other}\nexport OTHER=1\n{marker_end()}\n"
+            f"{own}\nexport OWN=2\n{marker_end()}\n"
+            f"{legacy_start}\nexport LEGACY=3\n{legacy_end}\n"
+            "tail\n"
+        )
+
+    def test_preserves_other_live_session_block(self):
+        path = self._make_tmp(self._three_block_content())
+        try:
+            with patch("com2tty.bridge.get_rc_files", return_value=[path]), \
+                 patch("com2tty.bridge.pid_alive", return_value=True):
+                clean_rc(own_pid=os.getpid())
+            with open(path) as f:
+                text = f.read()
+            self.assertIn("export OTHER=1", text)   # live session: kept
+            self.assertIn(marker_start(424242), text)
+            self.assertNotIn("export OWN=2", text)  # own block: removed
+            self.assertNotIn("export LEGACY=3", text)  # legacy: removed
+            self.assertIn("user line", text)
+            self.assertIn("tail", text)
+            # Exactly one start/end marker pair survives.
+            self.assertEqual(text.count("COM2TTY INJECTION START"), 1)
+            self.assertEqual(text.count("COM2TTY INJECTION END"), 1)
+        finally:
+            os.unlink(path)
+
+    def test_removes_dead_session_block(self):
+        path = self._make_tmp(self._three_block_content())
+        try:
+            with patch("com2tty.bridge.get_rc_files", return_value=[path]), \
+                 patch("com2tty.bridge.pid_alive", return_value=False):
+                clean_rc(own_pid=os.getpid())
+            with open(path) as f:
+                text = f.read()
+            self.assertNotIn("COM2TTY", text)  # every block reclaimed
+            self.assertIn("user line", text)
+            self.assertIn("tail", text)
+        finally:
+            os.unlink(path)
+
+    def test_full_clean_removes_even_live_blocks(self):
+        path = self._make_tmp(self._three_block_content())
+        try:
+            with patch("com2tty.bridge.get_rc_files", return_value=[path]), \
+                 patch("com2tty.bridge.pid_alive", return_value=True):
+                clean_rc()  # no own_pid: full cleanup
+            with open(path) as f:
+                text = f.read()
+            self.assertNotIn("COM2TTY", text)
+        finally:
+            os.unlink(path)
+
+    def test_inject_rc_tags_block_with_own_pid(self):
+        path = self._make_tmp("old\n")
+        try:
+            with patch("com2tty.bridge.get_rc_files", return_value=[path]):
+                inject_rc(4000)
+            with open(path) as f:
+                text = f.read()
+            self.assertIn(f"[pid={os.getpid()}]", text)
+        finally:
+            os.unlink(path)
+
+
+class TestFishConfOwnership(unittest.TestCase):
+
+    def _write(self, d, pid):
+        path = os.path.join(d, "com2tty.fish")
+        with open(path, "w") as f:
+            f.write(f"# Written by com2tty [pid={pid}]; removed automatically"
+                    " when it exits.\nset -gx PLATFORMIO_UPLOAD_PORT x\n")
+        return path
+
+    def test_preserves_other_live_session_snippet(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = self._write(d, 424242)
+            with patch("com2tty.bridge.get_fish_conf_path",
+                       return_value=path), \
+                 patch("com2tty.bridge.pid_alive", return_value=True):
+                clean_fish_conf(own_pid=os.getpid())
+            self.assertTrue(os.path.exists(path))
+
+    def test_removes_dead_session_snippet(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = self._write(d, 424242)
+            with patch("com2tty.bridge.get_fish_conf_path",
+                       return_value=path), \
+                 patch("com2tty.bridge.pid_alive", return_value=False):
+                clean_fish_conf(own_pid=os.getpid())
+            self.assertFalse(os.path.exists(path))
+
+    def test_removes_own_snippet(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = self._write(d, os.getpid())
+            with patch("com2tty.bridge.get_fish_conf_path",
+                       return_value=path):
+                clean_fish_conf(own_pid=os.getpid())
+            self.assertFalse(os.path.exists(path))
+
+    def test_unreadable_snippet_is_still_removed(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = self._write(d, 424242)
+            real_open = open
+
+            def fail_on_snippet(p, *a, **kw):
+                if p == path:
+                    raise OSError("unreadable")
+                return real_open(p, *a, **kw)
+
+            with patch("com2tty.bridge.get_fish_conf_path",
+                       return_value=path), \
+                 patch("builtins.open", side_effect=fail_on_snippet):
+                clean_fish_conf(own_pid=os.getpid())
+            self.assertFalse(os.path.exists(path))
+
+    def test_inject_fish_conf_records_pid(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "conf.d", "com2tty.fish")
+            with patch("com2tty.bridge.get_fish_conf_path",
+                       return_value=path):
+                inject_fish_conf(4000)
+            with open(path) as f:
+                first_line = f.readline()
+            self.assertEqual(_marker_pid(first_line), os.getpid())
+
+
+# == picotool interception ownership ========================================
+
+class TestPicotoolOwnership(unittest.TestCase):
+
+    def setUp(self):
+        intercepted_picotools.clear()
+
+    @patch("com2tty.bridge.os.symlink")
+    @patch("com2tty.bridge.os.remove")
+    @patch("com2tty.bridge.os.rename")
+    @patch("com2tty.bridge.os.path.lexists", return_value=False)
+    @patch("com2tty.bridge.os.path.exists", return_value=False)
+    @patch("com2tty.bridge.os.path.isfile", return_value=True)
+    @patch("com2tty.bridge.os.path.islink", return_value=False)
+    @patch("com2tty.bridge.glob.glob",
+           return_value=["/home/u/.platformio/packages/tool-picotool-x/picotool"])
+    @patch("com2tty.bridge.os.chmod")
+    @patch("builtins.open", new_callable=MagicMock)
+    def test_owner_marker_write_failure_is_tolerated(
+            self, mock_open, mock_chmod, mock_glob, mock_islink, mock_isfile,
+            mock_exists, mock_lexists, mock_rename, mock_remove, mock_symlink):
+        # Wrapper write succeeds, owner-marker write fails: interception must
+        # still be in effect.
+        mock_open.side_effect = [MagicMock(), PermissionError("denied")]
+        setup_picotool_interceptor(5001)
+        self.assertEqual(len(intercepted_picotools), 1)
+
+    @patch("com2tty.bridge.os.rename")
+    @patch("com2tty.bridge.os.remove")
+    @patch("com2tty.bridge.os.path.exists", return_value=True)
+    @patch("com2tty.bridge.os.path.lexists", return_value=True)
+    def test_cleanup_owner_marker_remove_failure_is_tolerated(
+            self, mock_lexists, mock_exists, mock_remove, mock_rename):
+        intercepted_picotools.append(("/path/picotool", "/path/picotool.real"))
+        # First remove (the symlink) succeeds, second (owner marker) fails.
+        mock_remove.side_effect = [None, OSError("locked")]
+        cleanup_picotool_interceptor()  # should not raise
+
+    @patch("com2tty.bridge.glob.glob")
+    @patch("com2tty.bridge.pid_alive", return_value=True)
+    @patch("com2tty.bridge.read_pid_file", return_value=99999999)
+    def test_restore_skips_live_owner(self, mock_read, mock_alive, mock_glob):
+        restore_orphaned_picotools()
+        mock_glob.assert_not_called()
+
+    @patch("com2tty.bridge.glob.glob", return_value=[])
+    @patch("com2tty.bridge.os.remove")
+    @patch("com2tty.bridge.pid_alive", return_value=False)
+    @patch("com2tty.bridge.read_pid_file", return_value=12345)
+    def test_restore_reclaims_dead_owner_marker(self, mock_read, mock_alive,
+                                                mock_remove, mock_glob):
+        restore_orphaned_picotools()
+        mock_remove.assert_called_once_with(PICOTOOL_OWNER_FILE)
+
+    @patch("com2tty.bridge.glob.glob", return_value=[])
+    @patch("com2tty.bridge.os.remove", side_effect=OSError("locked"))
+    @patch("com2tty.bridge.pid_alive", return_value=False)
+    @patch("com2tty.bridge.read_pid_file", return_value=12345)
+    def test_restore_owner_marker_remove_failure_is_tolerated(
+            self, mock_read, mock_alive, mock_remove, mock_glob):
+        restore_orphaned_picotools()  # should not raise
+
+    @patch("com2tty.bridge.glob.glob", return_value=[])
+    @patch("com2tty.bridge.os.remove")
+    @patch("com2tty.bridge.read_pid_file")
+    def test_restore_reclaims_own_marker(self, mock_read, mock_remove,
+                                         mock_glob):
+        # An owner marker pointing at *this* process is stale by definition
+        # (we have not intercepted anything yet at startup).
+        mock_read.return_value = os.getpid()
+        restore_orphaned_picotools()
+        mock_remove.assert_called_once_with(PICOTOOL_OWNER_FILE)
+
+
+# == main-loop heartbeat ====================================================
+
+class TestMainHeartbeat(unittest.TestCase):
+
+    @patch("sys.argv", ["bridge.py", "--symlink", "/tmp/tty",
+                         "--rfc2217-port", "4400"])
+    @patch("com2tty.bridge.ALIVE_TOUCH_INTERVAL", -1.0)
+    @patch("com2tty.bridge.remove_alive_files")
+    @patch("com2tty.bridge.touch_alive_files")
+    @patch("com2tty.bridge.restore_orphaned_picotools")
+    @patch("com2tty.bridge.setup_picotool_interceptor")
+    @patch("com2tty.bridge.inject_rc")
+    @patch("com2tty.bridge.clean_rc")
+    @patch("com2tty.bridge.cleanup_symlink")
+    @patch("com2tty.bridge.threading.Thread")
+    @patch("os.openpty", create=True, return_value=(3, 4))
+    @patch("os.ttyname", create=True, return_value="/dev/pts/1")
+    @patch("os.path.lexists", return_value=False)
+    @patch("os.symlink", create=True)
+    @patch("com2tty.bridge.get_pty_settings",
+           return_value=(None, None, None, None))
+    @patch("select.select")
+    @patch("os.read", return_value=b"")
+    @patch("os.close")
+    def test_heartbeat_touched_in_loop_and_removed_on_exit(
+            self, mock_close, mock_read, mock_select, mock_gps, mock_symlink,
+            mock_lexists, mock_ttyname, mock_openpty, mock_thread_cls,
+            mock_cleanup, mock_clean, mock_inj, mock_intercept, mock_restore,
+            mock_touch, mock_remove_alive):
+        mock_select.return_value = ([0], [], [])  # immediate stdin EOF
+
+        main()
+
+        # Touched at startup and again by the (interval-forced) loop pass.
+        self.assertGreaterEqual(mock_touch.call_count, 2)
+        mock_touch.assert_called_with([4400, 4401])
+        mock_remove_alive.assert_called_once_with([4400, 4401])
 
 
 if __name__ == "__main__":

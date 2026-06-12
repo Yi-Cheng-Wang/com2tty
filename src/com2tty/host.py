@@ -7,6 +7,7 @@ import threading
 import queue
 import serial
 import serial.tools.list_ports
+from . import devnotify
 from .rfc2217_server import Redirector
 from .banner import enable_vt_mode, get_banner_colors  # noqa: F401 (re-export)
 from .boards import (  # noqa: F401 (re-exports kept for backwards compatibility)
@@ -128,14 +129,74 @@ def get_serial_settings(bytesize, parity, stopbits):
         stopbits_map.get(stopbits, serial.STOPBITS_ONE)
     )
 
+def get_commstate_baudrate(port, _kernel32=None):
+    """Read the configured baud rate straight from Win32 ``GetCommState``.
+
+    Locale-independent, unlike parsing mode.com output, whose field labels
+    are translated on non-English Windows ("Bits par seconde", "波特率", ...)
+    and defeat any keyword regex. ``_kernel32`` is injectable for tests.
+    """
+    import ctypes
+
+    class _DCB(ctypes.Structure):
+        _fields_ = [
+            ("DCBlength", ctypes.c_uint32),
+            ("BaudRate", ctypes.c_uint32),
+            ("fFlags", ctypes.c_uint32),
+            ("wReserved", ctypes.c_uint16),
+            ("XonLim", ctypes.c_uint16),
+            ("XoffLim", ctypes.c_uint16),
+            ("ByteSize", ctypes.c_ubyte),
+            ("Parity", ctypes.c_ubyte),
+            ("StopBits", ctypes.c_ubyte),
+            ("XonChar", ctypes.c_char),
+            ("XoffChar", ctypes.c_char),
+            ("ErrorChar", ctypes.c_char),
+            ("EofChar", ctypes.c_char),
+            ("EvtChar", ctypes.c_char),
+            ("wReserved1", ctypes.c_uint16),
+        ]
+
+    GENERIC_READ = 0x80000000
+    GENERIC_WRITE = 0x40000000
+    OPEN_EXISTING = 3
+    invalid_handle = ctypes.c_void_p(-1).value
+
+    try:
+        kernel32 = _kernel32 if _kernel32 is not None else ctypes.windll.kernel32
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        # The \\.\ prefix is required for COM10 and above, harmless below.
+        handle = kernel32.CreateFileW(
+            "\\\\.\\" + port, GENERIC_READ | GENERIC_WRITE, 0, None,
+            OPEN_EXISTING, 0, None)
+        if not handle or handle == invalid_handle:
+            return None
+        try:
+            dcb = _DCB()
+            dcb.DCBlength = ctypes.sizeof(_DCB)
+            if kernel32.GetCommState(handle, ctypes.byref(dcb)) and dcb.BaudRate:
+                return int(dcb.BaudRate)
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception as e:
+        logging.debug(f"GetCommState baud detection failed for {port}: {e}")
+    return None
+
+
 def get_system_baudrate(port):
     import re
+
+    baud = get_commstate_baudrate(port)
+    if baud:
+        return baud
+
     try:
-        # mode.com prints the COM port state. The console codepage may not match
+        # Fallback: parse mode.com output. The console codepage may not match
         # Python's locale decoding; the digits we need are ASCII, so replace
         # anything undecodable.
+        creationflags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
         res = subprocess.run(["mode.com", port], capture_output=True, text=True,
-                             errors="replace")
+                             errors="replace", creationflags=creationflags)
         if res.returncode == 0:
             # Prefer the number on the line that names the baud field. Most
             # locales still print the English word "Baud", but other numbers
@@ -152,6 +213,7 @@ def get_system_baudrate(port):
 
 def read_wsl_stdout(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_data_queue, uf2_active_event, uf2_data_queue):
     logging.debug("WSL-to-COM thread started.")
+    com_write_failing = False
     try:
         while not shutdown_event.is_set():
             data = proc.stdout.read(1024)
@@ -166,10 +228,21 @@ def read_wsl_stdout(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_dat
                 # RFC 2217 mode: route data to the Redirector via queue
                 rfc2217_data_queue.put(data)
             else:
-                # Normal mode: write directly to COM port
-                logging.debug(f"WSL -> COM: {len(data)} bytes")
-                ser.write(data)
-                ser.flush()
+                # Normal mode: write directly to COM port. A write failure
+                # means the device is unplugged or re-enumerating; the
+                # COM-to-WSL thread owns the reconnect, so drop the data and
+                # keep this thread alive instead of tearing the bridge down.
+                try:
+                    logging.debug(f"WSL -> COM: {len(data)} bytes")
+                    ser.write(data)
+                    ser.flush()
+                    com_write_failing = False
+                except Exception as e:
+                    if not com_write_failing:
+                        logging.warning(
+                            f"Dropping WSL -> COM data while {ser.port} is "
+                            f"unavailable (reconnecting): {e}")
+                        com_write_failing = True
     except Exception as e:
         if not shutdown_event.is_set():
             logging.error(f"Error in WSL-to-COM thread: {e}")
@@ -177,7 +250,7 @@ def read_wsl_stdout(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_dat
         shutdown_event.set()
 
 def reopen_serial_port(ser, usb_serial, shutdown_event, abort_events=(),
-                       max_attempts=None, poll_interval=0.5):
+                       max_attempts=None, poll_interval=0.5, ser_lock=None):
     """Reopen a dead COM handle, following the device across re-enumeration.
 
     Windows invalidates the open handle when a device is unplugged or reboots
@@ -185,20 +258,27 @@ def reopen_serial_port(ser, usb_serial, shutdown_event, abort_events=(),
     returns. This closes the stale handle, then retries the original name and
     falls back to locating the device by its USB serial number.
 
+    ``ser_lock`` serialises the close/open/rename steps against the other
+    threads that touch the same port (the dynamic-SETTINGS handler reopens it
+    too); without it the two can interleave close/open on one handle.
+
     Returns True once the port is open again. Returns False when
     ``max_attempts`` (None = unlimited) is exhausted, ``shutdown_event`` is
     set, or any event in ``abort_events`` becomes set (used to yield to the
     UF2 upload path, which manages its own reopen).
     """
+    if ser_lock is None:
+        ser_lock = threading.Lock()
     original_port = ser.port
-    try:
-        ser.close()
-    except Exception:
-        pass
-    # Never reopen at 1200 baud: that would immediately re-trigger the
-    # bootloader touch on boards that interpret it.
-    if getattr(ser, 'baudrate', 115200) == 1200:
-        ser.baudrate = 115200
+    with ser_lock:
+        try:
+            ser.close()
+        except Exception:
+            pass
+        # Never reopen at 1200 baud: that would immediately re-trigger the
+        # bootloader touch on boards that interpret it.
+        if getattr(ser, 'baudrate', 115200) == 1200:
+            ser.baudrate = 115200
 
     attempts = 0
     while not shutdown_event.is_set():
@@ -207,15 +287,16 @@ def reopen_serial_port(ser, usb_serial, shutdown_event, abort_events=(),
         if max_attempts is not None and attempts >= max_attempts:
             return False
         attempts += 1
-        time.sleep(poll_interval)
+        _poll_wait(poll_interval)
 
         # First try the port under its current name.
-        try:
-            ser.open()
-            logging.info(f"{ser.port} reopened successfully.")
-            return True
-        except Exception:
-            pass
+        with ser_lock:
+            try:
+                ser.open()
+                logging.info(f"{ser.port} reopened successfully.")
+                return True
+            except Exception:
+                pass
 
         # The port number may have changed after re-enumeration; locate the
         # device by USB serial number.
@@ -223,14 +304,29 @@ def reopen_serial_port(ser, usb_serial, shutdown_event, abort_events=(),
             for p in serial.tools.list_ports.comports():
                 if p.serial_number == usb_serial and p.device != ser.port:
                     logging.info(f"Device reappeared as {p.device} (was {original_port}).")
-                    ser.port = p.device
-                    try:
-                        ser.open()
-                        logging.info(f"{p.device} opened successfully.")
-                        return True
-                    except Exception:
-                        pass
+                    with ser_lock:
+                        ser.port = p.device
+                        try:
+                            ser.open()
+                            logging.info(f"{p.device} opened successfully.")
+                            return True
+                        except Exception:
+                            pass
     return False
+
+
+def _poll_wait(interval):
+    """Sleep one poll interval, waking early on a device-change event.
+
+    Used by the device-polling loops (hot-plug reconnect, bootloader-port
+    acquisition, --wait). When the WM_DEVICECHANGE watcher is running, a
+    plug/unplug wakes the loop immediately; otherwise this is a plain sleep.
+    """
+    watcher = devnotify.get_watcher()
+    if watcher is not None:
+        watcher.wait(interval)
+    else:
+        time.sleep(interval)
 
 
 def snapshot_ports():
@@ -260,7 +356,7 @@ def acquire_new_port(ser, before_ports, shutdown_event, max_attempts=40,
     attempts = 0
     while not shutdown_event.is_set() and attempts < max_attempts:
         attempts += 1
-        time.sleep(poll_interval)
+        _poll_wait(poll_interval)
         for device in sorted(snapshot_ports() - before_ports):
             ser.port = device
             try:
@@ -273,7 +369,8 @@ def acquire_new_port(ser, before_ports, shutdown_event, max_attempts=40,
     return None
 
 
-def read_com_port(ser, proc, shutdown_event, rfc2217_active_event, uf2_active_event, usb_serial=None):
+def read_com_port(ser, proc, shutdown_event, rfc2217_active_event, uf2_active_event, usb_serial=None,
+                  ser_lock=None):
     logging.debug("COM-to-WSL thread started.")
     consecutive_errors = 0
     try:
@@ -284,7 +381,13 @@ def read_com_port(ser, proc, shutdown_event, rfc2217_active_event, uf2_active_ev
 
             # Short timeout allows periodic checking of shutdown_event
             try:
-                data = ser.read(1024)
+                # Read whatever has already arrived instead of blocking for a
+                # full 1024-byte buffer: read(1024) would sit out the whole
+                # 0.2 s timeout on every small payload, adding up to 200 ms
+                # of forwarding latency to interactive traffic.
+                data = ser.read(ser.in_waiting or 1)
+                if data and ser.in_waiting:
+                    data += ser.read(ser.in_waiting)
                 consecutive_errors = 0
             except (PermissionError, OSError):
                 # COM port may be temporarily unavailable during board reset
@@ -302,7 +405,8 @@ def read_com_port(ser, proc, shutdown_event, rfc2217_active_event, uf2_active_ev
                     f"to come back (unplugged or re-enumerating)...")
                 if reopen_serial_port(
                         ser, usb_serial, shutdown_event,
-                        abort_events=(rfc2217_active_event, uf2_active_event)):
+                        abort_events=(rfc2217_active_event, uf2_active_event),
+                        ser_lock=ser_lock):
                     logging.info(f"Bridge resumed on {ser.port}.")
                 consecutive_errors = 0
                 continue
@@ -382,12 +486,15 @@ class ResetProofSerial:
             setattr(object.__getattribute__(self, '_ser'), name, value)
 
 
-def read_wsl_stderr(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_data_queue, uf2_active_event, uf2_data_queue, usb_serial, board_type):
+def read_wsl_stderr(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_data_queue, uf2_active_event, uf2_data_queue, usb_serial, board_type,
+                    ser_lock=None):
     """
     Reads control messages from WSL bridge's stderr.
     Handles dynamic serial settings, RFC 2217 session lifecycle, and UF2 uploads.
     """
     logging.debug("WSL stderr logging thread started.")
+    if ser_lock is None:
+        ser_lock = threading.Lock()
 
     redirector_stop = None
     redirector_thread = None
@@ -693,32 +800,39 @@ def read_wsl_stderr(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_dat
                 for attempt in range(max_retries):
                     try:
                         changes = []
-                        for part in parts:
-                            k, v = part.split("=")
-                            if k == "baud" and v != "None":
-                                new_baud = int(v)
-                                if ser.baudrate != new_baud:
-                                    ser.baudrate = new_baud
-                                    changes.append(f"baud={new_baud}")
-                            elif k == "bytesize":
-                                new_bytesize = int(v)
-                                bytesize_map = {5: serial.FIVEBITS, 6: serial.SIXBITS, 7: serial.SEVENBITS, 8: serial.EIGHTBITS}
-                                target_bytesize = bytesize_map.get(new_bytesize)
-                                if target_bytesize and ser.bytesize != target_bytesize:
-                                    ser.bytesize = target_bytesize
-                                    changes.append(f"bytesize={new_bytesize}")
-                            elif k == "parity":
-                                parity_map = {"N": serial.PARITY_NONE, "E": serial.PARITY_EVEN, "O": serial.PARITY_ODD}
-                                target_parity = parity_map.get(v)
-                                if target_parity and ser.parity != target_parity:
-                                    ser.parity = target_parity
-                                    changes.append(f"parity={v}")
-                            elif k == "stopbits":
-                                stopbits_map = {"1": serial.STOPBITS_ONE, "2": serial.STOPBITS_TWO}
-                                target_stopbits = stopbits_map.get(v)
-                                if target_stopbits and ser.stopbits != target_stopbits:
-                                    ser.stopbits = target_stopbits
-                                    changes.append(f"stopbits={v}")
+                        with ser_lock:
+                            for part in parts:
+                                k, v = part.split("=")
+                                if k == "baud" and v != "None":
+                                    new_baud = int(v)
+                                    # 0 is the termios B0 hangup pseudo-rate;
+                                    # applying it to a Windows handle fails and
+                                    # would needlessly cycle the port below.
+                                    if new_baud > 0 and ser.baudrate != new_baud:
+                                        ser.baudrate = new_baud
+                                        changes.append(f"baud={new_baud}")
+                                elif k == "bytesize":
+                                    new_bytesize = int(v)
+                                    bytesize_map = {5: serial.FIVEBITS, 6: serial.SIXBITS, 7: serial.SEVENBITS, 8: serial.EIGHTBITS}
+                                    target_bytesize = bytesize_map.get(new_bytesize)
+                                    if target_bytesize and ser.bytesize != target_bytesize:
+                                        ser.bytesize = target_bytesize
+                                        changes.append(f"bytesize={new_bytesize}")
+                                elif k == "parity":
+                                    # Full map: the CLI accepts S/M as well, so
+                                    # dynamic changes must not silently drop them.
+                                    parity_map = {"N": serial.PARITY_NONE, "E": serial.PARITY_EVEN, "O": serial.PARITY_ODD,
+                                                  "S": serial.PARITY_SPACE, "M": serial.PARITY_MARK}
+                                    target_parity = parity_map.get(v)
+                                    if target_parity and ser.parity != target_parity:
+                                        ser.parity = target_parity
+                                        changes.append(f"parity={v}")
+                                elif k == "stopbits":
+                                    stopbits_map = {"1": serial.STOPBITS_ONE, "1.5": serial.STOPBITS_ONE_POINT_FIVE, "2": serial.STOPBITS_TWO}
+                                    target_stopbits = stopbits_map.get(v)
+                                    if target_stopbits and ser.stopbits != target_stopbits:
+                                        ser.stopbits = target_stopbits
+                                        changes.append(f"stopbits={v}")
                         if changes:
                             logging.info(f"Dynamic configuration change applied: {', '.join(changes)}")
                         break  # Success — exit retry loop
@@ -726,16 +840,18 @@ def read_wsl_stderr(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_dat
                         if attempt < max_retries - 1:
                             logging.warning(f"COM port temporarily unavailable while applying settings (attempt {attempt + 1}/{max_retries}): {e}")
                             logging.info("Attempting to reopen COM port handle...")
-                            try:
-                                ser.close()
-                            except Exception:
-                                pass
+                            with ser_lock:
+                                try:
+                                    ser.close()
+                                except Exception:
+                                    pass
                             time.sleep(1.0)
-                            try:
-                                ser.open()
-                                logging.info(f"COM port {ser.port} handle reopened.")
-                            except Exception as reopen_err:
-                                logging.warning(f"COM port reopen failed (will retry): {reopen_err}")
+                            with ser_lock:
+                                try:
+                                    ser.open()
+                                    logging.info(f"COM port {ser.port} handle reopened.")
+                                except Exception as reopen_err:
+                                    logging.warning(f"COM port reopen failed (will retry): {reopen_err}")
                         else:
                             logging.error(f"Failed to apply dynamic settings after {max_retries} attempts: {e}")
                     except Exception as e:
@@ -805,7 +921,8 @@ def read_wsl_stderr(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_dat
 
 
 def run_gamepad_bridge(pad_index=0, poll_hz=250, name="Microsoft X-Box 360 pad",
-                       use_uinput=False, tmp_path="/tmp/com2pad0", distro=None):
+                       use_uinput=False, tmp_path="/tmp/com2pad0", distro=None,
+                       stop_event=None):
     """
     Forward a Windows XInput controller into WSL as a virtual gamepad.
 
@@ -820,6 +937,10 @@ def run_gamepad_bridge(pad_index=0, poll_hz=250, name="Microsoft X-Box 360 pad",
     a real system-wide /dev/input device (one-time root setup; it falls back to
     the /tmp stream and prints instructions if /dev/uinput is not accessible).
     com2tty itself never needs administrator at runtime.
+
+    Returns the exit reason ("interrupt", "stop", "wsl-exited", or
+    "shutdown"), which run_with_respawn uses to decide whether to rebuild
+    the bridge.
     """
     from .xinput import GamepadSource
 
@@ -918,10 +1039,16 @@ def run_gamepad_bridge(pad_index=0, poll_hz=250, name="Microsoft X-Box 360 pad",
     heartbeat = 0.5  # seconds; keep the pipe warm even when idle
     last_send = 0.0
 
+    exit_reason = "shutdown"
     try:
         while not shutdown_event.is_set():
+            if stop_event is not None and stop_event.is_set():
+                logging.info("Stop requested; shutting down gamepad bridge.")
+                exit_reason = "stop"
+                break
             if proc.poll() is not None:
                 logging.info("WSL gamepad subprocess exited.")
+                exit_reason = "wsl-exited"
                 break
 
             changed, frame = src.poll()
@@ -933,11 +1060,13 @@ def run_gamepad_bridge(pad_index=0, poll_hz=250, name="Microsoft X-Box 360 pad",
                     last_send = now
                 except (BrokenPipeError, OSError):
                     logging.info("WSL pipe closed.")
+                    exit_reason = "wsl-exited"
                     break
 
             time.sleep(interval)
     except KeyboardInterrupt:
         logging.info("Stopping gamepad bridge due to KeyboardInterrupt...")
+        exit_reason = "interrupt"
     finally:
         shutdown_event.set()
         logging.info("Cleaning up gamepad bridge...")
@@ -950,6 +1079,54 @@ def run_gamepad_bridge(pad_index=0, poll_hz=250, name="Microsoft X-Box 360 pad",
                 logging.warning("WSL process did not exit. Killing it.")
                 proc.kill()
         logging.info("Gamepad bridge stopped successfully.")
+    return exit_reason
+
+
+def run_multi_gamepad_bridge(pad_indices, poll_hz=250,
+                             name="Microsoft X-Box 360 pad",
+                             use_uinput=False, tmp_path="/tmp/com2pad0",
+                             distro=None, auto_respawn=False):
+    """Forward several XInput controller slots concurrently.
+
+    Each slot gets its own WSL helper and its own endpoint: the FIFO path is
+    derived from ``tmp_path`` by incrementing its trailing number
+    (/tmp/com2pad0, /tmp/com2pad1, ...). In the uinput tier each helper
+    creates its own /dev/input device, exactly like plugging in several
+    physical controllers.
+    """
+    stop_event = threading.Event()
+    threads = []
+
+    def _runner(position, pad_index):
+        try:
+            kwargs = dict(pad_index=pad_index, poll_hz=poll_hz, name=name,
+                          use_uinput=use_uinput,
+                          tmp_path=_derive_indexed_path(tmp_path, position),
+                          distro=distro)
+            if auto_respawn:
+                run_with_respawn(run_gamepad_bridge, stop_event=stop_event,
+                                 **kwargs)
+            else:
+                run_gamepad_bridge(stop_event=stop_event, **kwargs)
+        except Exception as e:
+            logging.error(f"Gamepad bridge for slot {pad_index} failed: {e}")
+
+    for position, pad_index in enumerate(pad_indices):
+        t = threading.Thread(target=_runner, args=(position, pad_index),
+                             daemon=True)
+        t.start()
+        threads.append(t)
+
+    try:
+        while any(t.is_alive() for t in threads):
+            time.sleep(0.5)
+        logging.info("All gamepad bridges have stopped.")
+    except KeyboardInterrupt:
+        logging.info("Stopping all gamepad bridges...")
+    finally:
+        stop_event.set()
+        for t in threads:
+            t.join(timeout=5.0)
 
 
 def _derive_indexed_path(base, index):
@@ -967,9 +1144,38 @@ def _derive_indexed_path(base, index):
     return f"{base}{index}"
 
 
+def run_with_respawn(target, stop_event=None, respawn_delay=2.0, **kwargs):
+    """Run a bridge entry function and rebuild the bridge when WSL dies.
+
+    ``wsl --shutdown``, a WSL servicing update, or a crashed helper normally
+    ends the session; with --auto-respawn the host waits until WSL answers
+    again and then re-runs ``target`` (run_bridge or run_gamepad_bridge) with
+    the same arguments, so the WSL endpoint reappears at the same path. A
+    Ctrl+C or a stop request ends the loop like a normal session.
+    """
+    while True:
+        reason = target(stop_event=stop_event, **kwargs)
+        if reason in ("interrupt", "stop"):
+            return reason
+        if stop_event is not None and stop_event.is_set():
+            return "stop"
+        logging.warning(f"Bridge session ended ({reason}); waiting for WSL "
+                        "before respawning (--auto-respawn)...")
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                return "stop"
+            try:
+                check_wsl_environment(None, kwargs.get("distro"))
+                break
+            except RuntimeError as exc:
+                logging.info(f"WSL is not ready yet: {exc}")
+                time.sleep(respawn_delay)
+        logging.info("WSL is available again; respawning the bridge.")
+
+
 def run_multi_bridge(ports, baud, wsl_tty, bytesize, parity, stopbits,
                      xonxoff, rtscts, dsrdtr, rfc2217_port, distro=None,
-                     board="auto"):
+                     board="auto", wait=False, auto_respawn=False):
     """Bridge several COM ports concurrently from a single invocation.
 
     Each port gets its own WSL helper, a distinct symlink path (derived from
@@ -984,14 +1190,18 @@ def run_multi_bridge(ports, baud, wsl_tty, bytesize, parity, stopbits,
 
     def _runner(index, port_name):
         try:
-            run_bridge(
+            kwargs = dict(
                 port=port_name, baud=baud,
                 wsl_tty=_derive_indexed_path(wsl_tty, index),
                 bytesize=bytesize, parity=parity, stopbits=stopbits,
                 xonxoff=xonxoff, rtscts=rtscts, dsrdtr=dsrdtr,
                 rfc2217_port=rfc2217_port + 2 * index,
-                distro=distro, board=board,
-                env_setup=(index == 0), stop_event=stop_event)
+                distro=distro, board=board, wait=wait,
+                env_setup=(index == 0))
+            if auto_respawn:
+                run_with_respawn(run_bridge, stop_event=stop_event, **kwargs)
+            else:
+                run_bridge(stop_event=stop_event, **kwargs)
         except Exception as e:
             logging.error(f"Bridge for {port_name} failed: {e}")
 
@@ -1014,7 +1224,7 @@ def run_multi_bridge(ports, baud, wsl_tty, bytesize, parity, stopbits,
 
 def run_bridge(port, baud, wsl_tty, bytesize, parity, stopbits, xonxoff,
                rtscts, dsrdtr, rfc2217_port, distro=None, board="auto",
-               env_setup=True, stop_event=None):
+               env_setup=True, stop_event=None, wait=False):
     # Recover any AutoPlay setting a previous run left disabled after a crash.
     restore_orphaned_autoplay()
 
@@ -1032,6 +1242,21 @@ def run_bridge(port, baud, wsl_tty, bytesize, parity, stopbits, xonxoff,
     logging.info(f"WSL bridge script resolved to: {wsl_bridge_path}")
 
     check_wsl_environment(wsl_bridge_path, distro)
+
+    # Event-driven plug/unplug wake-ups for the polling loops below; plain
+    # sleeps remain the fallback when the watcher cannot start.
+    devnotify.start_device_watcher()
+
+    if wait and port not in snapshot_ports():
+        # --wait: the device may not be plugged in yet; poll for it instead
+        # of failing. Board detection below needs the port enumerated anyway.
+        logging.info(f"Port {port} is not present; waiting for it to appear (--wait)...")
+        while port not in snapshot_ports():
+            if stop_event is not None and stop_event.is_set():
+                logging.info(f"Stop requested while waiting for {port}.")
+                return "stop"
+            _poll_wait(0.5)
+        logging.info(f"Port {port} appeared.")
 
     if str(baud).lower() == "auto":
         detected_baud = get_system_baudrate(port)
@@ -1082,6 +1307,9 @@ def run_bridge(port, baud, wsl_tty, bytesize, parity, stopbits, xonxoff,
     rfc2217_data_queue = queue.Queue()
     uf2_active_event = threading.Event()
     uf2_data_queue = queue.Queue()
+    # Serialises close/open/setting changes on `ser` across the COM reader's
+    # hot-plug reconnect and the stderr thread's dynamic-SETTINGS handling.
+    ser_lock = threading.Lock()
     # Detect board type from USB VID/PID, unless overridden via --board
     # (covers boards whose USB-UART chip is not in the VID whitelist).
     if board and board != "auto":
@@ -1100,8 +1328,8 @@ def run_bridge(port, baud, wsl_tty, bytesize, parity, stopbits, xonxoff,
 
     # Start thread routing
     t_wsl_to_com = threading.Thread(target=read_wsl_stdout, args=(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_data_queue, uf2_active_event, uf2_data_queue), daemon=True)
-    t_com_to_wsl = threading.Thread(target=read_com_port, args=(ser, proc, shutdown_event, rfc2217_active_event, uf2_active_event, usb_serial), daemon=True)
-    t_wsl_stderr = threading.Thread(target=read_wsl_stderr, args=(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_data_queue, uf2_active_event, uf2_data_queue, usb_serial, board_type), daemon=True)
+    t_com_to_wsl = threading.Thread(target=read_com_port, args=(ser, proc, shutdown_event, rfc2217_active_event, uf2_active_event, usb_serial, ser_lock), daemon=True)
+    t_wsl_stderr = threading.Thread(target=read_wsl_stderr, args=(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_data_queue, uf2_active_event, uf2_data_queue, usb_serial, board_type, ser_lock), daemon=True)
 
     t_wsl_to_com.start()
     t_com_to_wsl.start()
@@ -1127,18 +1355,22 @@ def run_bridge(port, baud, wsl_tty, bytesize, parity, stopbits, xonxoff,
 
     logging.info("Bridge is fully active. Press Ctrl+C to stop.")
 
+    exit_reason = "shutdown"
     try:
         while not shutdown_event.is_set():
             if stop_event is not None and stop_event.is_set():
                 logging.info(f"Stop requested; shutting down bridge for {port}.")
+                exit_reason = "stop"
                 break
             # Wait and check if the WSL process is still running
             if proc.poll() is not None:
                 logging.info("WSL subprocess exited unexpectedly.")
+                exit_reason = "wsl-exited"
                 break
             time.sleep(0.5)
     except KeyboardInterrupt:
         logging.info("Stopping bridge due to KeyboardInterrupt...")
+        exit_reason = "interrupt"
     finally:
         shutdown_event.set()
 
@@ -1163,4 +1395,5 @@ def run_bridge(port, baud, wsl_tty, bytesize, parity, stopbits, xonxoff,
                 logging.warning("WSL process did not exit. Killing it.")
                 proc.kill()
         logging.info("Bridge stopped successfully.")
+    return exit_reason
 
