@@ -28,6 +28,7 @@ class TestCli(unittest.TestCase):
             rfc2217_port=4000,
             distro=None,
             board="auto",
+            wait=False,
         )
 
     @patch("com2tty.cli.run_bridge")
@@ -47,7 +48,14 @@ class TestCli(unittest.TestCase):
             rfc2217_port=4000,
             distro=None,
             board="auto",
+            wait=False,
         )
+
+    @patch("com2tty.cli.run_bridge")
+    @patch("sys.argv", ["com2tty", "COM2", "--wait"])
+    def test_cli_wait_flag(self, mock_run):
+        main()
+        self.assertTrue(mock_run.call_args[1]["wait"])
 
     @patch("com2tty.cli.run_bridge")
     @patch("sys.argv", ["com2tty", "COM2", "--distro", "Ubuntu-22.04",
@@ -129,13 +137,36 @@ class TestCliVersionAndList(unittest.TestCase):
     @patch("sys.argv", ["com2tty", "--list"])
     def test_list_calls_discovery(self, mock_list):
         main()
-        mock_list.assert_called_once_with()
+        mock_list.assert_called_once_with(as_json=False)
 
     @patch("com2tty.discovery.print_port_list")
     @patch("sys.argv", ["com2tty", "-l"])
     def test_list_short_flag(self, mock_list):
         main()
-        mock_list.assert_called_once_with()
+        mock_list.assert_called_once_with(as_json=False)
+
+    @patch("com2tty.discovery.print_port_list")
+    @patch("sys.argv", ["com2tty", "--list", "--json"])
+    def test_list_json_flag(self, mock_list):
+        main()
+        mock_list.assert_called_once_with(as_json=True)
+
+    @patch("com2tty.doctor.run_doctor", return_value=0)
+    @patch("sys.argv", ["com2tty", "--doctor"])
+    def test_doctor_dispatch(self, mock_doctor):
+        with self.assertRaises(SystemExit) as ctx:
+            main()
+        self.assertEqual(ctx.exception.code, 0)
+        mock_doctor.assert_called_once_with(distro=None, rfc2217_port=4000)
+
+    @patch("com2tty.doctor.run_doctor", return_value=1)
+    @patch("sys.argv", ["com2tty", "--doctor", "--distro", "Ubuntu",
+                        "--rfc2217-port", "5000"])
+    def test_doctor_propagates_failure_and_options(self, mock_doctor):
+        with self.assertRaises(SystemExit) as ctx:
+            main()
+        self.assertEqual(ctx.exception.code, 1)
+        mock_doctor.assert_called_once_with(distro="Ubuntu", rfc2217_port=5000)
 
     @patch("com2tty.cli.run_bridge")
     @patch("com2tty.discovery.print_port_list")
@@ -194,6 +225,15 @@ class TestCliGamepad(unittest.TestCase):
         # argparse parser.error raises SystemExit
         with self.assertRaises(SystemExit):
             main()
+
+    @patch("com2tty.cli.run_gamepad_bridge")
+    @patch("sys.argv", ["com2tty", "COM3", "--gamepad"])
+    def test_gamepad_with_port_errors(self, mock_pad):
+        # A positional COM port together with --gamepad used to be silently
+        # ignored; it is now a hard argument error.
+        with self.assertRaises(SystemExit):
+            main()
+        mock_pad.assert_not_called()
 
     @patch("com2tty.cli.run_gamepad_bridge")
     @patch("sys.exit")
