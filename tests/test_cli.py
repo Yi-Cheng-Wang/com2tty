@@ -57,6 +57,25 @@ class TestCli(unittest.TestCase):
         main()
         self.assertTrue(mock_run.call_args[1]["wait"])
 
+    @patch("com2tty.host.run_with_respawn")
+    @patch("com2tty.cli.run_bridge")
+    @patch("sys.argv", ["com2tty", "COM2", "--auto-respawn"])
+    def test_cli_auto_respawn_uses_wrapper_and_implies_wait(self, mock_run,
+                                                            mock_resp):
+        main()
+        mock_run.assert_not_called()
+        mock_resp.assert_called_once()
+        self.assertIs(mock_resp.call_args[0][0], mock_run)
+        self.assertEqual(mock_resp.call_args[1]["port"], "COM2")
+        self.assertTrue(mock_resp.call_args[1]["wait"])
+
+    @patch("com2tty.host.run_multi_bridge")
+    @patch("sys.argv", ["com2tty", "COM3", "COM5", "--auto-respawn"])
+    def test_cli_auto_respawn_multi_port(self, mock_multi):
+        main()
+        self.assertTrue(mock_multi.call_args[1]["auto_respawn"])
+        self.assertTrue(mock_multi.call_args[1]["wait"])
+
     @patch("com2tty.cli.run_bridge")
     @patch("sys.argv", ["com2tty", "COM2", "--distro", "Ubuntu-22.04",
                          "--board", "esp32"])
@@ -234,6 +253,34 @@ class TestCliGamepad(unittest.TestCase):
         with self.assertRaises(SystemExit):
             main()
         mock_pad.assert_not_called()
+
+    @patch("com2tty.host.run_multi_gamepad_bridge")
+    @patch("com2tty.cli.run_gamepad_bridge")
+    @patch("sys.argv", ["com2tty", "--gamepad", "--pad-index", "0", "1"])
+    def test_multiple_pad_indices_use_multi_bridge(self, mock_pad,
+                                                   mock_multi):
+        main()
+        mock_pad.assert_not_called()
+        mock_multi.assert_called_once()
+        self.assertEqual(mock_multi.call_args[0][0], [0, 1])
+        self.assertFalse(mock_multi.call_args[1]["auto_respawn"])
+
+    @patch("com2tty.cli.run_gamepad_bridge")
+    @patch("sys.argv", ["com2tty", "--gamepad", "--pad-index", "1", "1"])
+    def test_duplicate_pad_indices_error(self, mock_pad):
+        with self.assertRaises(SystemExit):
+            main()
+        mock_pad.assert_not_called()
+
+    @patch("com2tty.host.run_with_respawn")
+    @patch("com2tty.cli.run_gamepad_bridge")
+    @patch("sys.argv", ["com2tty", "--gamepad", "--auto-respawn"])
+    def test_gamepad_auto_respawn_uses_wrapper(self, mock_pad, mock_resp):
+        main()
+        mock_pad.assert_not_called()
+        mock_resp.assert_called_once()
+        self.assertIs(mock_resp.call_args[0][0], mock_pad)
+        self.assertEqual(mock_resp.call_args[1]["pad_index"], 0)
 
     @patch("com2tty.cli.run_gamepad_bridge")
     @patch("sys.exit")
