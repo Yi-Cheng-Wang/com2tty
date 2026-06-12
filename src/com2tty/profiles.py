@@ -27,7 +27,7 @@ import os
 # Options that are argparse store_true flags rather than value options.
 FLAG_OPTIONS = frozenset({
     "gamepad", "uinput", "xonxoff", "rtscts", "dsrdtr", "debug", "list",
-    "wait", "json", "doctor",
+    "wait", "json", "doctor", "auto-respawn",
 })
 
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})

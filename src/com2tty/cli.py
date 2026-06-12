@@ -53,6 +53,14 @@ def main():
     )
 
     parser.add_argument(
+        "--auto-respawn",
+        action="store_true",
+        help="Rebuild the bridge automatically when the WSL helper dies "
+             "(e.g. after 'wsl --shutdown' or a WSL update). In serial mode "
+             "this implies --wait."
+    )
+
+    parser.add_argument(
         "--gamepad",
         action="store_true",
         help="Gamepad mode: forward a Windows XInput controller into WSL as a "
@@ -62,9 +70,13 @@ def main():
     parser.add_argument(
         "--pad-index",
         type=int,
+        nargs="+",
         choices=[0, 1, 2, 3],
-        default=0,
-        help="XInput controller slot to forward in --gamepad mode (default: 0)."
+        default=[0],
+        help="XInput controller slot(s) to forward in --gamepad mode "
+             "(default: 0). Several slots may be given (e.g. --pad-index 0 1) "
+             "to forward multiple controllers at once; each gets its own WSL "
+             "endpoint."
     )
 
     parser.add_argument(
@@ -211,15 +223,29 @@ def main():
                      "positional argument (it would be silently ignored)")
 
     if parsed_args.gamepad:
+        pad_indices = parsed_args.pad_index
+        if len(set(pad_indices)) != len(pad_indices):
+            parser.error("--pad-index values must be unique")
         try:
-            run_gamepad_bridge(
-                pad_index=parsed_args.pad_index,
+            pad_kwargs = dict(
                 poll_hz=parsed_args.poll_hz,
                 name=parsed_args.pad_name,
                 use_uinput=parsed_args.uinput,
                 tmp_path=parsed_args.wsl_pad,
                 distro=parsed_args.distro,
             )
+            if len(pad_indices) > 1:
+                from com2tty.host import run_multi_gamepad_bridge
+                run_multi_gamepad_bridge(
+                    pad_indices,
+                    auto_respawn=parsed_args.auto_respawn,
+                    **pad_kwargs)
+            elif parsed_args.auto_respawn:
+                from com2tty.host import run_with_respawn
+                run_with_respawn(run_gamepad_bridge,
+                                 pad_index=pad_indices[0], **pad_kwargs)
+            else:
+                run_gamepad_bridge(pad_index=pad_indices[0], **pad_kwargs)
         except KeyboardInterrupt:
             logging.info("Interrupted by user. Exiting.")
             sys.exit(0)
@@ -233,6 +259,11 @@ def main():
 
     if not parsed_args.port:
         parser.error("the 'port' argument is required unless --gamepad or --list is used")
+
+    # A respawned bridge re-opens the COM port from scratch; the device may
+    # re-enumerate while WSL restarts, so waiting for it is implied.
+    if parsed_args.auto_respawn:
+        parsed_args.wait = True
 
     try:
         if len(parsed_args.port) > 1:
@@ -250,10 +281,11 @@ def main():
                 rfc2217_port=parsed_args.rfc2217_port,
                 distro=parsed_args.distro,
                 board=parsed_args.board,
-                wait=parsed_args.wait
+                wait=parsed_args.wait,
+                auto_respawn=parsed_args.auto_respawn
             )
         else:
-            run_bridge(
+            bridge_kwargs = dict(
                 port=parsed_args.port[0],
                 baud=parsed_args.baud,
                 wsl_tty=parsed_args.wsl_tty,
@@ -268,6 +300,11 @@ def main():
                 board=parsed_args.board,
                 wait=parsed_args.wait
             )
+            if parsed_args.auto_respawn:
+                from com2tty.host import run_with_respawn
+                run_with_respawn(run_bridge, **bridge_kwargs)
+            else:
+                run_bridge(**bridge_kwargs)
     except KeyboardInterrupt:
         logging.info("Interrupted by user. Exiting.")
         sys.exit(0)

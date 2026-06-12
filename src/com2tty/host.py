@@ -7,6 +7,7 @@ import threading
 import queue
 import serial
 import serial.tools.list_ports
+from . import devnotify
 from .rfc2217_server import Redirector
 from .banner import enable_vt_mode, get_banner_colors  # noqa: F401 (re-export)
 from .boards import (  # noqa: F401 (re-exports kept for backwards compatibility)
@@ -286,7 +287,7 @@ def reopen_serial_port(ser, usb_serial, shutdown_event, abort_events=(),
         if max_attempts is not None and attempts >= max_attempts:
             return False
         attempts += 1
-        time.sleep(poll_interval)
+        _poll_wait(poll_interval)
 
         # First try the port under its current name.
         with ser_lock:
@@ -312,6 +313,20 @@ def reopen_serial_port(ser, usb_serial, shutdown_event, abort_events=(),
                         except Exception:
                             pass
     return False
+
+
+def _poll_wait(interval):
+    """Sleep one poll interval, waking early on a device-change event.
+
+    Used by the device-polling loops (hot-plug reconnect, bootloader-port
+    acquisition, --wait). When the WM_DEVICECHANGE watcher is running, a
+    plug/unplug wakes the loop immediately; otherwise this is a plain sleep.
+    """
+    watcher = devnotify.get_watcher()
+    if watcher is not None:
+        watcher.wait(interval)
+    else:
+        time.sleep(interval)
 
 
 def snapshot_ports():
@@ -341,7 +356,7 @@ def acquire_new_port(ser, before_ports, shutdown_event, max_attempts=40,
     attempts = 0
     while not shutdown_event.is_set() and attempts < max_attempts:
         attempts += 1
-        time.sleep(poll_interval)
+        _poll_wait(poll_interval)
         for device in sorted(snapshot_ports() - before_ports):
             ser.port = device
             try:
@@ -906,7 +921,8 @@ def read_wsl_stderr(proc, ser, shutdown_event, rfc2217_active_event, rfc2217_dat
 
 
 def run_gamepad_bridge(pad_index=0, poll_hz=250, name="Microsoft X-Box 360 pad",
-                       use_uinput=False, tmp_path="/tmp/com2pad0", distro=None):
+                       use_uinput=False, tmp_path="/tmp/com2pad0", distro=None,
+                       stop_event=None):
     """
     Forward a Windows XInput controller into WSL as a virtual gamepad.
 
@@ -921,6 +937,10 @@ def run_gamepad_bridge(pad_index=0, poll_hz=250, name="Microsoft X-Box 360 pad",
     a real system-wide /dev/input device (one-time root setup; it falls back to
     the /tmp stream and prints instructions if /dev/uinput is not accessible).
     com2tty itself never needs administrator at runtime.
+
+    Returns the exit reason ("interrupt", "stop", "wsl-exited", or
+    "shutdown"), which run_with_respawn uses to decide whether to rebuild
+    the bridge.
     """
     from .xinput import GamepadSource
 
@@ -1019,10 +1039,16 @@ def run_gamepad_bridge(pad_index=0, poll_hz=250, name="Microsoft X-Box 360 pad",
     heartbeat = 0.5  # seconds; keep the pipe warm even when idle
     last_send = 0.0
 
+    exit_reason = "shutdown"
     try:
         while not shutdown_event.is_set():
+            if stop_event is not None and stop_event.is_set():
+                logging.info("Stop requested; shutting down gamepad bridge.")
+                exit_reason = "stop"
+                break
             if proc.poll() is not None:
                 logging.info("WSL gamepad subprocess exited.")
+                exit_reason = "wsl-exited"
                 break
 
             changed, frame = src.poll()
@@ -1034,11 +1060,13 @@ def run_gamepad_bridge(pad_index=0, poll_hz=250, name="Microsoft X-Box 360 pad",
                     last_send = now
                 except (BrokenPipeError, OSError):
                     logging.info("WSL pipe closed.")
+                    exit_reason = "wsl-exited"
                     break
 
             time.sleep(interval)
     except KeyboardInterrupt:
         logging.info("Stopping gamepad bridge due to KeyboardInterrupt...")
+        exit_reason = "interrupt"
     finally:
         shutdown_event.set()
         logging.info("Cleaning up gamepad bridge...")
@@ -1051,6 +1079,54 @@ def run_gamepad_bridge(pad_index=0, poll_hz=250, name="Microsoft X-Box 360 pad",
                 logging.warning("WSL process did not exit. Killing it.")
                 proc.kill()
         logging.info("Gamepad bridge stopped successfully.")
+    return exit_reason
+
+
+def run_multi_gamepad_bridge(pad_indices, poll_hz=250,
+                             name="Microsoft X-Box 360 pad",
+                             use_uinput=False, tmp_path="/tmp/com2pad0",
+                             distro=None, auto_respawn=False):
+    """Forward several XInput controller slots concurrently.
+
+    Each slot gets its own WSL helper and its own endpoint: the FIFO path is
+    derived from ``tmp_path`` by incrementing its trailing number
+    (/tmp/com2pad0, /tmp/com2pad1, ...). In the uinput tier each helper
+    creates its own /dev/input device, exactly like plugging in several
+    physical controllers.
+    """
+    stop_event = threading.Event()
+    threads = []
+
+    def _runner(position, pad_index):
+        try:
+            kwargs = dict(pad_index=pad_index, poll_hz=poll_hz, name=name,
+                          use_uinput=use_uinput,
+                          tmp_path=_derive_indexed_path(tmp_path, position),
+                          distro=distro)
+            if auto_respawn:
+                run_with_respawn(run_gamepad_bridge, stop_event=stop_event,
+                                 **kwargs)
+            else:
+                run_gamepad_bridge(stop_event=stop_event, **kwargs)
+        except Exception as e:
+            logging.error(f"Gamepad bridge for slot {pad_index} failed: {e}")
+
+    for position, pad_index in enumerate(pad_indices):
+        t = threading.Thread(target=_runner, args=(position, pad_index),
+                             daemon=True)
+        t.start()
+        threads.append(t)
+
+    try:
+        while any(t.is_alive() for t in threads):
+            time.sleep(0.5)
+        logging.info("All gamepad bridges have stopped.")
+    except KeyboardInterrupt:
+        logging.info("Stopping all gamepad bridges...")
+    finally:
+        stop_event.set()
+        for t in threads:
+            t.join(timeout=5.0)
 
 
 def _derive_indexed_path(base, index):
@@ -1068,9 +1144,38 @@ def _derive_indexed_path(base, index):
     return f"{base}{index}"
 
 
+def run_with_respawn(target, stop_event=None, respawn_delay=2.0, **kwargs):
+    """Run a bridge entry function and rebuild the bridge when WSL dies.
+
+    ``wsl --shutdown``, a WSL servicing update, or a crashed helper normally
+    ends the session; with --auto-respawn the host waits until WSL answers
+    again and then re-runs ``target`` (run_bridge or run_gamepad_bridge) with
+    the same arguments, so the WSL endpoint reappears at the same path. A
+    Ctrl+C or a stop request ends the loop like a normal session.
+    """
+    while True:
+        reason = target(stop_event=stop_event, **kwargs)
+        if reason in ("interrupt", "stop"):
+            return reason
+        if stop_event is not None and stop_event.is_set():
+            return "stop"
+        logging.warning(f"Bridge session ended ({reason}); waiting for WSL "
+                        "before respawning (--auto-respawn)...")
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                return "stop"
+            try:
+                check_wsl_environment(None, kwargs.get("distro"))
+                break
+            except RuntimeError as exc:
+                logging.info(f"WSL is not ready yet: {exc}")
+                time.sleep(respawn_delay)
+        logging.info("WSL is available again; respawning the bridge.")
+
+
 def run_multi_bridge(ports, baud, wsl_tty, bytesize, parity, stopbits,
                      xonxoff, rtscts, dsrdtr, rfc2217_port, distro=None,
-                     board="auto", wait=False):
+                     board="auto", wait=False, auto_respawn=False):
     """Bridge several COM ports concurrently from a single invocation.
 
     Each port gets its own WSL helper, a distinct symlink path (derived from
@@ -1085,14 +1190,18 @@ def run_multi_bridge(ports, baud, wsl_tty, bytesize, parity, stopbits,
 
     def _runner(index, port_name):
         try:
-            run_bridge(
+            kwargs = dict(
                 port=port_name, baud=baud,
                 wsl_tty=_derive_indexed_path(wsl_tty, index),
                 bytesize=bytesize, parity=parity, stopbits=stopbits,
                 xonxoff=xonxoff, rtscts=rtscts, dsrdtr=dsrdtr,
                 rfc2217_port=rfc2217_port + 2 * index,
                 distro=distro, board=board, wait=wait,
-                env_setup=(index == 0), stop_event=stop_event)
+                env_setup=(index == 0))
+            if auto_respawn:
+                run_with_respawn(run_bridge, stop_event=stop_event, **kwargs)
+            else:
+                run_bridge(stop_event=stop_event, **kwargs)
         except Exception as e:
             logging.error(f"Bridge for {port_name} failed: {e}")
 
@@ -1134,6 +1243,10 @@ def run_bridge(port, baud, wsl_tty, bytesize, parity, stopbits, xonxoff,
 
     check_wsl_environment(wsl_bridge_path, distro)
 
+    # Event-driven plug/unplug wake-ups for the polling loops below; plain
+    # sleeps remain the fallback when the watcher cannot start.
+    devnotify.start_device_watcher()
+
     if wait and port not in snapshot_ports():
         # --wait: the device may not be plugged in yet; poll for it instead
         # of failing. Board detection below needs the port enumerated anyway.
@@ -1141,8 +1254,8 @@ def run_bridge(port, baud, wsl_tty, bytesize, parity, stopbits, xonxoff,
         while port not in snapshot_ports():
             if stop_event is not None and stop_event.is_set():
                 logging.info(f"Stop requested while waiting for {port}.")
-                return
-            time.sleep(0.5)
+                return "stop"
+            _poll_wait(0.5)
         logging.info(f"Port {port} appeared.")
 
     if str(baud).lower() == "auto":
@@ -1242,18 +1355,22 @@ def run_bridge(port, baud, wsl_tty, bytesize, parity, stopbits, xonxoff,
 
     logging.info("Bridge is fully active. Press Ctrl+C to stop.")
 
+    exit_reason = "shutdown"
     try:
         while not shutdown_event.is_set():
             if stop_event is not None and stop_event.is_set():
                 logging.info(f"Stop requested; shutting down bridge for {port}.")
+                exit_reason = "stop"
                 break
             # Wait and check if the WSL process is still running
             if proc.poll() is not None:
                 logging.info("WSL subprocess exited unexpectedly.")
+                exit_reason = "wsl-exited"
                 break
             time.sleep(0.5)
     except KeyboardInterrupt:
         logging.info("Stopping bridge due to KeyboardInterrupt...")
+        exit_reason = "interrupt"
     finally:
         shutdown_event.set()
 
@@ -1278,4 +1395,5 @@ def run_bridge(port, baud, wsl_tty, bytesize, parity, stopbits, xonxoff,
                 logging.warning("WSL process did not exit. Killing it.")
                 proc.kill()
         logging.info("Bridge stopped successfully.")
+    return exit_reason
 

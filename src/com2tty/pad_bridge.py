@@ -12,6 +12,9 @@ the user opts in and grants access:
 * **TmpStreamGamepad (default, no root):** writes the evdev event stream to a
   FIFO under ``/tmp`` (e.g. ``/tmp/com2pad0``). Identical bytes to what a real
   ``/dev/input/eventN`` would emit, so a single reader works against both.
+  A second FIFO at ``<path>.ff`` accepts 6-byte rumble frames (see
+  ``pack_rumble``) from the consumer, giving this tier the same force
+  feedback the uinput tier gets from the kernel.
 * **UinputGamepad (``--uinput``, one-time root):** creates a real, system-wide
   ``/dev/input/event*`` device via ``/dev/uinput`` so SDL2 games and emulators
   see a normally-inserted controller. Falls back to the ``/tmp`` stream if
@@ -208,6 +211,42 @@ def pack_rumble(strong, weak):
     motor magnitudes, 0-65535 each."""
     return struct.pack(RUMBLE_FORMAT, RUMBLE_MAGIC0, RUMBLE_MAGIC1,
                        strong & 0xFFFF, weak & 0xFFFF)
+
+
+class RumbleFrameReader:
+    """Resynchronising parser for the 6-byte rumble frames.
+
+    Consumers of the /tmp stream tier write these frames into the ``.ff``
+    FIFO to drive the physical controller's motors. This mirrors
+    ``xinput.RumbleReader`` on the Windows side; it is duplicated here
+    because this helper runs standalone inside WSL and must not import
+    other com2tty modules.
+    """
+
+    def __init__(self):
+        self._buf = bytearray()
+
+    def feed(self, data):
+        """Add raw bytes, yield every complete (strong, weak) rumble pair."""
+        self._buf.extend(data)
+        frames = []
+        while True:
+            start = self._buf.find(RUMBLE_MAGIC0)
+            if start == -1:
+                self._buf.clear()
+                break
+            if start > 0:
+                del self._buf[:start]
+            if len(self._buf) < RUMBLE_SIZE:
+                break
+            if self._buf[1] != RUMBLE_MAGIC1:
+                del self._buf[0]
+                continue
+            _, _, strong, weak = struct.unpack(
+                RUMBLE_FORMAT, bytes(self._buf[:RUMBLE_SIZE]))
+            del self._buf[:RUMBLE_SIZE]
+            frames.append((strong, weak))
+        return frames
 
 
 def _clamp(value, lo, hi):
@@ -425,25 +464,38 @@ class TmpStreamGamepad(GamepadSink):
     O_RDWR so the bridge always holds a reader end (writes never raise on a
     missing consumer); when no real consumer is draining and the pipe buffer
     fills, writes are dropped (only the latest controller state matters).
+
+    Force feedback: alongside the event FIFO a second FIFO is created at
+    ``<path>.ff``. A consumer writes 6-byte rumble frames (see
+    ``pack_rumble``) into it to drive the physical controller's motors --
+    the same reverse channel the uinput tier gets from the kernel.
     """
 
     def __init__(self, path=DEFAULT_TMP_PAD,
                  name="Microsoft X-Box 360 pad", **_ignored):
         self.path = path
+        self.ff_path = path + ".ff"
         self.name = name
         self.fd = None
+        self.ff_fd = None
+        self._ff_reader = RumbleFrameReader()
+
+    @staticmethod
+    def _open_fifo(path):
+        # Replace a stale non-FIFO file if one is in the way.
+        if os.path.lexists(path):
+            try:
+                if not stat.S_ISFIFO(os.stat(path).st_mode):
+                    os.unlink(path)
+            except OSError:
+                os.unlink(path)
+        if not os.path.exists(path):
+            os.mkfifo(path, 0o666)
+        return os.open(path, os.O_RDWR | os.O_NONBLOCK)
 
     def open(self):
-        # Replace a stale non-FIFO file if one is in the way.
-        if os.path.lexists(self.path):
-            try:
-                if not stat.S_ISFIFO(os.stat(self.path).st_mode):
-                    os.unlink(self.path)
-            except OSError:
-                os.unlink(self.path)
-        if not os.path.exists(self.path):
-            os.mkfifo(self.path, 0o666)
-        self.fd = os.open(self.path, os.O_RDWR | os.O_NONBLOCK)
+        self.fd = self._open_fifo(self.path)
+        self.ff_fd = self._open_fifo(self.ff_path)
 
     def _write(self, blob):
         try:
@@ -453,18 +505,38 @@ class TmpStreamGamepad(GamepadSink):
         except OSError:
             pass
 
+    def ff_fileno(self):
+        return self.ff_fd
+
+    def handle_ff_io(self):
+        """Read rumble frames a consumer wrote into the ``.ff`` FIFO.
+
+        Returns the most recent complete (strong, weak) pair, or None.
+        """
+        try:
+            data = os.read(self.ff_fd, 4096)
+        except (BlockingIOError, OSError):
+            return None
+        if not data:
+            return None
+        frames = self._ff_reader.feed(data)
+        return frames[-1] if frames else None
+
     def close(self):
-        if self.fd is not None:
+        for attr in ("fd", "ff_fd"):
+            fd = getattr(self, attr)
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        for path in (self.path, self.ff_path):
             try:
-                os.close(self.fd)
+                if os.path.lexists(path):
+                    os.unlink(path)
             except Exception:
                 pass
-            self.fd = None
-        try:
-            if os.path.lexists(self.path):
-                os.unlink(self.path)
-        except Exception:
-            pass
 
 
 class UinputGamepad(GamepadSink):
@@ -611,8 +683,8 @@ def _open_sink(use_uinput, tmp_path, name):
 
     sink = TmpStreamGamepad(path=tmp_path, name=name)
     sink.open()
-    return sink, ("[CONTROL] PAD_READY: evdev stream at %s (no root). "
-                  "Bridge active." % tmp_path)
+    return sink, ("[CONTROL] PAD_READY: evdev stream at %s (no root, "
+                  "rumble at %s.ff). Bridge active." % (tmp_path, tmp_path))
 
 
 def main(argv=None):  # pragma: no cover - integration entry point
