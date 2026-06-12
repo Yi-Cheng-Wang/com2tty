@@ -66,7 +66,16 @@ def format_port_table(rows):
     return lines
 
 
-def print_port_list():
-    """Print the discovered ports; the implementation behind ``--list``."""
-    for line in format_port_table(collect_ports()):
+def print_port_list(as_json=False):
+    """Print the discovered ports; the implementation behind ``--list``.
+
+    With ``as_json`` the same rows are emitted as a JSON array for scripts
+    and IDE integrations (``com2tty --list --json``).
+    """
+    rows = collect_ports()
+    if as_json:
+        import json
+        print(json.dumps(rows, indent=2))
+        return
+    for line in format_port_table(rows):
         print(line)

@@ -33,6 +33,26 @@ def main():
     )
 
     parser.add_argument(
+        "--json",
+        action="store_true",
+        help="With --list: print the port list as JSON instead of a table."
+    )
+
+    parser.add_argument(
+        "--doctor",
+        action="store_true",
+        help="Run an environment self-check (WSL, python3, ports, leftovers) "
+             "and exit."
+    )
+
+    parser.add_argument(
+        "--wait",
+        action="store_true",
+        help="Serial mode: if the COM port is not present yet, wait for it "
+             "to appear instead of failing."
+    )
+
+    parser.add_argument(
         "--gamepad",
         action="store_true",
         help="Gamepad mode: forward a Windows XInput controller into WSL as a "
@@ -176,10 +196,19 @@ def main():
         stream=sys.stderr
     )
 
+    if parsed_args.doctor:
+        from com2tty.doctor import run_doctor
+        sys.exit(run_doctor(distro=parsed_args.distro,
+                            rfc2217_port=parsed_args.rfc2217_port))
+
     if parsed_args.list_ports:
         from com2tty.discovery import print_port_list
-        print_port_list()
+        print_port_list(as_json=parsed_args.json)
         return
+
+    if parsed_args.gamepad and parsed_args.port:
+        parser.error("--gamepad does not take a COM port; remove the "
+                     "positional argument (it would be silently ignored)")
 
     if parsed_args.gamepad:
         try:
@@ -220,7 +249,8 @@ def main():
                 dsrdtr=parsed_args.dsrdtr,
                 rfc2217_port=parsed_args.rfc2217_port,
                 distro=parsed_args.distro,
-                board=parsed_args.board
+                board=parsed_args.board,
+                wait=parsed_args.wait
             )
         else:
             run_bridge(
@@ -235,7 +265,8 @@ def main():
                 dsrdtr=parsed_args.dsrdtr,
                 rfc2217_port=parsed_args.rfc2217_port,
                 distro=parsed_args.distro,
-                board=parsed_args.board
+                board=parsed_args.board,
+                wait=parsed_args.wait
             )
     except KeyboardInterrupt:
         logging.info("Interrupted by user. Exiting.")

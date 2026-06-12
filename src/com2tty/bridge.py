@@ -3,6 +3,7 @@ import os
 import select
 import argparse
 import signal
+import time
 import traceback
 import termios
 import threading
@@ -55,6 +56,71 @@ if __name__ == '__main__':
 
 intercepted_picotools = []
 
+# ---------------------------------------------------------------------------
+# Session liveness markers.
+#
+# Several resources a bridge session creates (the TCP listeners, the rc-file
+# environment block, the picotool interception) used to be reclaimed blindly
+# on the next startup, which destroyed them for a *concurrently running*
+# session as well. Liveness is tracked two ways: a per-port heartbeat file
+# under /tmp refreshed by the main loop (so a SIGKILLed session goes stale
+# within ALIVE_TTL), and the owning PID recorded in shared artifacts, checked
+# against /proc.
+# ---------------------------------------------------------------------------
+
+ALIVE_TTL = 10.0
+ALIVE_TOUCH_INTERVAL = 2.0
+PICOTOOL_OWNER_FILE = "/tmp/com2tty_picotool.owner"
+
+
+def alive_file_path(port):
+    return "/tmp/com2tty_alive_%d" % int(port)
+
+
+def touch_alive_files(ports):
+    """Refresh the heartbeat files that mark this session's ports as live."""
+    for port in ports:
+        try:
+            with open(alive_file_path(port), "w") as f:
+                f.write(str(os.getpid()))
+        except Exception:
+            pass
+
+
+def remove_alive_files(ports):
+    for port in ports:
+        try:
+            os.remove(alive_file_path(port))
+        except OSError:
+            pass
+
+
+def is_port_session_alive(port, ttl=ALIVE_TTL):
+    """True when a live com2tty session is heartbeating this port."""
+    try:
+        mtime = os.stat(alive_file_path(port)).st_mtime
+    except OSError:
+        return False
+    return (time.time() - mtime) < ttl
+
+
+def pid_alive(pid):
+    """True when the given PID is a running process in this distro."""
+    try:
+        return os.path.isdir("/proc/%d" % int(pid))
+    except (TypeError, ValueError):
+        return False
+
+
+def read_pid_file(path):
+    """Read an integer PID from a marker file, or None."""
+    try:
+        with open(path, "r") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
 def setup_picotool_interceptor(uf2_port):
     wrapper_path = "/tmp/com2tty_picotool.py"
     try:
@@ -81,6 +147,14 @@ def setup_picotool_interceptor(uf2_port):
             sys.stderr.write(f"Intercepted picotool at {picotool_path}\n")
         except Exception as e:
             sys.stderr.write(f"Warning: Failed to intercept {picotool_path}: {e}\n")
+    if intercepted_picotools:
+        # Record ownership so a later session's orphan recovery does not
+        # restore the binaries out from under this still-running one.
+        try:
+            with open(PICOTOOL_OWNER_FILE, "w") as f:
+                f.write(str(os.getpid()))
+        except Exception:
+            pass
 
 def cleanup_picotool_interceptor():
     for picotool_path, real_path in intercepted_picotools:
@@ -92,6 +166,11 @@ def cleanup_picotool_interceptor():
             sys.stderr.write(f"Restored picotool at {picotool_path}\n")
         except Exception as e:
             sys.stderr.write(f"Warning: Failed to restore {picotool_path}: {e}\n")
+    if intercepted_picotools:
+        try:
+            os.remove(PICOTOOL_OWNER_FILE)
+        except OSError:
+            pass
 
 def restore_orphaned_picotools():
     """Restore picotool binaries left intercepted by a previous, crashed session.
@@ -103,6 +182,19 @@ def restore_orphaned_picotools():
     PlatformIO uploads silently break. This runs on startup and reverses any such
     orphaned swap so the tool self-heals on the next launch.
     """
+    owner = read_pid_file(PICOTOOL_OWNER_FILE)
+    if owner is not None:
+        if owner != os.getpid() and pid_alive(owner):
+            # Another live session owns the interception; leave it intact.
+            sys.stderr.write(
+                f"Note: picotool is intercepted by a live com2tty session "
+                f"(PID {owner}); leaving it in place.\n")
+            sys.stderr.flush()
+            return
+        try:
+            os.remove(PICOTOOL_OWNER_FILE)
+        except OSError:
+            pass
     home = os.path.expanduser("~")
     search_pattern = os.path.join(home, ".platformio", "packages", "tool-picotool*", "picotool.real")
     for real_path in glob.glob(search_pattern):
@@ -129,8 +221,48 @@ def md5_hexdigest(data):
     except TypeError:  # Python < 3.9 has no usedforsecurity flag
         return hashlib.md5(data).hexdigest()
 
-MARKER_START = "# === COM2TTY INJECTION START ==="
-MARKER_END   = "# === COM2TTY INJECTION END ==="
+# Marker lines delimiting the injected environment block. Blocks are tagged
+# with the owning session's PID so that two concurrently running sessions do
+# not remove each other's block (legacy untagged blocks are always reclaimed).
+MARKER_START_PREFIX = "# === COM2TTY INJECTION START"
+MARKER_END_PREFIX = "# === COM2TTY INJECTION END"
+
+
+def marker_start(pid=None):
+    pid = os.getpid() if pid is None else pid
+    return f"{MARKER_START_PREFIX} [pid={pid}] ==="
+
+
+def marker_end():
+    return f"{MARKER_END_PREFIX} ==="
+
+
+def _marker_pid(line):
+    """Extract the session PID from a start-marker line, or None (legacy)."""
+    start = line.find("[pid=")
+    if start == -1:
+        return None
+    end = line.find("]", start)
+    if end == -1:
+        return None
+    try:
+        return int(line[start + len("[pid="):end])
+    except ValueError:
+        return None
+
+
+def _block_is_removable(line, own_pid):
+    """Decide whether the block starting at this marker line may be removed.
+
+    With ``own_pid`` None every block is removed (full cleanup). Otherwise a
+    block is removed when it is legacy/untagged, owned by this session, or
+    owned by a session that is no longer running.
+    """
+    if own_pid is None:
+        return True
+    pid = _marker_pid(line)
+    return pid is None or pid == own_pid or not pid_alive(pid)
+
 
 def get_rc_files():
     home = os.path.expanduser("~")
@@ -156,10 +288,21 @@ def get_fish_conf_path():
     return None
 
 
-def clean_fish_conf():
+def clean_fish_conf(own_pid=None):
     path = get_fish_conf_path()
     if not path or not os.path.exists(path):
         return
+    if own_pid is not None:
+        # The fish snippet records its owning session; do not delete a live
+        # other session's snippet.
+        owner = None
+        try:
+            with open(path, "r") as f:
+                owner = _marker_pid(f.readline())
+        except OSError:
+            pass
+        if owner is not None and owner != own_pid and pid_alive(owner):
+            return
     try:
         os.remove(path)
         sys.stderr.write(f"Removed {path}\n")
@@ -177,7 +320,8 @@ def inject_fish_conf(port, monitor_path="/tmp/ttyUSB0"):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as f:
             f.write(
-                "# Written by com2tty; removed automatically when it exits.\n"
+                f"# Written by com2tty [pid={os.getpid()}]; removed "
+                "automatically when it exits.\n"
                 f"set -gx PLATFORMIO_UPLOAD_PORT rfc2217://127.0.0.1:{port}\n"
                 f"set -gx PLATFORMIO_MONITOR_PORT {monitor_path}\n"
             )
@@ -188,8 +332,15 @@ def inject_fish_conf(port, monitor_path="/tmp/ttyUSB0"):
         sys.stderr.flush()
 
 
-def clean_rc():
-    clean_fish_conf()
+def clean_rc(own_pid=None):
+    """Remove injected environment blocks from the shell rc files.
+
+    With ``own_pid`` set, only this session's block, legacy untagged blocks,
+    and blocks left behind by dead sessions are removed; a block owned by a
+    different live session is preserved (two independent com2tty sessions
+    previously destroyed each other's configuration here).
+    """
+    clean_fish_conf(own_pid)
     for rc_path in get_rc_files():
         if not os.path.exists(rc_path):
             continue
@@ -198,17 +349,24 @@ def clean_rc():
                 lines = f.readlines()
             new_lines = []
             in_block = False
+            keep_block = False
             for line in lines:
-                if MARKER_START in line:
-                    idx = line.find(MARKER_START)
-                    if idx > 0 and line[:idx].strip():
-                        new_lines.append(line[:idx] + "\n")
+                if MARKER_START_PREFIX in line and not in_block:
+                    idx = line.find(MARKER_START_PREFIX)
                     in_block = True
+                    keep_block = not _block_is_removable(line, own_pid)
+                    if keep_block:
+                        new_lines.append(line)
+                    elif idx > 0 and line[:idx].strip():
+                        new_lines.append(line[:idx] + "\n")
                     continue
-                if MARKER_END in line:
+                if MARKER_END_PREFIX in line and in_block:
                     in_block = False
+                    if keep_block:
+                        new_lines.append(line)
+                    keep_block = False
                     continue
-                if not in_block:
+                if not in_block or keep_block:
                     new_lines.append(line)
             with open(rc_path, "w") as f:
                 f.writelines(new_lines)
@@ -219,13 +377,13 @@ def clean_rc():
             sys.stderr.flush()
 
 def inject_rc(port, monitor_path="/tmp/ttyUSB0"):
-    clean_rc()
+    clean_rc(own_pid=os.getpid())
     inject_fish_conf(port, monitor_path)
     block = (
-        f"{MARKER_START}\n"
+        f"{marker_start()}\n"
         f"export PLATFORMIO_UPLOAD_PORT=rfc2217://127.0.0.1:{port}\n"
         f"export PLATFORMIO_MONITOR_PORT={monitor_path}\n"
-        f"{MARKER_END}\n"
+        f"{marker_end()}\n"
     )
     for rc_path in get_rc_files():
         try:
@@ -247,7 +405,9 @@ def get_pty_settings(fd):
     try:
         attrs = termios.tcgetattr(fd)
         speed = attrs[5]
-        baud = baud_map.get(speed)
+        # B0 is the termios hangup pseudo-rate; report it as "no baud" so the
+        # host never tries to apply a 0 baudrate to the Windows port.
+        baud = baud_map.get(speed) or None
         cflag = attrs[2]
         cs_mask = termios.CS5 | termios.CS6 | termios.CS7 | termios.CS8
         cs_val = cflag & cs_mask
@@ -278,9 +438,19 @@ def kill_leftover_listener(port):
     Only processes whose command line references this bridge are killed, so an
     unrelated service that happens to use the same port is never terminated.
     (The previous implementation ran ``fuser -k`` which killed any owner.)
+
+    A port whose heartbeat file is fresh belongs to a *live* com2tty session
+    (most likely a second invocation that forgot --rfc2217-port); killing that
+    would tear down the user's other bridge, so it is left alone and the bind
+    below fails with an actionable message instead.
     """
     import subprocess as sp
-    import time
+    if is_port_session_alive(port):
+        sys.stderr.write(
+            f"Note: port {port} is held by another live com2tty session; "
+            f"not killing it. Choose a different --rfc2217-port.\n")
+        sys.stderr.flush()
+        return
     try:
         res = sp.run(["fuser", f"{port}/tcp"], capture_output=True, timeout=3)
     except FileNotFoundError:
@@ -319,7 +489,21 @@ def kill_leftover_listener(port):
     if killed:
         time.sleep(0.3)
 
-def run_rfc2217_server_thread(port, rfc2217_active):
+def _wait_until_clear(event, timeout=30.0):
+    """Block until ``event`` clears (or the timeout lapses).
+
+    Used to serialise stdin/stdout ownership between the RFC 2217 forwarder
+    and the UF2 relay: both read fd 0, and starting one session while the
+    other is active would interleave their reads.
+    """
+    if event is None:
+        return
+    deadline = time.time() + timeout
+    while event.is_set() and time.time() < deadline:
+        time.sleep(0.05)
+
+
+def run_rfc2217_server_thread(port, rfc2217_active, uf2_active=None):
     """
     Long-lived TCP forwarder that runs as a thread inside the main bridge process.
     Accepts esptool connections and relays data through stdin/stdout (shared with
@@ -354,11 +538,14 @@ def run_rfc2217_server_thread(port, rfc2217_active):
 
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
+            # Never start an RFC 2217 session while a UF2 transfer owns the
+            # stdio pipes; both would read stdin and corrupt each other.
+            _wait_until_clear(uf2_active)
+
             # Signal connection to Windows side and pause PTY bridge
             sys.stderr.write("[CONTROL] RFC2217_CONNECT\n")
             sys.stderr.flush()
             rfc2217_active.set()
-            import time
             time.sleep(0.3)  # Wait for main loop to yield stdin/stdout
 
             conn.setblocking(False)
@@ -394,13 +581,11 @@ def run_rfc2217_server_thread(port, rfc2217_active):
     finally:
         s.close()
 
-def run_uf2_relay_thread(port, uf2_active):
+def run_uf2_relay_thread(port, uf2_active, rfc2217_active=None):
     """
     TCP server inside WSL that receives UF2 data from the picotool wrapper
     and relays it to the Windows host through stdout pipe with control messages.
     """
-    import time
-
     kill_leftover_listener(port)
 
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -442,6 +627,10 @@ def run_uf2_relay_thread(port, uf2_active):
                 conn.close()
 
             md5_hash = md5_hexdigest(uf2_data)
+
+            # Never start the upload while an RFC 2217 session owns stdin;
+            # the ACK wait below would steal bytes from that session.
+            _wait_until_clear(rfc2217_active)
 
             sys.stderr.write(f"[CONTROL] UF2_UPLOAD_START:{len(uf2_data)}:{md5_hash}\n")
             sys.stderr.flush()
@@ -511,6 +700,7 @@ def main():
 
     target_path = args.symlink
     created_symlink = None
+    alive_ports = []
 
     # We must keep both master and slave descriptors open.
     # Keeping slave_fd open prevents EIO errors on the master side when
@@ -566,32 +756,40 @@ def main():
         # Start RFC 2217 server thread if port is specified
         if args.rfc2217_port:
             uf2_port = args.rfc2217_port + 1
+            alive_ports = [args.rfc2217_port, uf2_port]
+            touch_alive_files(alive_ports)
             if env_setup:
                 setup_picotool_interceptor(uf2_port)
             t_rfc2217 = threading.Thread(
                 target=run_rfc2217_server_thread,
-                args=(args.rfc2217_port, rfc2217_active),
+                args=(args.rfc2217_port, rfc2217_active, uf2_active),
                 daemon=True
             )
             t_rfc2217.start()
             t_uf2_relay = threading.Thread(
                 target=run_uf2_relay_thread,
-                args=(uf2_port, uf2_active),
+                args=(uf2_port, uf2_active, rfc2217_active),
                 daemon=True
             )
             t_uf2_relay.start()
-            
+
         # Select loop
         # 0 is stdin, master_fd is the pseudo-terminal master
         sys.stderr.write("WSL bridge enter main loop.\n")
         sys.stderr.flush()
-        
+
         last_settings = None
-        
+        last_alive_touch = time.time()
+
         while True:
+            # Heartbeat: keep the per-port liveness markers fresh so another
+            # session can tell this one apart from a crashed leftover.
+            if alive_ports and time.time() - last_alive_touch >= ALIVE_TOUCH_INTERVAL:
+                touch_alive_files(alive_ports)
+                last_alive_touch = time.time()
+
             # Yield stdin/stdout to RFC 2217 forwarder or UF2 relay when active
             if rfc2217_active.is_set() or uf2_active.is_set():
-                import time
                 time.sleep(0.1)
                 continue
 
@@ -645,8 +843,9 @@ def main():
     finally:
         # Clean up symlink and file descriptors
         if env_setup:
-            clean_rc()
+            clean_rc(own_pid=os.getpid())
             cleanup_picotool_interceptor()
+        remove_alive_files(alive_ports)
         if created_symlink:
             cleanup_symlink(created_symlink)
         if slave_fd is not None:
