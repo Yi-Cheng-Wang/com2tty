@@ -4,6 +4,60 @@ All notable changes to com2tty are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-06-13
+
+### Added
+
+- Startup same-port conflict guard: before any shared-state side effects, a
+  serial session probes its RFC 2217 and UF2 relay ports and refuses to start
+  if either is already bound, rather than starting with a broken forwarder and
+  cross-wiring its uploads to another session's board.
+- tty symlink anti-hijack: the WSL helper refuses to replace a tty path that is
+  a symlink to another live session's pseudo-terminal slave, so the shared
+  default `/tmp/ttyUSB0` cannot be silently stolen; stale or dangling links are
+  still replaced.
+
+### Changed
+
+- Intercepted `picotool` now forwards non-flashing subcommands (`info`,
+  `reboot`, `help`, and any invocation that carries no `.uf2`/`.elf` image) to
+  the real binary instead of exiting silently, so diagnostic uses keep working
+  while the interception is active.
+- Passing a COM port together with `--list` is now an argument error instead of
+  being silently ignored.
+- Argument profiles accept a `@@` literal escape: `@@value` is passed through as
+  the literal `@value` and is never treated as a profile reference.
+
+### Fixed
+
+- Closing the console window no longer orphans the WSL helper. The `wsl.exe`
+  child is placed in a kill-on-close Windows Job Object, so it is reaped with
+  the host instead of being left running and holding the relay ports and the
+  injected shell-rc block.
+- Injections (the shell-rc block, the picotool interception, the tty symlink,
+  and the heartbeat files) are now reliably cleaned on exit, including on Ctrl+C
+  and on window close. The helper handles SIGTERM and SIGHUP through its normal
+  shutdown path, and the host closes the helper's stdin and waits for a graceful
+  exit before escalating to terminate and kill.
+- Session-liveness detection is now PID-verified: a port is reported as held
+  only when its heartbeat is fresh and owned by a live com2tty process other
+  than the caller, which removes a spurious "port held by another live session"
+  warning a single session could raise against its own marker, and prevents a
+  recycled PID from being mistaken for a live session.
+
+### Security
+
+- The XInput DLL is loaded by its absolute path under `System32` rather than by
+  bare name, closing a DLL-hijacking path through the working directory.
+- The gamepad event FIFO and its force-feedback companion are created with
+  owner-only permissions instead of world-writable, preventing other local
+  users from reading the input stream or injecting events.
+- The shell startup files are rewritten atomically (temporary file plus rename),
+  so an interrupted cleanup cannot leave `~/.bashrc` or `~/.zshrc` truncated.
+- The AutoPlay recovery marker is stored under the user's LocalAppData instead
+  of the shared system temporary directory, removing a temporary-file hijacking
+  surface.
+
 ## [0.3.0] - 2026-06-13
 
 ### Added
