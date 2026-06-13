@@ -23,8 +23,12 @@ _AUTOPLAY_VALUE_NAME = "DisableAutoplay"
 
 
 def _autoplay_marker_path():
-    import tempfile
-    return os.path.join(tempfile.gettempdir(), AUTOPLAY_MARKER_FILENAME)
+    # Keep the recovery marker in the user's private LocalAppData rather than
+    # the world-writable system temp dir: the static filename there is open to
+    # file-squatting and symlink/junction attacks that could block execution
+    # or feed attacker-controlled values back into the registry restore.
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    return os.path.join(base, AUTOPLAY_MARKER_FILENAME)
 
 
 def _restore_autoplay_state(existed, original_value):

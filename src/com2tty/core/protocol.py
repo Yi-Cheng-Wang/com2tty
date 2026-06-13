@@ -61,8 +61,8 @@ UF2_ACK_LINE = b"[CONTROL] UF2_ACK\n"
 def format_line(name, payload=None):
     """Render one control line (without trailing newline)."""
     if payload is None:
-        return "%s %s" % (CONTROL_PREFIX, name)
-    return "%s %s:%s" % (CONTROL_PREFIX, name, payload)
+        return f"{CONTROL_PREFIX} {name}"
+    return f"{CONTROL_PREFIX} {name}:{payload}"
 
 
 def emit(stream, name, payload=None):
@@ -114,10 +114,14 @@ class ControlDispatcher:
             # a hypothetical UF2_UPLOAD registration.
             for name in sorted(self._handlers, key=len, reverse=True):
                 if body.startswith(name):
-                    payload = None
                     rest = body[len(name):]
-                    if rest.startswith(":"):
-                        payload = rest[1:]
+                    # Require an exact name match or a ``:`` payload separator
+                    # so e.g. a hypothetical ``SETTINGS_RESET`` line is not
+                    # misrouted to the ``SETTINGS`` handler; a non-separator
+                    # remainder falls through to the next (shorter) candidate.
+                    if rest != "" and not rest.startswith(":"):
+                        continue
+                    payload = rest[1:] if rest.startswith(":") else None
                     return self._handlers[name](
                         ControlMessage(name, payload, line_str))
         if self._fallback is not None:

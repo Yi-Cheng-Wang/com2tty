@@ -4,12 +4,124 @@ The entire bridge transport is the stdin/stdout/stderr of one ``wsl --exec``
 child process; this module owns how that child is built (argument quoting,
 path translation, environment verification) and how it is torn down.
 """
+import ctypes
 import logging
 import os
 import shutil
 import subprocess
 
 from ..core.constants import CREATE_NO_WINDOW
+
+# -- Windows Job Object: tie the WSL child's life to this host process --------
+#
+# Closing the console window (the X button / taskkill) terminates the Python
+# host *without* running its Ctrl+C cleanup, which would otherwise orphan
+# wsl.exe -- and with it the WSL bridge.py. The orphan keeps holding the
+# RFC2217/UF2 ports and the injected shell-rc block forever. Putting wsl.exe in
+# a Job Object flagged KILL_ON_JOB_CLOSE makes the OS terminate it the moment
+# this process exits for any reason, which closes the helper's stdin and lets
+# its normal EOF cleanup run (exactly like a Ctrl+C teardown).
+
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+_JobObjectExtendedLimitInformation = 9
+_PROCESS_TERMINATE = 0x0001
+_PROCESS_SET_QUOTA = 0x0100
+
+
+class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_int64),
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", ctypes.c_uint32),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", ctypes.c_uint32),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", ctypes.c_uint32),
+        ("SchedulingClass", ctypes.c_uint32),
+    ]
+
+
+class _IO_COUNTERS(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_uint64) for name in (
+        "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+        "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+
+class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+        ("IoInfo", _IO_COUNTERS),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+def _assign_kill_on_close_job(pid, kernel32=None):
+    """Put process ``pid`` in a kill-on-close Job Object; return its handle.
+
+    The handle must be kept alive for the host's lifetime -- it is the OS
+    closing this handle (on host exit) that triggers the child's termination.
+    Returns None if the job could not be set up, so the caller degrades to the
+    previous (orphan-on-close) behaviour rather than failing to spawn.
+    """
+    if not isinstance(pid, int):
+        return None
+    if kernel32 is None:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+    kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+    kernel32.SetInformationJobObject.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.SetInformationJobObject.restype = ctypes.c_int
+    kernel32.OpenProcess.argtypes = [
+        ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.AssignProcessToJobObject.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p]
+    kernel32.AssignProcessToJobObject.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        return None
+    info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+    info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    if not kernel32.SetInformationJobObject(
+            job, _JobObjectExtendedLimitInformation,
+            ctypes.byref(info), ctypes.sizeof(info)):
+        kernel32.CloseHandle(job)
+        return None
+    h_proc = kernel32.OpenProcess(
+        _PROCESS_TERMINATE | _PROCESS_SET_QUOTA, False, pid)
+    if not h_proc:
+        kernel32.CloseHandle(job)
+        return None
+    try:
+        if not kernel32.AssignProcessToJobObject(job, h_proc):
+            kernel32.CloseHandle(job)
+            return None
+    finally:
+        kernel32.CloseHandle(h_proc)
+    return job
+
+
+def _arm_kill_on_close(proc):
+    """Tie the WSL child's lifetime to this host process (Windows only)."""
+    if os.name != "nt":
+        return
+    try:
+        job = _assign_kill_on_close_job(proc.pid)
+    except Exception as e:  # never let job setup break bridge startup
+        logging.debug(f"Could not arm kill-on-close for WSL helper: {e}")
+        return
+    if job is not None:
+        # Stash the handle on the Popen so it lives as long as the host does;
+        # the OS closing it on exit is what reaps the orphaned wsl.exe.
+        proc._com2tty_kill_job = job
 
 
 def wsl_command(distro, *argv):
@@ -109,7 +221,7 @@ def spawn_wsl_helper(cmd):
     the Python CLI.
     """
     logging.info(f"Spawning WSL process: {' '.join(cmd)}")
-    return subprocess.Popen(
+    proc = subprocess.Popen(
         cmd,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -117,15 +229,36 @@ def spawn_wsl_helper(cmd):
         bufsize=0,
         creationflags=CREATE_NO_WINDOW,
     )
+    _arm_kill_on_close(proc)
+    return proc
 
 
 def terminate_wsl_helper(proc, timeout=3.0):
-    """Terminate the helper, escalating to kill if it does not exit."""
-    if proc.poll() is None:
-        logging.info("Terminating WSL process...")
-        proc.terminate()
-        try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            logging.warning("WSL process did not exit. Killing it.")
-            proc.kill()
+    """Shut the helper down, giving it a chance to clean up first.
+
+    Closing the helper's stdin makes the WSL select loop see EOF and run its
+    own teardown (the ~/.bashrc block, picotool interception, tty symlink,
+    heartbeats). We then WAIT for that graceful exit before escalating: a
+    forced ``terminate()`` (TerminateProcess on wsl.exe) would otherwise kill
+    the helper mid-cleanup and leak its injections.
+    """
+    if proc.poll() is not None:
+        return
+    try:
+        if proc.stdin is not None:
+            proc.stdin.close()
+    except Exception as e:
+        logging.debug(f"Could not close WSL helper stdin: {e}")
+    # Give the helper room to finish its own cleanup and exit on the EOF.
+    try:
+        proc.wait(timeout=timeout)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    logging.info("WSL helper did not exit on its own; terminating...")
+    proc.terminate()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        logging.warning("WSL process did not exit. Killing it.")
+        proc.kill()

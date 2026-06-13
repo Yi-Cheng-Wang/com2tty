@@ -100,7 +100,8 @@ The following options apply to both modes.
 --version              Print the com2tty version and exit.
 -l, --list             List the serial ports Windows can see (device name,
                        VID:PID, USB bus id, serial number, detected board,
-                       description) and exit.
+                       description) and exit. Supplying a COM port together
+                       with --list is an argument error.
 --json                 With --list: print the port list as a JSON array
                        instead of an aligned table, for scripts and IDE
                        integrations.
@@ -280,6 +281,10 @@ com2tty @myboard --baud 9600
 com2tty @pad
 ```
 
+A literal argument that must begin with `@` is written with a doubled marker:
+`@@value` is passed through as the literal `@value` and is never interpreted as
+a profile reference.
+
 ### Automatic baud-rate detection
 
 When the baud rate is left at its default value of `auto`, com2tty queries the
@@ -332,9 +337,11 @@ when zsh is in use or that file exists, and to
 `~/.config/fish/conf.d/com2tty.fish` when fish is in use or its configuration
 directory exists. Open a new WSL shell or run `source ~/.bashrc` (or
 `source ~/.zshrc`; fish picks the snippet up automatically) after starting
-com2tty for them to take effect. The variables are removed when com2tty exits;
-if a session is killed before it can clean up, the next run removes the stale
-block on startup.
+com2tty for them to take effect. The variables are removed when com2tty exits,
+including when the console window is closed: the WSL helper is reaped together
+with the host process rather than left running, and it is given the chance to
+run its own cleanup before it is forced down. If a session is nonetheless killed
+before it can clean up, the next run removes the stale block on startup.
 
 Second, com2tty detects the connected board type from its USB vendor identifier
 and performs the appropriate hardware reset on the Windows side. For ESP32-class
@@ -357,10 +364,13 @@ inside WSL. When PlatformIO calls `picotool` to flash a `.uf2` image, a wrapper
 transfers the image back to the Windows host over a relay that listens on
 `127.0.0.1:<rfc2217-port + 1>`. The host then triggers BOOTSEL mode, locates the
 board's mass-storage drive, verifies the transferred image against an MD5
-checksum, and writes the image to the drive. The original `picotool` is restored
-when com2tty exits; if a session is killed before it can restore it, the next run
-detects and reverses the leftover interception on startup, so PlatformIO uploads
-are not left broken.
+checksum, and writes the image to the drive. Subcommands that carry no firmware
+image, such as `picotool info`, `picotool reboot`, and `picotool help`, are
+forwarded to the real binary unchanged, so non-flashing uses of `picotool`
+continue to work while the interception is active. The original `picotool` is
+restored when com2tty exits; if a session is killed before it can restore it, the
+next run detects and reverses the leftover interception on startup, so PlatformIO
+uploads are not left broken.
 
 These mechanisms operate without any additional flags. The startup banner reports
 the detected board type, the RFC 2217 port, the UF2 relay port, and the board's
@@ -376,12 +386,14 @@ non-default `--rfc2217-port` if another local service needs the default port. To
 reclaim a port left open by a previous com2tty session, the helper only
 terminates processes whose command line identifies them as a com2tty bridge; an
 unrelated service occupying the port is never killed. A *running* com2tty
-session is never killed either: each session refreshes a heartbeat marker for
-its ports, so a second invocation that reuses the same `--rfc2217-port` reports
-the conflict and leaves the first bridge intact. Two sessions can run
-concurrently by giving the second one a different `--rfc2217-port` and
-`--wsl-tty`; each session removes only its own block from the shell startup
-files when it exits.
+session is never disturbed: before it touches any shared state, a new session
+checks whether its RFC 2217 and UF2 relay ports are already bound and, if so,
+refuses to start rather than overwrite the first session's shell configuration
+or steal its serial endpoint. As a further guard, the WSL helper refuses to
+replace a tty symlink that already points at another live session's pseudo
+terminal. Two sessions can run concurrently by giving the second one a different
+`--rfc2217-port` and `--wsl-tty`; each session removes only its own block from
+the shell startup files when it exits.
 
 ### Gamepad mode
 
@@ -407,7 +419,10 @@ privileges at run time.
 #### Default tier: the /tmp event stream
 
 The default tier writes the evdev event stream to a FIFO under `/tmp`, by default
-`/tmp/com2pad0`, and requires no privileged setup.
+`/tmp/com2pad0`, and requires no privileged setup. This FIFO and its
+force-feedback companion (described below) are created with owner-only
+permissions, so another local user on the WSL instance cannot read the input
+stream or inject events into it.
 
 ```cmd
 com2tty --gamepad
@@ -674,6 +689,11 @@ leftover listeners automatically using `fuser`, which ships in the `psmisc`
 package; on minimal distributions install it with `sudo apt install psmisc`, or
 select a different port with `--rfc2217-port` (the UF2 relay always uses that
 port plus one).
+
+If com2tty instead refuses to start with a message that a port is already in
+use, a second com2tty session is already bound to that port. Give the new session
+a different `--rfc2217-port`, and a different `--wsl-tty`, to run the two
+concurrently.
 
 The serial-mode environment variables are written to `~/.bashrc`, to `~/.zshrc`
 when zsh is detected or a `~/.zshrc` file exists, and to

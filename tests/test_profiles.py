@@ -138,6 +138,12 @@ class TestExpandProfiles(unittest.TestCase):
     def test_bare_at_passes_through(self):
         self.assertEqual(expand_profiles(["@"]), ["@"])
 
+    def test_doubled_at_is_escaped_to_literal(self):
+        # ``@@value`` is a literal ``@value`` argument, not a profile ref, so
+        # it is never looked up on disk.
+        self.assertEqual(
+            expand_profiles(["--name", "@@home"]), ["--name", "@home"])
+
 
 class TestCliProfileIntegration(unittest.TestCase):
 

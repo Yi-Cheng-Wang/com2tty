@@ -232,6 +232,10 @@ def main():
         sys.exit(run_doctor(distro=parsed_args.distro,
                             rfc2217_port=parsed_args.rfc2217_port))
 
+    if parsed_args.list_ports and parsed_args.port:
+        parser.error("--list does not take a COM port; remove the positional "
+                     "argument (it would be silently ignored)")
+
     if parsed_args.list_ports:
         from com2tty.windows.discovery import print_port_list
         print_port_list(as_json=parsed_args.json)

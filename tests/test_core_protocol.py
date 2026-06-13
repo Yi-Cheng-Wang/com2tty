@@ -99,6 +99,17 @@ class TestControlDispatcher(unittest.TestCase):
         self.dispatcher.dispatch("[CONTROL] UF2_UPLOAD_START:1")
         self.assertEqual(self.calls[0][0], "long")
 
+    def test_prefix_is_not_misrouted_to_shorter_handler(self):
+        # A registered name that is a prefix of the incoming name, with no
+        # ":" separator after it, must NOT capture the line; it falls through
+        # to the fallback rather than being misrouted with a None payload.
+        seen = []
+        self.dispatcher.set_fallback(seen.append)
+        self.dispatcher.register("SETTINGS", self._record("settings"))
+        self.dispatcher.dispatch("[CONTROL] SETTINGS_RESET")
+        self.assertEqual(seen, ["[CONTROL] SETTINGS_RESET"])
+        self.assertEqual(self.calls, [])
+
     def test_non_control_line_goes_to_fallback(self):
         seen = []
         self.dispatcher.set_fallback(seen.append)
