@@ -1,4 +1,4 @@
-"""Tests for com2tty.doctor (``com2tty --doctor`` environment self-check)."""
+"""Tests for com2tty.windows.doctor (``com2tty --doctor`` environment self-check)."""
 import os
 import subprocess
 import sys
@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
-from com2tty.doctor import (
+from com2tty.windows.doctor import (
     OK, WARN, FAIL, SKIP,
     _run,
     check_wsl_exe,
@@ -64,60 +64,60 @@ class TestIndividualChecks(unittest.TestCase):
         self.assertEqual(status, FAIL)
         self.assertIn("wsl --install", detail)
 
-    @patch("com2tty.doctor._run", return_value=(0, "", ""))
+    @patch("com2tty.windows.doctor._run", return_value=(0, "", ""))
     def test_wsl_exec_ok(self, mock_run):
         self.assertEqual(check_wsl_exec(None)[0], OK)
 
-    @patch("com2tty.doctor._run", return_value=(1, "", "unknown option"))
+    @patch("com2tty.windows.doctor._run", return_value=(1, "", "unknown option"))
     def test_wsl_exec_fail_mentions_windows_version(self, mock_run):
         status, _, detail = check_wsl_exec(None)
         self.assertEqual(status, FAIL)
         self.assertIn("1903", detail)
 
-    @patch("com2tty.doctor._run", return_value=(None, "", ""))
+    @patch("com2tty.windows.doctor._run", return_value=(None, "", ""))
     def test_wsl_exec_no_output_fail(self, mock_run):
         status, _, detail = check_wsl_exec(None)
         self.assertEqual(status, FAIL)
         self.assertIn("no output", detail)
 
-    @patch("com2tty.doctor._run", return_value=(0, "Python 3.10.6", ""))
+    @patch("com2tty.windows.doctor._run", return_value=(0, "Python 3.10.6", ""))
     def test_python3_ok(self, mock_run):
         status, _, detail = check_python3(None)
         self.assertEqual(status, OK)
         self.assertIn("3.10", detail)
 
-    @patch("com2tty.doctor._run", return_value=(0, "", "Python 3.8.2"))
+    @patch("com2tty.windows.doctor._run", return_value=(0, "", "Python 3.8.2"))
     def test_python3_version_on_stderr(self, mock_run):
         # Old CPython printed --version to stderr.
         status, _, detail = check_python3(None)
         self.assertEqual(status, OK)
         self.assertIn("3.8", detail)
 
-    @patch("com2tty.doctor._run", return_value=(127, "", "not found"))
+    @patch("com2tty.windows.doctor._run", return_value=(127, "", "not found"))
     def test_python3_missing(self, mock_run):
         status, _, detail = check_python3(None)
         self.assertEqual(status, FAIL)
         self.assertIn("--distro", detail)
 
-    @patch("com2tty.doctor.get_wsl_path", return_value="/mnt/c/x/bridge.py")
-    @patch("com2tty.doctor._run", return_value=(0, "", ""))
+    @patch("com2tty.windows.doctor.get_wsl_path", return_value="/mnt/c/x/bridge.py")
+    @patch("com2tty.windows.doctor._run", return_value=(0, "", ""))
     def test_bridge_script_readable(self, mock_run, mock_path):
         status, _, detail = check_bridge_script(None)
         self.assertEqual(status, OK)
         self.assertEqual(detail, "/mnt/c/x/bridge.py")
 
-    @patch("com2tty.doctor.get_wsl_path", return_value="/mnt/c/x/bridge.py")
-    @patch("com2tty.doctor._run", return_value=(1, "", ""))
+    @patch("com2tty.windows.doctor.get_wsl_path", return_value="/mnt/c/x/bridge.py")
+    @patch("com2tty.windows.doctor._run", return_value=(1, "", ""))
     def test_bridge_script_unreadable(self, mock_run, mock_path):
         status, _, detail = check_bridge_script(None)
         self.assertEqual(status, FAIL)
         self.assertIn("automount", detail)
 
-    @patch("com2tty.doctor._run", return_value=(0, "/usr/bin/fuser", ""))
+    @patch("com2tty.windows.doctor._run", return_value=(0, "/usr/bin/fuser", ""))
     def test_fuser_present(self, mock_run):
         self.assertEqual(check_fuser(None)[0], OK)
 
-    @patch("com2tty.doctor._run", return_value=(1, "", ""))
+    @patch("com2tty.windows.doctor._run", return_value=(1, "", ""))
     def test_fuser_missing_is_warning(self, mock_run):
         status, _, detail = check_fuser(None)
         self.assertEqual(status, WARN)
@@ -127,7 +127,7 @@ class TestIndividualChecks(unittest.TestCase):
         results = check_ports(None, 4000, fuser_ok=False)
         self.assertEqual([r[0] for r in results], [SKIP, SKIP])
 
-    @patch("com2tty.doctor._run", return_value=(1, "", ""))
+    @patch("com2tty.windows.doctor._run", return_value=(1, "", ""))
     def test_ports_free(self, mock_run):
         results = check_ports(None, 4000, fuser_ok=True)
         self.assertEqual([r[0] for r in results], [OK, OK])
@@ -135,61 +135,61 @@ class TestIndividualChecks(unittest.TestCase):
         probed = [c.args[0][-1] for c in mock_run.call_args_list]
         self.assertEqual(probed, ["4000/tcp", "4001/tcp"])
 
-    @patch("com2tty.doctor._run", return_value=(0, "1234", ""))
+    @patch("com2tty.windows.doctor._run", return_value=(0, "1234", ""))
     def test_ports_in_use_is_warning(self, mock_run):
         results = check_ports(None, 4000, fuser_ok=True)
         self.assertEqual([r[0] for r in results], [WARN, WARN])
         self.assertIn("1234", results[0][2])
 
-    @patch("com2tty.doctor._run", return_value=(None, "", "boom"))
+    @patch("com2tty.windows.doctor._run", return_value=(None, "", "boom"))
     def test_ports_probe_error_is_skip(self, mock_run):
         results = check_ports(None, 4000, fuser_ok=True)
         self.assertEqual([r[0] for r in results], [SKIP, SKIP])
 
-    @patch("com2tty.doctor._run", return_value=(0, "0 0", ""))
+    @patch("com2tty.windows.doctor._run", return_value=(0, "0 0", ""))
     def test_leftovers_none(self, mock_run):
         status, _, detail = check_leftovers(None)
         self.assertEqual(status, OK)
         self.assertEqual(detail, "none")
 
-    @patch("com2tty.doctor._run", return_value=(0, "2 1", ""))
+    @patch("com2tty.windows.doctor._run", return_value=(0, "2 1", ""))
     def test_leftovers_found(self, mock_run):
         status, _, detail = check_leftovers(None)
         self.assertEqual(status, WARN)
         self.assertIn("2 intercepted picotool", detail)
         self.assertIn("1 rc file", detail)
 
-    @patch("com2tty.doctor._run", return_value=(0, "1 0", ""))
+    @patch("com2tty.windows.doctor._run", return_value=(0, "1 0", ""))
     def test_leftovers_only_picotool(self, mock_run):
         status, _, detail = check_leftovers(None)
         self.assertEqual(status, WARN)
         self.assertIn("picotool", detail)
         self.assertNotIn("rc file", detail)
 
-    @patch("com2tty.doctor._run", return_value=(0, "0 1", ""))
+    @patch("com2tty.windows.doctor._run", return_value=(0, "0 1", ""))
     def test_leftovers_only_rc(self, mock_run):
         status, _, detail = check_leftovers(None)
         self.assertEqual(status, WARN)
         self.assertIn("rc file", detail)
         self.assertNotIn("picotool", detail)
 
-    @patch("com2tty.doctor._run", return_value=(1, "", "probe failed"))
+    @patch("com2tty.windows.doctor._run", return_value=(1, "", "probe failed"))
     def test_leftovers_probe_failure_is_skip(self, mock_run):
         status, _, detail = check_leftovers(None)
         self.assertEqual(status, SKIP)
         self.assertIn("probe failed", detail)
 
-    @patch("com2tty.doctor._run", return_value=(0, "garbage", ""))
+    @patch("com2tty.windows.doctor._run", return_value=(0, "garbage", ""))
     def test_leftovers_unexpected_output_is_skip(self, mock_run):
         status, _, detail = check_leftovers(None)
         self.assertEqual(status, SKIP)
         self.assertIn("garbage", detail)
 
-    @patch("com2tty.doctor._run", return_value=(0, "", ""))
+    @patch("com2tty.windows.doctor._run", return_value=(0, "", ""))
     def test_uinput_accessible(self, mock_run):
         self.assertEqual(check_uinput(None)[0], OK)
 
-    @patch("com2tty.doctor._run", return_value=(1, "", ""))
+    @patch("com2tty.windows.doctor._run", return_value=(1, "", ""))
     def test_uinput_missing_is_warning(self, mock_run):
         status, _, detail = check_uinput(None)
         self.assertEqual(status, WARN)
@@ -200,7 +200,7 @@ class TestIndividualChecks(unittest.TestCase):
         self.assertEqual(check_autoplay_marker()[0], OK)
 
     def test_autoplay_marker_present(self):
-        from com2tty.uf2 import _autoplay_marker_path
+        from com2tty.windows.os_hacks.autoplay import _autoplay_marker_path
         with open(_autoplay_marker_path(), "w") as f:
             f.write("{}")
         try:
@@ -213,12 +213,12 @@ class TestIndividualChecks(unittest.TestCase):
     def test_xinput_skipped_off_windows(self):
         self.assertEqual(check_xinput(os_name="posix")[0], SKIP)
 
-    @patch("com2tty.xinput._load_xinput")
+    @patch("com2tty.windows.gamepad_host._load_xinput")
     def test_xinput_ok(self, mock_load):
         self.assertEqual(check_xinput(os_name="nt")[0], OK)
         mock_load.assert_called_once()
 
-    @patch("com2tty.xinput._load_xinput", side_effect=OSError("no DLL"))
+    @patch("com2tty.windows.gamepad_host._load_xinput", side_effect=OSError("no DLL"))
     def test_xinput_missing_is_warning(self, mock_load):
         status, _, detail = check_xinput(os_name="nt")
         self.assertEqual(status, WARN)
@@ -241,10 +241,10 @@ class TestRunDoctor(unittest.TestCase):
             "check_xinput": (OK, "XInput DLL", ""),
         }
         defaults.update(overrides)
-        patchers = [patch(f"com2tty.doctor.{name}", return_value=value)
+        patchers = [patch(f"com2tty.windows.doctor.{name}", return_value=value)
                     for name, value in defaults.items()]
         patchers.append(patch(
-            "com2tty.doctor.check_ports",
+            "com2tty.windows.doctor.check_ports",
             return_value=[(OK, "RFC 2217 port 4000 free", ""),
                           (OK, "UF2 relay port 4001 free", "")]))
         return patchers

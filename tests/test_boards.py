@@ -10,11 +10,13 @@ from unittest.mock import MagicMock, PropertyMock, patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
-from com2tty.boards import (
+from com2tty.core.boards import (
     BOARD_CHOICES,
     BOARD_LABELS,
     UF2_FAMILIES,
     classify_vid,
+)
+from com2tty.windows.board_reset import (
     samd_touch_reset,
     stm32_manual_reset,
 )
@@ -45,7 +47,7 @@ class TestClassifyVid(unittest.TestCase):
 
 class TestSamdTouchReset(unittest.TestCase):
 
-    @patch("com2tty.boards.time.sleep")
+    @patch("com2tty.windows.board_reset.time.sleep")
     def test_sequence(self, mock_sleep):
         ser = MagicMock()
         ser.baudrate = 115200
@@ -56,14 +58,14 @@ class TestSamdTouchReset(unittest.TestCase):
         self.assertEqual(ser.baudrate, 115200)
         self.assertTrue(ser.dtr)
 
-    @patch("com2tty.boards.time.sleep")
+    @patch("com2tty.windows.board_reset.time.sleep")
     def test_restores_default_when_old_baud_was_1200(self, mock_sleep):
         ser = MagicMock()
         ser.baudrate = 1200
         samd_touch_reset(ser)
         self.assertEqual(ser.baudrate, 115200)
 
-    @patch("com2tty.boards.time.sleep")
+    @patch("com2tty.windows.board_reset.time.sleep")
     def test_close_failure_is_tolerated(self, mock_sleep):
         ser = MagicMock()
         ser.baudrate = 9600
@@ -71,7 +73,7 @@ class TestSamdTouchReset(unittest.TestCase):
         samd_touch_reset(ser)  # should not raise
         self.assertEqual(ser.baudrate, 9600)
 
-    @patch("com2tty.boards.time.sleep")
+    @patch("com2tty.windows.board_reset.time.sleep")
     def test_exception_is_logged_not_raised(self, mock_sleep):
         ser = MagicMock()
         type(ser).dtr = PropertyMock(side_effect=OSError("port died"))
@@ -80,7 +82,7 @@ class TestSamdTouchReset(unittest.TestCase):
 
 class TestStm32ManualReset(unittest.TestCase):
 
-    @patch("com2tty.boards.time.sleep")
+    @patch("com2tty.windows.board_reset.time.sleep")
     def test_pulse_sequence(self, mock_sleep):
         ser = MagicMock()
         stm32_manual_reset(ser)
@@ -88,7 +90,7 @@ class TestStm32ManualReset(unittest.TestCase):
         self.assertFalse(ser.rts)
         self.assertFalse(ser.dtr)
 
-    @patch("com2tty.boards.time.sleep")
+    @patch("com2tty.windows.board_reset.time.sleep")
     def test_exception_is_logged_not_raised(self, mock_sleep):
         ser = MagicMock()
         type(ser).rts = PropertyMock(side_effect=OSError("no port"))
@@ -99,7 +101,7 @@ class TestNewBoardSessionPaths(unittest.TestCase):
     """The host wires samd into RFC2217 connect and stm32 into disconnect."""
 
     def _run_session(self, board_type):
-        from com2tty.host import read_wsl_stderr
+        from com2tty.windows.control_handler import read_wsl_stderr
         proc = MagicMock()
         ser = MagicMock()
         ser.get_settings.return_value = {}
@@ -114,23 +116,23 @@ class TestNewBoardSessionPaths(unittest.TestCase):
                         threading.Event(), queue.Queue(), None, board_type)
         return ser
 
-    @patch("com2tty.host.Redirector")
-    @patch("com2tty.host.time.sleep")
-    @patch("com2tty.host.samd_touch_reset")
+    @patch("com2tty.windows.control_handler.Redirector")
+    @patch("com2tty.windows.control_handler.time.sleep")
+    @patch("com2tty.windows.control_handler.samd_touch_reset")
     def test_samd_touch_on_connect(self, mock_touch, mock_sleep, mock_redir):
         ser = self._run_session("samd")
         mock_touch.assert_called_once_with(ser)
 
-    @patch("com2tty.host.Redirector")
-    @patch("com2tty.host.time.sleep")
-    @patch("com2tty.host.stm32_manual_reset")
+    @patch("com2tty.windows.control_handler.Redirector")
+    @patch("com2tty.windows.control_handler.time.sleep")
+    @patch("com2tty.windows.control_handler.stm32_manual_reset")
     def test_stm32_reset_on_disconnect(self, mock_reset, mock_sleep, mock_redir):
         ser = self._run_session("stm32")
         mock_reset.assert_called_once_with(ser)
 
-    @patch("com2tty.host.Redirector")
-    @patch("com2tty.host.time.sleep")
-    @patch("com2tty.host.pico_manual_reset")
+    @patch("com2tty.windows.control_handler.Redirector")
+    @patch("com2tty.windows.control_handler.time.sleep")
+    @patch("com2tty.windows.control_handler.pico_manual_reset")
     def test_nrf52_uses_uf2_touch_on_disconnect(self, mock_reset, mock_sleep,
                                                 mock_redir):
         ser = self._run_session("nrf52")
