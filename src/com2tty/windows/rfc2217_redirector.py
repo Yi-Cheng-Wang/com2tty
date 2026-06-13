@@ -86,3 +86,32 @@ class Redirector(object):
         self.log.debug('stopping redirector')
         if self.alive:
             self.alive = False
+
+
+class QueuePipeConnection:
+    """
+    Socket-like adapter that reads from a queue (fed by the WSL-to-COM pump)
+    and writes to proc.stdin. Used by the Redirector during RFC 2217 sessions.
+    """
+    def __init__(self, proc, data_queue, stop_event):
+        self.proc = proc
+        self._queue = data_queue
+        self._stop = stop_event
+
+    def recv(self, size):
+        while not self._stop.is_set():
+            try:
+                return self._queue.get(timeout=0.2)
+            except Exception:
+                continue
+        return b""
+
+    def sendall(self, data):
+        try:
+            self.proc.stdin.write(data)
+            self.proc.stdin.flush()
+        except Exception:
+            pass
+
+    def close(self):
+        self._stop.set()

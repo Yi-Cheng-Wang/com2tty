@@ -1,4 +1,4 @@
-"""Tests for com2tty.discovery (the --list port enumeration)."""
+"""Tests for com2tty.windows.discovery (the --list port enumeration)."""
 import os
 import sys
 import unittest
@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
-from com2tty.discovery import (
+from com2tty.windows.discovery import (
     _busid,
     collect_ports,
     format_port_table,

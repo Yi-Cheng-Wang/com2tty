@@ -1,4 +1,4 @@
-"""Tests for com2tty.profiles (@profile expansion from com2tty.ini)."""
+"""Tests for com2tty.cli.profiles (@profile expansion from com2tty.ini)."""
 import os
 import sys
 import tempfile
@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
-from com2tty.profiles import (
+from com2tty.cli.profiles import (
     ProfileError,
     default_search_paths,
     expand_profiles,
@@ -146,7 +146,7 @@ class TestCliProfileIntegration(unittest.TestCase):
         from com2tty.cli import main
         path = _ini("[b]\nport = COM7\nbaud = 57600\n")
         try:
-            with patch("com2tty.profiles.default_search_paths",
+            with patch("com2tty.cli.profiles.default_search_paths",
                        return_value=[path]), \
                  patch("sys.argv", ["com2tty", "@b"]):
                 main()
@@ -160,7 +160,7 @@ class TestCliProfileIntegration(unittest.TestCase):
         from com2tty.cli import main
         path = _ini("[b]\nport = COM7\nbaud = 57600\n")
         try:
-            with patch("com2tty.profiles.default_search_paths",
+            with patch("com2tty.cli.profiles.default_search_paths",
                        return_value=[path]), \
                  patch("sys.argv", ["com2tty", "@b", "--baud", "115200"]):
                 main()
@@ -172,7 +172,7 @@ class TestCliProfileIntegration(unittest.TestCase):
         from com2tty.cli import main
         path = _ini("[b]\nbaud = 9600\n")
         try:
-            with patch("com2tty.profiles.default_search_paths",
+            with patch("com2tty.cli.profiles.default_search_paths",
                        return_value=[path]), \
                  patch("sys.argv", ["com2tty", "@nope"]):
                 with self.assertRaises(SystemExit):

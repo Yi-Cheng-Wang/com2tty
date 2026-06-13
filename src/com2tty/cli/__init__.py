@@ -1,9 +1,26 @@
+"""Command-line entry point: argument parsing and mode dispatch.
+
+This package is deliberately thin -- it parses arguments (after expanding
+@profile tokens from com2tty.ini) and hands off to the Windows-side
+facades in ``com2tty.windows``. The CLI surface (flags, defaults, help
+text) is a compatibility contract; defaults come from
+``com2tty.core.constants`` so the documented values and the implementation
+cannot drift apart.
+"""
 import argparse
 import sys
 import logging
 from com2tty import __version__
-from com2tty.boards import BOARD_CHOICES
-from com2tty.host import run_bridge, run_gamepad_bridge
+from com2tty.core.boards import BOARD_CHOICES
+from com2tty.core.constants import (
+    DEFAULT_PAD_FIFO,
+    DEFAULT_PAD_NAME,
+    DEFAULT_POLL_HZ,
+    DEFAULT_RFC2217_PORT,
+    DEFAULT_WSL_TTY,
+)
+from com2tty.windows.bridge_app import run_bridge
+from com2tty.windows.gamepad_app import run_gamepad_bridge
 
 def main():
     parser = argparse.ArgumentParser(
@@ -81,7 +98,7 @@ def main():
 
     parser.add_argument(
         "--pad-name",
-        default="Microsoft X-Box 360 pad",
+        default=DEFAULT_PAD_NAME,
         help="Virtual device name advertised to WSL in --gamepad mode."
     )
 
@@ -95,16 +112,17 @@ def main():
 
     parser.add_argument(
         "--wsl-pad",
-        default="/tmp/com2pad0",
+        default=DEFAULT_PAD_FIFO,
         help="Target FIFO path inside WSL for the default /tmp gamepad stream "
-             "(default: /tmp/com2pad0)."
+             f"(default: {DEFAULT_PAD_FIFO})."
     )
 
     parser.add_argument(
         "--poll-hz",
         type=int,
-        default=250,
-        help="XInput polling rate in Hz for --gamepad mode (default: 250)."
+        default=DEFAULT_POLL_HZ,
+        help="XInput polling rate in Hz for --gamepad mode "
+             f"(default: {DEFAULT_POLL_HZ})."
     )
     
     parser.add_argument(
@@ -116,15 +134,16 @@ def main():
     
     parser.add_argument(
         "-w", "--wsl-tty",
-        default="/tmp/ttyUSB0",
-        help="Target symlink path inside WSL (default: /tmp/ttyUSB0)."
+        default=DEFAULT_WSL_TTY,
+        help=f"Target symlink path inside WSL (default: {DEFAULT_WSL_TTY})."
     )
     
     parser.add_argument(
         "--rfc2217-port",
         type=int,
-        default=4000,
-        help="TCP port for RFC 2217 server (default: 4000)."
+        default=DEFAULT_RFC2217_PORT,
+        help="TCP port for RFC 2217 server "
+             f"(default: {DEFAULT_RFC2217_PORT})."
     )
 
     parser.add_argument(
@@ -191,7 +210,7 @@ def main():
     
     # Expand @profile tokens (saved argument sets from com2tty.ini) before
     # parsing; arguments given after the token override the profile's values.
-    from com2tty.profiles import ProfileError, expand_profiles
+    from com2tty.cli.profiles import ProfileError, expand_profiles
     try:
         argv = expand_profiles(sys.argv[1:])
     except ProfileError as e:
@@ -209,12 +228,12 @@ def main():
     )
 
     if parsed_args.doctor:
-        from com2tty.doctor import run_doctor
+        from com2tty.windows.doctor import run_doctor
         sys.exit(run_doctor(distro=parsed_args.distro,
                             rfc2217_port=parsed_args.rfc2217_port))
 
     if parsed_args.list_ports:
-        from com2tty.discovery import print_port_list
+        from com2tty.windows.discovery import print_port_list
         print_port_list(as_json=parsed_args.json)
         return
 
@@ -235,13 +254,13 @@ def main():
                 distro=parsed_args.distro,
             )
             if len(pad_indices) > 1:
-                from com2tty.host import run_multi_gamepad_bridge
+                from com2tty.windows.gamepad_app import run_multi_gamepad_bridge
                 run_multi_gamepad_bridge(
                     pad_indices,
                     auto_respawn=parsed_args.auto_respawn,
                     **pad_kwargs)
             elif parsed_args.auto_respawn:
-                from com2tty.host import run_with_respawn
+                from com2tty.windows.bridge_app import run_with_respawn
                 run_with_respawn(run_gamepad_bridge,
                                  pad_index=pad_indices[0], **pad_kwargs)
             else:
@@ -267,7 +286,7 @@ def main():
 
     try:
         if len(parsed_args.port) > 1:
-            from com2tty.host import run_multi_bridge
+            from com2tty.windows.bridge_app import run_multi_bridge
             run_multi_bridge(
                 ports=parsed_args.port,
                 baud=parsed_args.baud,
@@ -301,7 +320,7 @@ def main():
                 wait=parsed_args.wait
             )
             if parsed_args.auto_respawn:
-                from com2tty.host import run_with_respawn
+                from com2tty.windows.bridge_app import run_with_respawn
                 run_with_respawn(run_bridge, **bridge_kwargs)
             else:
                 run_bridge(**bridge_kwargs)

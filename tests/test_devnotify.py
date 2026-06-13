@@ -1,4 +1,4 @@
-"""Tests for com2tty.devnotify (WM_DEVICECHANGE wake-ups).
+"""Tests for com2tty.windows.os_hacks.device_watcher (WM_DEVICECHANGE wake-ups).
 
 The ctypes message pump is exercised against a fake user32 injected by
 patching ``ctypes.windll``/``ctypes.WINFUNCTYPE`` (create=True so the
@@ -14,8 +14,8 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
-import com2tty.devnotify as dn
-from com2tty.devnotify import (
+import com2tty.windows.os_hacks.device_watcher as dn
+from com2tty.windows.os_hacks.device_watcher import (
     DBT_DEVICEARRIVAL,
     DBT_DEVICEREMOVECOMPLETE,
     WM_CLOSE,
@@ -81,13 +81,13 @@ class TestStart(unittest.TestCase):
 
 class TestWait(unittest.TestCase):
 
-    @patch("com2tty.devnotify.time.sleep")
+    @patch("com2tty.windows.os_hacks.device_watcher.time.sleep")
     def test_inactive_falls_back_to_sleep(self, mock_sleep):
         w = DeviceChangeWatcher()
         self.assertFalse(w.wait(0.25))
         mock_sleep.assert_called_once_with(0.25)
 
-    @patch("com2tty.devnotify.time.sleep")
+    @patch("com2tty.windows.os_hacks.device_watcher.time.sleep")
     def test_active_signal_fires_and_clears(self, mock_sleep):
         w = DeviceChangeWatcher()
         w.active = True
@@ -206,7 +206,7 @@ class TestSingleton(unittest.TestCase):
     def test_start_creates_once_and_reuses(self):
         fake = MagicMock()
         fake.active = True
-        with patch("com2tty.devnotify.DeviceChangeWatcher",
+        with patch("com2tty.windows.os_hacks.device_watcher.DeviceChangeWatcher",
                    return_value=fake) as cls:
             self.assertIs(start_device_watcher(), fake)
             self.assertIs(start_device_watcher(), fake)
@@ -216,7 +216,7 @@ class TestSingleton(unittest.TestCase):
     def test_inactive_watcher_yields_none(self):
         fake = MagicMock()
         fake.active = False
-        with patch("com2tty.devnotify.DeviceChangeWatcher",
+        with patch("com2tty.windows.os_hacks.device_watcher.DeviceChangeWatcher",
                    return_value=fake):
             self.assertIsNone(start_device_watcher())
         self.assertIsNone(get_watcher())
@@ -225,7 +225,7 @@ class TestSingleton(unittest.TestCase):
         fake = MagicMock()
         fake.active = False
         fake.start.side_effect = RuntimeError("boom")
-        with patch("com2tty.devnotify.DeviceChangeWatcher",
+        with patch("com2tty.windows.os_hacks.device_watcher.DeviceChangeWatcher",
                    return_value=fake):
             self.assertIsNone(start_device_watcher())
 

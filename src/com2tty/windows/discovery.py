@@ -6,7 +6,7 @@ so no usbipd is needed -- and classifies the board family by USB VID.
 """
 import serial.tools.list_ports
 
-from .boards import classify_vid
+from ..core.boards import classify_vid
 
 
 def _busid(location):

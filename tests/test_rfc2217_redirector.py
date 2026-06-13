@@ -2,10 +2,16 @@ import unittest
 from unittest.mock import MagicMock, patch
 import sys
 import os
+import queue
+import threading
+import time as _time
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
-from com2tty.rfc2217_server import Redirector
+from com2tty.windows.rfc2217_redirector import (
+    QueuePipeConnection,
+    Redirector,
+)
 
 
 @patch("serial.rfc2217.PortManager")
@@ -174,7 +180,7 @@ class TestRedirector(unittest.TestCase):
 
     # ── statusline_poller ────────────────────────────────────────────────
 
-    @patch("com2tty.rfc2217_server.time.sleep")
+    @patch("com2tty.windows.rfc2217_redirector.time.sleep")
     def test_statusline_poller_normal(self, mock_sleep, mock_pm):
         r = Redirector(MagicMock(), MagicMock())
         r.alive = True
@@ -189,7 +195,7 @@ class TestRedirector(unittest.TestCase):
         r.statusline_poller()
         r.rfc2217.check_modem_lines.assert_called()
 
-    @patch("com2tty.rfc2217_server.time.sleep")
+    @patch("com2tty.windows.rfc2217_redirector.time.sleep")
     def test_statusline_poller_exception(self, mock_sleep, mock_pm):
         r = Redirector(MagicMock(), MagicMock())
         r.alive = True
@@ -222,3 +228,58 @@ class TestRedirector(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestQueuePipeConnection(unittest.TestCase):
+
+    def test_recv_returns_data(self):
+        proc = MagicMock()
+        q = queue.Queue()
+        stop = threading.Event()
+        qpc = QueuePipeConnection(proc, q, stop)
+        q.put(b"payload")
+        self.assertEqual(qpc.recv(1024), b"payload")
+
+    def test_recv_returns_empty_on_stop(self):
+        proc = MagicMock()
+        q = queue.Queue()
+        stop = threading.Event()
+        stop.set()
+        qpc = QueuePipeConnection(proc, q, stop)
+        self.assertEqual(qpc.recv(1024), b"")
+
+    def test_recv_timeout_then_stop(self):
+        """Queue.get times out (Empty) ??except continues ??stop fires."""
+        proc = MagicMock()
+        q = queue.Queue()  # empty queue
+        stop = threading.Event()
+        qpc = QueuePipeConnection(proc, q, stop)
+
+        # Set stop after a short delay so recv loops once through the timeout
+        def _set_stop():
+            _time.sleep(0.3)
+            stop.set()
+        t = threading.Thread(target=_set_stop, daemon=True)
+        t.start()
+
+        result = qpc.recv(1024)
+        self.assertEqual(result, b"")
+        t.join(timeout=1)
+
+    def test_sendall(self):
+        proc = MagicMock()
+        qpc = QueuePipeConnection(proc, queue.Queue(), threading.Event())
+        qpc.sendall(b"data")
+        proc.stdin.write.assert_called_with(b"data")
+
+    def test_sendall_exception(self):
+        proc = MagicMock()
+        proc.stdin.write.side_effect = Exception("broken")
+        qpc = QueuePipeConnection(proc, queue.Queue(), threading.Event())
+        qpc.sendall(b"x")  # should not raise
+
+    def test_close(self):
+        stop = threading.Event()
+        qpc = QueuePipeConnection(MagicMock(), queue.Queue(), stop)
+        qpc.close()
+        self.assertTrue(stop.is_set())
