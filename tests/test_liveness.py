@@ -1,6 +1,6 @@
 """Tests for com2tty.wsl.liveness (heartbeat files and PID markers)."""
 import unittest
-from unittest.mock import patch
+from unittest.mock import mock_open, patch
 import sys
 import os
 import tempfile
@@ -37,11 +37,43 @@ class TestSessionLiveness(unittest.TestCase):
                 self.assertTrue(os.path.exists(path))
                 with open(path) as f:
                     self.assertEqual(int(f.read()), os.getpid())
-                self.assertTrue(is_port_session_alive(4000))
+                # Our own marker must NOT count as another live session.
+                self.assertFalse(is_port_session_alive(4000))
                 remove_alive_files([4000, 4001])
                 self.assertFalse(os.path.exists(path))
                 self.assertFalse(is_port_session_alive(4000))
                 remove_alive_files([4000])  # removing again is a no-op
+
+    def test_fresh_marker_of_another_live_session_is_alive(self):
+        with tempfile.TemporaryDirectory() as d:
+            with patch("com2tty.wsl.liveness.alive_file_path",
+                       side_effect=lambda p: os.path.join(d, f"alive_{p}")):
+                path = os.path.join(d, "alive_4000")
+                with open(path, "w") as f:
+                    f.write("99999")  # some other PID
+                with patch("com2tty.wsl.liveness.pid_alive", return_value=True):
+                    self.assertTrue(is_port_session_alive(4000))
+
+    def test_fresh_marker_of_dead_session_is_not_alive(self):
+        # A session that crashed seconds ago leaves a still-fresh marker; the
+        # PID check keeps it from being mistaken for a live holder.
+        with tempfile.TemporaryDirectory() as d:
+            with patch("com2tty.wsl.liveness.alive_file_path",
+                       side_effect=lambda p: os.path.join(d, f"alive_{p}")):
+                path = os.path.join(d, "alive_4000")
+                with open(path, "w") as f:
+                    f.write("99999")
+                with patch("com2tty.wsl.liveness.pid_alive", return_value=False):
+                    self.assertFalse(is_port_session_alive(4000))
+
+    def test_legacy_marker_without_pid_trusts_freshness(self):
+        with tempfile.TemporaryDirectory() as d:
+            with patch("com2tty.wsl.liveness.alive_file_path",
+                       side_effect=lambda p: os.path.join(d, f"alive_{p}")):
+                path = os.path.join(d, "alive_4000")
+                with open(path, "w") as f:
+                    f.write("")  # no PID recorded (legacy marker)
+                self.assertTrue(is_port_session_alive(4000))
 
     def test_stale_alive_file_is_not_alive(self):
         with tempfile.TemporaryDirectory() as d:
@@ -60,13 +92,22 @@ class TestSessionLiveness(unittest.TestCase):
     def test_alive_file_path_layout(self):
         self.assertEqual(alive_file_path(4000), "/tmp/com2tty_alive_4000")
 
-    @patch("com2tty.wsl.liveness.os.path.isdir")
-    def test_pid_alive_consults_proc(self, mock_isdir):
-        mock_isdir.return_value = True
-        self.assertTrue(pid_alive(123))
-        mock_isdir.assert_called_once_with("/proc/123")
-        mock_isdir.return_value = False
-        self.assertFalse(pid_alive(123))
+    def test_pid_alive_true_for_com2tty_process(self):
+        m = mock_open(read_data=b"python3\x00/x/com2tty/bridge.py\x00")
+        with patch("com2tty.wsl.liveness.open", m, create=True):
+            self.assertTrue(pid_alive(123))
+        m.assert_called_once_with("/proc/123/cmdline", "rb")
+
+    def test_pid_alive_false_for_recycled_pid(self):
+        # /proc/<pid> exists but the command line is an unrelated process,
+        # so a recycled PID must not be treated as a live com2tty session.
+        m = mock_open(read_data=b"/usr/bin/vim\x00")
+        with patch("com2tty.wsl.liveness.open", m, create=True):
+            self.assertFalse(pid_alive(123))
+
+    def test_pid_alive_false_when_no_proc_entry(self):
+        with patch("com2tty.wsl.liveness.open", side_effect=OSError):
+            self.assertFalse(pid_alive(999))
 
     def test_pid_alive_invalid_pid(self):
         self.assertFalse(pid_alive("abc"))

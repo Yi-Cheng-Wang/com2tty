@@ -10,9 +10,55 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 import termios  # real on Linux, mock on Windows via conftest
 
 from com2tty.wsl.pty_manager import (
+    _refuse_if_foreign_live_pty,
     cleanup_symlink,
+    create_symlink_with_fallback,
     get_pty_settings,
 )
+
+
+class TestRefuseIfForeignLivePty(unittest.TestCase):
+
+    @patch("os.path.islink", return_value=False)
+    def test_non_link_is_allowed(self, m_islink):
+        _refuse_if_foreign_live_pty("/tmp/ttyUSB0", "/dev/pts/3")  # no raise
+
+    @patch("os.path.exists", return_value=True)
+    @patch("os.readlink", return_value="/dev/pts/9")
+    @patch("os.path.islink", return_value=True)
+    def test_foreign_live_pty_is_refused(self, m_islink, m_readlink, m_exists):
+        with self.assertRaises(FileExistsError):
+            _refuse_if_foreign_live_pty("/tmp/ttyUSB0", "/dev/pts/3")
+
+    @patch("os.readlink", return_value="/dev/pts/3")
+    @patch("os.path.islink", return_value=True)
+    def test_our_own_link_is_allowed(self, m_islink, m_readlink):
+        _refuse_if_foreign_live_pty("/tmp/ttyUSB0", "/dev/pts/3")  # no raise
+
+    @patch("os.path.exists", return_value=False)
+    @patch("os.readlink", return_value="/dev/pts/9")
+    @patch("os.path.islink", return_value=True)
+    def test_dangling_link_is_allowed(self, m_islink, m_readlink, m_exists):
+        # The previous owner's pts is gone; safe to replace.
+        _refuse_if_foreign_live_pty("/tmp/ttyUSB0", "/dev/pts/3")  # no raise
+
+    @patch("os.readlink", side_effect=OSError("boom"))
+    @patch("os.path.islink", return_value=True)
+    def test_unreadable_link_is_allowed(self, m_islink, m_readlink):
+        _refuse_if_foreign_live_pty("/tmp/ttyUSB0", "/dev/pts/3")  # no raise
+
+
+class TestCreateSymlinkAntiHijack(unittest.TestCase):
+
+    @patch("os.symlink", create=True)
+    @patch("os.path.exists", return_value=True)
+    @patch("os.readlink", return_value="/dev/pts/9")
+    @patch("os.path.islink", return_value=True)
+    def test_refuses_to_hijack_and_does_not_symlink(
+            self, m_islink, m_readlink, m_exists, m_symlink):
+        with self.assertRaises(FileExistsError):
+            create_symlink_with_fallback("/dev/pts/3", "/tmp/ttyUSB0")
+        m_symlink.assert_not_called()
 
 
 class TestGetPtySettings(unittest.TestCase):

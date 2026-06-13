@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 
 import com2tty.wsl.integrations.shell_env as _shell_env
 from com2tty.wsl.integrations.shell_env import (
+    _atomic_write_lines,
     _marker_pid,
     clean_fish_conf,
     clean_rc,
@@ -41,6 +42,68 @@ def _no_real_fish_conf(monkeypatch):
     """
     monkeypatch.setattr(_shell_env, "get_fish_conf_path", lambda: None)
 
+
+
+class TestAtomicWriteLines(unittest.TestCase):
+
+    def test_creates_file_when_absent(self):
+        # os.stat on a missing path raises -> orig_mode falls back to None,
+        # and the file is created from scratch.
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "new.bashrc")
+            _atomic_write_lines(path, ["a\n", "b\n"])
+            with open(path) as f:
+                self.assertEqual(f.read(), "a\nb\n")
+
+    def test_preserves_existing_mode(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, ".bashrc")
+            with open(path, "w") as f:
+                f.write("old\n")
+            os.chmod(path, 0o640)
+            # Read back what the platform actually stored (Windows ignores the
+            # group/other bits), so the assertion is portable.
+            expected = os.stat(path).st_mode & 0o777
+            _atomic_write_lines(path, ["new\n"])
+            self.assertEqual(os.stat(path).st_mode & 0o777, expected)
+
+    def test_cleans_up_temp_and_reraises_on_failure(self):
+        captured = {}
+        real_mkstemp = tempfile.mkstemp
+
+        def spy_mkstemp(*a, **k):
+            fd, tmp = real_mkstemp(*a, **k)
+            captured["tmp"] = tmp
+            return fd, tmp
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, ".bashrc")
+            with open(path, "w") as f:
+                f.write("old\n")
+            with patch("com2tty.wsl.integrations.shell_env.tempfile.mkstemp",
+                       side_effect=spy_mkstemp), \
+                 patch("com2tty.wsl.integrations.shell_env.os.replace",
+                       side_effect=OSError("nope")):
+                with self.assertRaises(OSError):
+                    _atomic_write_lines(path, ["new\n"])
+            # The temp file must not be left behind, and the original is intact.
+            self.assertFalse(os.path.exists(captured["tmp"]))
+            with open(path) as f:
+                self.assertEqual(f.read(), "old\n")
+
+    def test_temp_unlink_failure_is_swallowed_but_original_error_raised(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, ".bashrc")
+            with open(path, "w") as f:
+                f.write("old\n")
+            with patch("com2tty.wsl.integrations.shell_env.os.replace",
+                       side_effect=OSError("replace failed")), \
+                 patch("com2tty.wsl.integrations.shell_env.os.unlink",
+                       side_effect=OSError("unlink failed")):
+                # The cleanup unlink also fails, but that is swallowed and the
+                # original replace failure still propagates.
+                with self.assertRaises(OSError):
+                    _atomic_write_lines(path, ["new\n"])
 
 
 class TestGetRcFiles(unittest.TestCase):

@@ -231,9 +231,9 @@ class TestTmpStreamGamepad(unittest.TestCase):
     def test_open_creates_fifo(self, m_lexists, m_exists, m_mkfifo, m_open):
         sink = pb.TmpStreamGamepad(path="/tmp/p")
         sink.open()
-        # Both the event FIFO and the .ff rumble FIFO are created.
-        m_mkfifo.assert_any_call("/tmp/p", 0o666)
-        m_mkfifo.assert_any_call("/tmp/p.ff", 0o666)
+        # Both the event FIFO and the .ff rumble FIFO are created owner-only.
+        m_mkfifo.assert_any_call("/tmp/p", 0o600)
+        m_mkfifo.assert_any_call("/tmp/p.ff", 0o600)
         self.assertEqual(m_mkfifo.call_count, 2)
         self.assertEqual(sink.fd, 7)
         self.assertEqual(sink.ff_fd, 8)
@@ -244,11 +244,13 @@ class TestTmpStreamGamepad(unittest.TestCase):
     @patch("com2tty.wsl.evdev_sink.os.mkfifo", create=True)
     @patch("com2tty.wsl.evdev_sink.os.path.exists", return_value=True)
     @patch("com2tty.wsl.evdev_sink.os.unlink")
+    @patch("com2tty.wsl.evdev_sink.stat.S_ISLNK", return_value=False)
     @patch("com2tty.wsl.evdev_sink.stat.S_ISFIFO", return_value=False)
-    @patch("com2tty.wsl.evdev_sink.os.stat")
+    @patch("com2tty.wsl.evdev_sink.os.lstat")
     @patch("com2tty.wsl.evdev_sink.os.path.lexists", return_value=True)
     def test_open_replaces_stale_non_fifo(self, m_lex, m_stat, m_isfifo,
-                                          m_unlink, m_exists, m_mkfifo, m_open):
+                                          m_islnk, m_unlink, m_exists,
+                                          m_mkfifo, m_open):
         sink = pb.TmpStreamGamepad(path="/tmp/p")
         sink.open()
         # Both stale paths (event FIFO and .ff FIFO) are replaced.
@@ -263,7 +265,7 @@ class TestTmpStreamGamepad(unittest.TestCase):
     @patch("com2tty.wsl.evdev_sink.os.mkfifo", create=True)
     @patch("com2tty.wsl.evdev_sink.os.path.exists", return_value=False)
     @patch("com2tty.wsl.evdev_sink.os.unlink")
-    @patch("com2tty.wsl.evdev_sink.os.stat", side_effect=OSError("boom"))
+    @patch("com2tty.wsl.evdev_sink.os.lstat", side_effect=OSError("boom"))
     @patch("com2tty.wsl.evdev_sink.os.path.lexists", return_value=True)
     def test_open_stat_oserror_unlinks(self, m_lex, m_stat, m_unlink,
                                        m_exists, m_mkfifo, m_open):
@@ -277,12 +279,29 @@ class TestTmpStreamGamepad(unittest.TestCase):
     @patch("com2tty.wsl.evdev_sink.os.open", return_value=7)
     @patch("com2tty.wsl.evdev_sink.os.mkfifo", create=True)
     @patch("com2tty.wsl.evdev_sink.os.path.exists", return_value=True)
+    @patch("com2tty.wsl.evdev_sink.os.unlink", side_effect=OSError("gone"))
+    @patch("com2tty.wsl.evdev_sink.os.lstat", side_effect=OSError("boom"))
+    @patch("com2tty.wsl.evdev_sink.os.path.lexists", return_value=True)
+    def test_open_lstat_and_unlink_both_fail(self, m_lex, m_stat, m_unlink,
+                                             m_exists, m_mkfifo, m_open):
+        # lstat fails, and the salvage unlink fails too: the doubly-guarded
+        # branch swallows it rather than crashing the sink open.
+        sink = pb.TmpStreamGamepad(path="/tmp/p")
+        sink.open()  # must not raise
+        self.assertEqual(sink.fd, 7)
+
+    @patch("com2tty.wsl.evdev_sink.os.O_NONBLOCK", 2048, create=True)
+    @patch("com2tty.wsl.evdev_sink.os.open", return_value=7)
+    @patch("com2tty.wsl.evdev_sink.os.mkfifo", create=True)
+    @patch("com2tty.wsl.evdev_sink.os.path.exists", return_value=True)
     @patch("com2tty.wsl.evdev_sink.os.unlink")
+    @patch("com2tty.wsl.evdev_sink.stat.S_ISLNK", return_value=False)
     @patch("com2tty.wsl.evdev_sink.stat.S_ISFIFO", return_value=True)
-    @patch("com2tty.wsl.evdev_sink.os.stat")
+    @patch("com2tty.wsl.evdev_sink.os.lstat")
     @patch("com2tty.wsl.evdev_sink.os.path.lexists", return_value=True)
     def test_open_reuses_existing_fifo(self, m_lex, m_stat, m_isfifo,
-                                       m_unlink, m_exists, m_mkfifo, m_open):
+                                       m_islnk, m_unlink, m_exists,
+                                       m_mkfifo, m_open):
         # Existing path that is already a FIFO: no unlink, no mkfifo.
         sink = pb.TmpStreamGamepad(path="/tmp/p")
         sink.open()

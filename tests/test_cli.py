@@ -254,6 +254,15 @@ class TestCliGamepad(unittest.TestCase):
             main()
         mock_pad.assert_not_called()
 
+    @patch("com2tty.windows.discovery.print_port_list")
+    @patch("sys.argv", ["com2tty", "COM3", "--list"])
+    def test_list_with_port_errors(self, mock_list):
+        # A positional COM port together with --list is a hard argument error
+        # rather than being silently ignored.
+        with self.assertRaises(SystemExit):
+            main()
+        mock_list.assert_not_called()
+
     @patch("com2tty.windows.gamepad_app.run_multi_gamepad_bridge")
     @patch("com2tty.cli.run_gamepad_bridge")
     @patch("sys.argv", ["com2tty", "--gamepad", "--pad-index", "0", "1"])

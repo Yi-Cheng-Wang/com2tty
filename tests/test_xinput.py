@@ -177,34 +177,35 @@ class TestRumbleReader(unittest.TestCase):
 
 class TestLoadXinput(unittest.TestCase):
 
-    class _OkLoader:
-        def __getattr__(self, name):
-            return "dll-" + name
-
-    class _FailLoader:
-        def __getattr__(self, name):
-            raise OSError("no such dll")
-
-    class _SecondOkLoader:
-        def __getattr__(self, name):
-            if name == "xinput1_4":
-                raise OSError("missing")
-            return "dll-" + name
-
     def test_returns_first_available_dll(self):
         with patch("com2tty.windows.gamepad_host.ctypes") as mc:
-            mc.windll = self._OkLoader()
-            self.assertEqual(xi._load_xinput(), "dll-xinput1_4")
+            mc.WinDLL.side_effect = lambda path: "dll-" + path
+            result = xi._load_xinput()
+            # Loaded the newest candidate, by absolute System32 path.
+            self.assertTrue(result.endswith(os.path.join("System32", "xinput1_4.dll")))
 
     def test_falls_through_to_next_dll(self):
+        def fake_windll(path):
+            if path.endswith("xinput1_4.dll"):
+                raise OSError("missing")
+            return "dll-" + path
         with patch("com2tty.windows.gamepad_host.ctypes") as mc:
-            mc.windll = self._SecondOkLoader()
+            mc.WinDLL.side_effect = fake_windll
             # xinput1_4 fails, so the next candidate (xinput1_3) is used.
-            self.assertEqual(xi._load_xinput(), "dll-xinput1_3")
+            self.assertTrue(xi._load_xinput().endswith("xinput1_3.dll"))
+
+    def test_loads_from_system32_not_cwd(self):
+        seen = []
+        with patch("com2tty.windows.gamepad_host.ctypes") as mc:
+            mc.WinDLL.side_effect = lambda path: seen.append(path) or "ok"
+            xi._load_xinput()
+        # Every load attempt used an absolute path rooted at System32, never
+        # a bare name resolvable from the current working directory.
+        self.assertTrue(all(os.path.isabs(p) and "System32" in p for p in seen))
 
     def test_raises_when_no_dll_found(self):
         with patch("com2tty.windows.gamepad_host.ctypes") as mc:
-            mc.windll = self._FailLoader()
+            mc.WinDLL.side_effect = OSError("no such dll")
             with self.assertRaises(OSError):
                 xi._load_xinput()
 

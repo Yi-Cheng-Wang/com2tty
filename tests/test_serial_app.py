@@ -9,9 +9,16 @@ import pytest
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
 
+import socket
+
 import com2tty.wsl.integrations.shell_env as _shell_env
+import com2tty.wsl.serial_app as sa
 from com2tty.wsl.liveness import alive_file_path  # noqa: F401
-from com2tty.wsl.serial_app import main
+from com2tty.wsl.serial_app import (
+    _install_signal_handlers,
+    _tcp_port_in_use,
+    main,
+)
 
 _real_get_fish_conf_path = _shell_env.get_fish_conf_path
 
@@ -442,10 +449,86 @@ class TestMainHeartbeat(unittest.TestCase):
 
         main()
 
-        # Touched at startup and again by the (interval-forced) loop pass.
-        self.assertGreaterEqual(mock_touch.call_count, 2)
+        # The premature startup touch was removed (it caused self-detection);
+        # the heartbeat is now registered by the loop's first pass, which runs
+        # once before the immediate stdin EOF breaks the loop.
+        self.assertGreaterEqual(mock_touch.call_count, 1)
         mock_touch.assert_called_with([4400, 4401])
         mock_remove_alive.assert_called_once_with([4400, 4401])
+
+
+class TestInstallSignalHandlers(unittest.TestCase):
+
+    def test_registers_and_handler_routes_to_keyboardinterrupt(self):
+        captured = {}
+        fake_signal = MagicMock()
+        fake_signal.SIGTERM = 15
+        fake_signal.SIGHUP = 1
+        fake_signal.signal.side_effect = (
+            lambda sig, handler: captured.__setitem__(sig, handler))
+        with patch.object(sa, "signal", fake_signal):
+            _install_signal_handlers()
+        self.assertEqual(set(captured), {15, 1})
+        # The handler converts the signal into the normal Ctrl+C teardown.
+        with self.assertRaises(KeyboardInterrupt):
+            captured[15](15, None)
+
+    def test_skips_signal_absent_on_platform(self):
+        fake_signal = MagicMock()
+        fake_signal.SIGTERM = 15
+        fake_signal.SIGHUP = None  # e.g. Windows has no SIGHUP
+        with patch.object(sa, "signal", fake_signal):
+            _install_signal_handlers()
+        registered = [c.args[0] for c in fake_signal.signal.call_args_list]
+        self.assertEqual(registered, [15])
+
+    def test_tolerates_non_main_thread(self):
+        fake_signal = MagicMock()
+        fake_signal.SIGTERM = 15
+        fake_signal.SIGHUP = 1
+        fake_signal.signal.side_effect = ValueError("not the main thread")
+        with patch.object(sa, "signal", fake_signal):
+            _install_signal_handlers()  # must not raise
+
+
+class TestTcpPortInUse(unittest.TestCase):
+
+    def test_free_port_is_not_in_use(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        free_port = s.getsockname()[1]
+        s.close()  # release it so the probe can bind
+        self.assertFalse(_tcp_port_in_use(free_port))
+
+    def test_listening_port_is_in_use(self):
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        try:
+            self.assertTrue(_tcp_port_in_use(port))
+        finally:
+            listener.close()
+
+
+class TestSamePortConflictFailsFast(unittest.TestCase):
+
+    @patch("sys.argv", ["bridge.py", "--symlink", "/tmp/tty",
+                         "--rfc2217-port", "4000"])
+    @patch("com2tty.wsl.serial_app.create_symlink_with_fallback")
+    @patch("com2tty.wsl.serial_app.open_pty")
+    @patch("com2tty.wsl.serial_app.inject_rc")
+    @patch("com2tty.wsl.serial_app.restore_orphaned_picotools")
+    @patch("com2tty.wsl.serial_app._tcp_port_in_use", return_value=True)
+    def test_conflict_returns_1_without_side_effects(
+            self, m_inuse, m_restore, m_inject, m_openpty, m_symlink):
+        rc = main()
+        self.assertEqual(rc, 1)
+        # No shared-state side effects: no rc injection, no pty/symlink.
+        m_inject.assert_not_called()
+        m_restore.assert_not_called()
+        m_openpty.assert_not_called()
+        m_symlink.assert_not_called()
 
 
 if __name__ == "__main__":
