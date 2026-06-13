@@ -4,7 +4,7 @@ All notable changes to com2tty are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-06-13
 
 ### Added
 
@@ -105,10 +105,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- The host module has been split: board detection and reset sequences live
-  in `boards.py`, UF2/AutoPlay support in `uf2.py`, console colours in
-  `banner.py`, port enumeration in `discovery.py`, and profile handling in
-  `profiles.py`. `host.py` re-exports the moved names.
+- The flat module layout has been reorganised into four domain packages
+  with no change to external behaviour, the command-line interface, or the
+  `[CONTROL]` wire protocol. `core/` holds the dependency-free definitions
+  shared by both interpreters (the `[CONTROL]` message catalogue and its
+  dispatcher, the gamepad and rumble frame codecs, board data, and
+  constants); `windows/` holds the host-side logic previously in `host.py`
+  (the serial and gamepad session orchestration, the COM-port and hot-plug
+  handling, the board reset sequences, the control-protocol handlers, and an
+  `os_hacks/` facade over the AutoPlay, Explorer, device-notification, and
+  console interventions); `wsl/` holds the guest-side helpers previously in
+  `bridge.py` and `pad_bridge.py` (the pseudo-terminal manager, the loopback
+  TCP servers, the shell-environment and picotool integrations, and the
+  evdev sinks); and `cli/` holds the argument parser and profile handling.
+  `bridge.py` and `pad_bridge.py` remain at the package root as thin entry
+  shims so the launch paths the Windows host resolves are unchanged. Internal
+  import paths changed accordingly and no backwards-compatibility re-exports
+  were kept.
 - CI now also runs on Python 3.13 and includes a ruff lint job.
 
 ## [0.1.3] - 2026
