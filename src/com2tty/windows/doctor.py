@@ -13,8 +13,8 @@ import os
 import shutil
 import subprocess
 
-from .host import get_wsl_path, wsl_command
-from .uf2 import _autoplay_marker_path
+from .wsl_process import get_wsl_path, helper_script_path, wsl_command
+from .os_hacks.autoplay import _autoplay_marker_path
 
 OK = "OK"
 WARN = "WARN"
@@ -62,8 +62,7 @@ def check_python3(distro):
 
 
 def check_bridge_script(distro):
-    script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                          "bridge.py")
+    script = helper_script_path("bridge.py")
     wsl_path = get_wsl_path(script, distro)
     rc, out, err = _run(wsl_command(distro, "test", "-r", wsl_path))
     if rc == 0:
@@ -159,7 +158,7 @@ def check_xinput(os_name=os.name):
     if os_name != "nt":
         return (SKIP, "XInput DLL (gamepad)", "not a Windows host")
     try:
-        from .xinput import _load_xinput
+        from .gamepad_host import _load_xinput
         _load_xinput()
         return (OK, "XInput DLL (gamepad)", "")
     except Exception as e:
