@@ -11,6 +11,28 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _no_real_device_watcher(monkeypatch):
+    """Keep host tests from spinning up a real WM_DEVICECHANGE message pump.
+
+    serial_host (_poll_wait) and bridge_app (run_bridge) reach the watcher
+    through their module-level `devnotify` import; replacing that attribute
+    with an inert stub makes the tests use the plain-sleep fallback. The
+    watcher's own tests import the real module directly and are unaffected.
+    Individual tests can override the stub's `get_watcher` to exercise the
+    event-driven branch of _poll_wait.
+    """
+    stub = types.SimpleNamespace(
+        start_device_watcher=lambda: None,
+        get_watcher=lambda: None,
+    )
+    import com2tty.windows.bridge_app
+    import com2tty.windows.serial_host
+    monkeypatch.setattr(com2tty.windows.serial_host, "devnotify", stub)
+    monkeypatch.setattr(com2tty.windows.bridge_app, "devnotify", stub)
+    return stub
+
+
+@pytest.fixture(autouse=True)
 def _isolate_autoplay_marker(tmp_path, monkeypatch):
     """Redirect the temp directory to a throwaway path for every test.
 

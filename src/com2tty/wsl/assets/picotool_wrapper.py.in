@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+import sys
+import os
+import socket
+
+def main():
+    args = sys.argv[1:]
+    target_file = None
+    for arg in args:
+        if arg.endswith('.elf') or arg.endswith('.uf2'):
+            target_file = arg
+            break
+
+    if not target_file:
+        sys.exit(0)
+
+    if target_file.endswith('.elf'):
+        uf2_file = target_file[:-4] + '.uf2'
+        if not os.path.exists(uf2_file):
+            uf2_file = target_file
+    else:
+        uf2_file = target_file
+
+    if not os.path.exists(uf2_file):
+        print(f"com2tty UF2 wrapper: {uf2_file} not found.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"com2tty UF2 wrapper: Sending {uf2_file} to host...", file=sys.stderr)
+    try:
+        with open(uf2_file, 'rb') as f:
+            data = f.read()
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect(('127.0.0.1', {port}))
+        s.sendall(data)
+        s.close()
+        print("com2tty UF2 wrapper: Transfer complete.", file=sys.stderr)
+    except Exception as e:
+        print(f"com2tty UF2 wrapper error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()

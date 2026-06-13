@@ -31,17 +31,27 @@ machine, and are not affected by firewall policy.
 The `--exec` form matters. Without it, `wsl.exe` rejoins its arguments and hands
 them to the distribution's login shell, which re-splits on whitespace and would
 corrupt any path containing a space. The helper is therefore always launched
-through `wsl_command` in `host.py`, which inserts `--exec` and preserves
-arguments verbatim. The host process is created with the `CREATE_NO_WINDOW`
-flag so that `wsl.exe` does not alter the Windows console mode, which would
-otherwise disable Ctrl+C handling for the foreground com2tty process.
+through `wsl_command` in `windows/wsl_process.py`, which inserts `--exec` and
+preserves arguments verbatim. The host process is created with the
+`CREATE_NO_WINDOW` flag so that `wsl.exe` does not alter the Windows console
+mode, which would otherwise disable Ctrl+C handling for the foreground com2tty
+process.
+
+The helper entry scripts, `bridge.py` and `pad_bridge.py`, stay at the package
+root as thin shims: the host resolves and verifies exactly those paths, and a
+script launched by path cannot assume the package is importable, so each shim
+puts the package's parent directory on `sys.path` before delegating to the
+implementation in `com2tty.wsl`.
 
 ## The control protocol
 
 The helper's standard error doubles as a control channel. Lines that begin with
 `[CONTROL]` are interpreted by the host; all other lines are surfaced as log
-output. The serial path uses the following messages, all emitted by `bridge.py`
-unless noted.
+output. The message catalogue is defined once in `core/protocol.py`, which both
+sides import: the WSL helpers emit the literals, and the host routes each line
+through a `ControlDispatcher` whose registered handlers live in
+`windows/control_handler.py`. The serial path uses the following messages, all
+emitted by the serial helper unless noted.
 
 The line `[CONTROL] SETTINGS: baud=<n> bytesize=<n> parity=<X> stopbits=<n>`
 reports that a WSL program changed the pseudo-terminal line discipline; the host
@@ -54,13 +64,13 @@ upload path uses `[CONTROL] UF2_READY:<port>`,
 `[CONTROL] UF2_ERROR: <detail>`. The host answers an upload start by writing
 `[CONTROL] UF2_ACK` back on the helper's standard input, which is the only
 control message that travels from host to helper. The gamepad helper
-(`pad_bridge.py`) emits `[CONTROL] PAD_READY`, `[CONTROL] PAD_UINPUT_UNAVAILABLE`,
+emits `[CONTROL] PAD_READY`, `[CONTROL] PAD_UINPUT_UNAVAILABLE`,
 `[CONTROL] PAD_PERMISSION_ERROR`, and `[CONTROL] PAD_ERROR`.
 
 ## The serial data path
 
-In serial mode, `run_bridge` in `host.py` opens the COM port with `pyserial`,
-launches `bridge.py` in WSL, and runs three daemon threads. One thread relays
+In serial mode, `run_bridge` in `windows/bridge_app.py` opens the COM port with
+`pyserial`, launches the serial helper in WSL, and runs three daemon threads. One thread relays
 bytes from the COM port to the helper's standard input, one relays bytes from
 the helper's standard output to the COM port, and one reads the helper's standard
 error and acts on the control protocol. A `threading.Event` named
@@ -68,8 +78,9 @@ error and acts on the control protocol. A `threading.Event` named
 `rfc2217_active_event` and `uf2_active_event`, suspend ordinary pseudo-terminal
 relaying while an RFC 2217 session or a UF2 upload owns the pipe.
 
-Inside WSL, `bridge.py` creates a pseudo terminal with `os.openpty`, symlinks the
-requested path (default `/tmp/ttyUSB0`) to the pseudo-terminal slave, and runs a
+Inside WSL, `wsl/serial_app.py` creates a pseudo terminal with `os.openpty`
+(through `wsl/pty_manager.py`), symlinks the requested path (default
+`/tmp/ttyUSB0`) to the pseudo-terminal slave, and runs a
 `select` loop that copies data between the helper's standard input and output and
 the pseudo-terminal master. It keeps the slave descriptor open for the lifetime
 of the process so that a WSL client opening and closing the port does not raise
@@ -79,13 +90,17 @@ equivalent path under `/tmp` and prints the one-time command to link the two.
 
 ## RFC 2217 forwarding and firmware upload
 
-To let build tools inside WSL flash a board attached to Windows, `bridge.py`
-starts two TCP servers bound to the loopback interface inside the WSL
-distribution. The RFC 2217 forwarder listens on the configured port (default
-4000) and relays an esptool or PlatformIO serial connection through the standard
-input and output pipe; `rfc2217_server.py` supplies the `Redirector` that
-implements the RFC 2217 protocol against the Windows COM port. The UF2 relay
-listens on the configured port plus one.
+To let build tools inside WSL flash a board attached to Windows, the serial
+helper starts two TCP servers bound to the loopback interface inside the WSL
+distribution; both derive from `LoopbackTcpServer` in `wsl/servers/base.py`,
+which owns the shared lifecycle (liveness-aware reclamation of a leftover
+listener, bind-failure reporting, the READY announcement, and the accept loop).
+The RFC 2217 forwarder (`wsl/servers/rfc2217_forwarder.py`) listens on the
+configured port (default 4000) and relays an esptool or PlatformIO serial
+connection through the standard input and output pipe;
+`windows/rfc2217_redirector.py` supplies the `Redirector` that implements the
+RFC 2217 protocol against the Windows COM port. The UF2 relay
+(`wsl/servers/uf2_relay.py`) listens on the configured port plus one.
 
 When an RFC 2217 client connects, the host suspends pseudo-terminal relaying,
 performs the board-specific reset described below, and runs the redirector for
@@ -96,8 +111,10 @@ that they cannot interfere with the controlled reset sequence while forwarding
 all other attribute access to the real port.
 
 For boards whose firmware is delivered as a UF2 image on a mass-storage
-bootloader, `bridge.py` intercepts the `picotool` binary inside WSL by renaming
-it to `picotool.real` and replacing it with a wrapper. When PlatformIO invokes
+bootloader, `wsl/integrations/picotool.py` intercepts the `picotool` binary
+inside WSL by renaming it to `picotool.real` and replacing it with a wrapper
+(rendered from the packaged template `wsl/assets/picotool_wrapper.py.in`). When
+PlatformIO invokes
 `picotool`, the wrapper sends the UF2 image to the UF2 relay, which forwards it
 to the host over standard output framed by the `UF2_UPLOAD_START` and
 `UF2_UPLOAD_END` control messages and an MD5 checksum. The host accumulates the
@@ -114,8 +131,9 @@ run.
 
 ## Board detection and reset sequences
 
-`boards.py` maps a USB vendor identifier to a board family through
-`BOARD_VID_MAP`. The Raspberry Pi vendor maps to `pico`; Silicon Labs, QinHeng,
+`core/boards.py` maps a USB vendor identifier to a board family through
+`BOARD_VID_MAP` and holds the reset timing parameters; the sequences themselves
+live in `windows/board_reset.py`. The Raspberry Pi vendor maps to `pico`; Silicon Labs, QinHeng,
 FTDI, Prolific, and Espressif map to `esp32`; the Adafruit nRF52 vendor maps to
 `nrf52`; Arduino, Seeed, and SparkFun map to `samd`; and STMicroelectronics maps
 to `stm32`. Generic USB-UART vendors are classified as `esp32` because the ESP32
@@ -139,7 +157,7 @@ unaffected by the pulse.
 
 A USB device that is unplugged, reset, or re-enumerated invalidates the open
 Windows handle, and Windows may assign it a different COM number when it returns.
-`host.py` handles this with two helpers. `reopen_serial_port` closes the stale
+`windows/serial_host.py` handles this with two helpers. `reopen_serial_port` closes the stale
 handle and then repeatedly tries the original port name, falling back to scanning
 for a port whose USB serial number matches the original device. The COM-to-WSL
 relay thread tolerates a short run of transient errors, which cover a board
@@ -158,12 +176,13 @@ the board reboots.
 ## The gamepad data path
 
 The gamepad path reuses the spawn-and-pipe transport. On the Windows side,
-`xinput.py` polls one XInput controller slot through `ctypes`, preferring the
+`windows/gamepad_host.py` polls one XInput controller slot through `ctypes`, preferring the
 undocumented `XInputGetStateEx` export (ordinal 100) so that the Guide button is
 visible, and packs each state snapshot into a fixed sixteen-byte frame. A frame is
 sent only when the controller's packet number or connection status changes, with
-a periodic heartbeat to keep the pipe warm. Inside WSL, `pad_bridge.py` parses the
+a periodic heartbeat to keep the pipe warm. Inside WSL, `wsl/gamepad_app.py` parses the
 frames with a resynchronising reader that tolerates partial reads and stray bytes,
+feeds them to the sinks in `wsl/evdev_sink.py`,
 translates each state into a list of Linux evdev events, and writes them to one of
 two sinks. The default sink writes the event stream to a FIFO under `/tmp` and
 needs no privileges. The opt-in sink creates a real device through `/dev/uinput`
@@ -176,13 +195,15 @@ The uinput sink also advertises `FF_RUMBLE` force feedback. It services the
 kernel's force-feedback upload handshake on the uinput descriptor, records the
 strong and weak magnitudes of each uploaded rumble effect, and when an effect is
 played sends a six-byte rumble frame back to the host over standard output. The
-host parses those frames with `RumbleReader` in `xinput.py` and drives the
-physical controller's motors through `XInputSetState`. The FIFO sink has no
+host parses those frames with the shared `RumbleReader` from `core/frames.py`
+and drives the physical controller's motors through `XInputSetState`. The FIFO sink has no
 reverse channel and therefore no force feedback.
 
 ## Binary frame formats
 
-The gamepad frame is sixteen bytes packed little-endian as `<BBBBHBBhhhh>`: two
+Both gamepad frame formats are defined once in `core/frames.py` and imported by
+both sides of the pipe. The gamepad frame is sixteen bytes packed little-endian
+as `<BBBBHBBhhhh>`: two
 magic bytes (`0xAB`, `0xCD`), the pad index, a flags byte whose low bit marks the
 controller as connected, the XInput button bitmask as an unsigned sixteen-bit
 value, the two trigger bytes, and the four signed sixteen-bit thumbstick axes.
@@ -192,21 +213,50 @@ The evdev records the helper writes are standard twenty-four-byte
 `struct input_event` values packed as `=qqHHi`, which is exactly what a real
 `/dev/input/eventN` node emits, so a single reader is portable across both sinks.
 
-## Module responsibilities
+## Package layout and module responsibilities
 
-The package contains thirteen modules under `src/com2tty/`. `__init__.py` holds
-the package version and `__main__.py` lets the package run as `python -m com2tty`.
-`cli.py` defines the argument parser, expands `@profile` tokens, and dispatches to
-the correct entry function. `profiles.py` loads named argument sets from an INI
-file. `discovery.py` implements the `--list` port enumeration. `host.py` is the
-Windows side of every mode and owns the COM port, the helper subprocess, the
-threads, the control-protocol handling, the reconnection logic, and the UF2 write
-routine. `boards.py`, `uf2.py`, and `banner.py` hold the board detection and reset
-sequences, the UF2 drive lookup and AutoPlay suppression, and the console colour
-handling respectively; `host.py` re-exports their names so that existing imports
-keep working. `bridge.py` is the WSL side of serial forwarding, and
-`rfc2217_server.py` supplies its RFC 2217 redirector. `xinput.py` is the Windows
-side of gamepad forwarding and `pad_bridge.py` is the WSL side.
+The code under `src/com2tty/` is organised by where it runs. `__init__.py`
+holds the package version, `__main__.py` lets the package run as
+`python -m com2tty`, and `bridge.py`/`pad_bridge.py` are the WSL entry shims
+described under "The transport".
+
+`cli/` is the user-interface layer: `cli/__init__.py` defines the argument
+parser, expands `@profile` tokens, and dispatches to the mode facades;
+`cli/profiles.py` loads named argument sets from an INI file.
+
+`core/` contains the dependency-free definitions both interpreters share:
+`constants.py` (paths, ports, marker strings, timing), `protocol.py` (the
+`[CONTROL]` message catalogue and the host-side `ControlDispatcher`),
+`frames.py` (the controller and rumble frame codecs with their
+resynchronising readers), and `boards.py` (the USB VID classification and
+reset timing data).
+
+`windows/` runs on the Windows interpreter. `wsl_process.py` builds and
+supervises the `wsl --exec` helper process; `serial_host.py` owns the COM
+port (settings, baud detection via `GetCommState`, hot-plug reconnection,
+`ResetProofSerial`); `board_reset.py` implements the per-family reset
+sequences; `control_handler.py` holds the handlers behind the control
+protocol (dynamic settings, the RFC 2217 session controller, the UF2 upload
+controller and flash routine); `bridge_app.py` and `gamepad_app.py`
+orchestrate the serial and gamepad sessions (`run_bridge`,
+`run_multi_bridge`, `run_with_respawn`, `run_gamepad_bridge`,
+`run_multi_gamepad_bridge`); `gamepad_host.py` polls XInput;
+`rfc2217_redirector.py` adapts pyserial's RFC 2217 machinery to the pipe;
+`uf2_flash.py` locates the bootloader drive; `discovery.py` and `doctor.py`
+implement `--list` and `--doctor`. The `windows/os_hacks/` facade isolates
+the raw OS-level interventions: `autoplay.py` (registry AutoPlay
+suppression with crash recovery), `explorer.py` (closing Explorer windows
+on the bootloader drive), `device_watcher.py` (`WM_DEVICECHANGE` wake-ups),
+and `console.py` (VT-mode banner colours).
+
+`wsl/` runs on the Linux interpreter inside WSL and uses only the standard
+library. `serial_app.py` and `gamepad_app.py` are the helper entry points;
+`pty_manager.py` owns the pseudo-terminal primitives; `evdev_sink.py`
+implements the `/tmp` FIFO and uinput gamepad sinks; `liveness.py` tracks
+session heartbeats and PID markers; `wsl/servers/` contains the
+`LoopbackTcpServer` base with the RFC 2217 forwarder and UF2 relay; and
+`wsl/integrations/` carries the shell-environment injection and the
+picotool interception with its `assets/` wrapper template.
 
 ## Dependencies and integration points
 
@@ -219,6 +269,29 @@ through the RFC 2217 forwarder and the UF2 relay. On minimal distributions the
 `fuser` utility from the `psmisc` package is used to reclaim a TCP port left open
 by a previous session; only processes whose command line identifies them as a
 com2tty bridge are terminated.
+
+The host-side polling loops (hot-plug reconnect, bootloader-port
+acquisition, and `--wait`) sleep through
+`windows/os_hacks/device_watcher.py`, which runs a
+hidden message-only window registered for `WM_DEVICECHANGE`
+device-interface notifications on a daemon thread; a plug or unplug wakes
+the loops immediately, and a plain timed sleep is the fallback whenever the
+watcher cannot start. With `--auto-respawn`, `run_with_respawn` in
+`windows/bridge_app.py` re-runs the bridge entry function after the WSL helper dies,
+first polling `check_wsl_environment` until the distribution answers
+again, so a `wsl --shutdown` no longer ends the session.
+
+Shared resources are guarded by session-liveness markers so that two
+concurrently running sessions cannot reclaim each other's state. Each helper
+refreshes a per-port heartbeat file (`/tmp/com2tty_alive_<port>`) from its main
+loop; `kill_leftover_listener` treats a port whose heartbeat is fresh as
+belonging to a live session and refuses to kill its owner. The rc-file
+environment blocks and the fish snippet are tagged with the owning helper's
+PID (`[pid=N]` in the marker line), and cleanup removes only blocks that are
+owned by the cleaning session, untagged (written by an older version), or
+owned by a PID that no longer exists in `/proc`. The picotool interception
+records its owner in `/tmp/com2tty_picotool.owner`; startup orphan recovery
+leaves the interception in place while that owner is still running.
 
 ## Security considerations
 

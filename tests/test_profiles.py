@@ -1,4 +1,4 @@
-"""Tests for com2tty.profiles (@profile expansion from com2tty.ini)."""
+"""Tests for com2tty.cli.profiles (@profile expansion from com2tty.ini)."""
 import os
 import sys
 import tempfile
@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
-from com2tty.profiles import (
+from com2tty.cli.profiles import (
     ProfileError,
     default_search_paths,
     expand_profiles,
@@ -93,6 +93,31 @@ class TestLoadProfileArgs(unittest.TestCase):
         self.assertTrue(paths[0].endswith("com2tty.ini"))
         self.assertTrue(paths[1].endswith(".com2tty.ini"))
 
+    def test_utf8_file_with_bom_and_non_ascii_comment(self):
+        # The file is read as UTF-8 regardless of the Windows ANSI codepage.
+        f = tempfile.NamedTemporaryFile("wb", suffix=".ini", delete=False)
+        f.write("﻿# 開發板設定\n[b]\nport = COM9\n".encode("utf-8"))
+        f.close()
+        self._files.append(f.name)
+        args = load_profile_args("b", [f.name])
+        self.assertEqual(args, ["COM9"])
+
+    def test_legacy_encoding_falls_back_to_latin1(self):
+        # Bytes that are not valid UTF-8 (a legacy ANSI-codepage file) must
+        # still parse; ASCII keys/values are unaffected by the fallback.
+        f = tempfile.NamedTemporaryFile("wb", suffix=".ini", delete=False)
+        f.write(b"# legacy comment \xb0\xea\xbb\xd8\n[b]\nport = COM9\n")
+        f.close()
+        self._files.append(f.name)
+        args = load_profile_args("b", [f.name])
+        self.assertEqual(args, ["COM9"])
+
+    def test_new_flag_options_accepted(self):
+        path = self._write("[w]\nport = COM4\nwait = true\njson = false\n")
+        args = load_profile_args("w", [path])
+        self.assertIn("--wait", args)
+        self.assertNotIn("--json", args)
+
 
 class TestExpandProfiles(unittest.TestCase):
 
@@ -121,7 +146,7 @@ class TestCliProfileIntegration(unittest.TestCase):
         from com2tty.cli import main
         path = _ini("[b]\nport = COM7\nbaud = 57600\n")
         try:
-            with patch("com2tty.profiles.default_search_paths",
+            with patch("com2tty.cli.profiles.default_search_paths",
                        return_value=[path]), \
                  patch("sys.argv", ["com2tty", "@b"]):
                 main()
@@ -135,7 +160,7 @@ class TestCliProfileIntegration(unittest.TestCase):
         from com2tty.cli import main
         path = _ini("[b]\nport = COM7\nbaud = 57600\n")
         try:
-            with patch("com2tty.profiles.default_search_paths",
+            with patch("com2tty.cli.profiles.default_search_paths",
                        return_value=[path]), \
                  patch("sys.argv", ["com2tty", "@b", "--baud", "115200"]):
                 main()
@@ -147,7 +172,7 @@ class TestCliProfileIntegration(unittest.TestCase):
         from com2tty.cli import main
         path = _ini("[b]\nbaud = 9600\n")
         try:
-            with patch("com2tty.profiles.default_search_paths",
+            with patch("com2tty.cli.profiles.default_search_paths",
                        return_value=[path]), \
                  patch("sys.argv", ["com2tty", "@nope"]):
                 with self.assertRaises(SystemExit):

@@ -27,6 +27,7 @@ import os
 # Options that are argparse store_true flags rather than value options.
 FLAG_OPTIONS = frozenset({
     "gamepad", "uinput", "xonxoff", "rtscts", "dsrdtr", "debug", "list",
+    "wait", "json", "doctor", "auto-respawn",
 })
 
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
@@ -49,7 +50,16 @@ def load_profile_args(name, search_paths=None):
     paths = search_paths if search_paths is not None else default_search_paths()
     parser = configparser.ConfigParser()
     try:
-        found = parser.read(paths)
+        # Read as UTF-8 regardless of the Windows ANSI codepage, so an INI
+        # written by a UTF-8 editor (the common case) parses correctly on a
+        # CJK-locale system. Files in a legacy single-byte encoding fall back
+        # to latin-1, which accepts any byte sequence; option keys and values
+        # used by com2tty are ASCII, so only comments could read garbled.
+        try:
+            found = parser.read(paths, encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            parser = configparser.ConfigParser()
+            found = parser.read(paths, encoding="latin-1")
     except configparser.Error as exc:
         raise ProfileError(f"could not parse the profile file: {exc}")
     if not found:

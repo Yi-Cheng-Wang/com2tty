@@ -3,28 +3,24 @@ Windows-side XInput controller reader for com2tty's gamepad mode.
 
 Polls a physical Xbox/XInput controller through the native Windows driver
 (no usbipd, no kernel driver needed in WSL) and packs each state snapshot
-into a fixed 16-byte frame that ``pad_bridge.py`` decodes inside WSL.
-
-Frame format (little-endian, 16 bytes)::
-
-    <BBBBHBBhhhh>
-      magic0, magic1, pad_index, flags,
-      wButtons, bLeftTrigger, bRightTrigger,
-      sThumbLX, sThumbLY, sThumbRX, sThumbRY
+into a fixed 16-byte frame that the WSL gamepad helper decodes; the helper
+sends 6-byte rumble frames back over its stdout. Both formats are defined
+in ``com2tty.core.frames``.
 """
 import ctypes
-import struct
 
-FRAME_MAGIC0 = 0xAB
-FRAME_MAGIC1 = 0xCD
-FRAME_FORMAT = "<BBBBHBBhhhh"
-FRAME_SIZE = struct.calcsize(FRAME_FORMAT)  # 16
-
-# Reverse-channel rumble frame (WSL -> Windows), see pad_bridge.py.
-RUMBLE_MAGIC0 = 0xFB
-RUMBLE_MAGIC1 = 0xFE
-RUMBLE_FORMAT = "<BBHH"
-RUMBLE_SIZE = struct.calcsize(RUMBLE_FORMAT)  # 6
+from ..core.frames import (  # noqa: F401 (re-exports kept for compatibility)
+    FRAME_FORMAT,
+    FRAME_MAGIC0,
+    FRAME_MAGIC1,
+    FRAME_SIZE,
+    RUMBLE_FORMAT,
+    RUMBLE_MAGIC0,
+    RUMBLE_MAGIC1,
+    RUMBLE_SIZE,
+    RumbleReader,
+    pack_frame,
+)
 
 ERROR_SUCCESS = 0
 ERROR_DEVICE_NOT_CONNECTED = 1167
@@ -62,47 +58,6 @@ class _XINPUT_VIBRATION(ctypes.Structure):
         ("wLeftMotorSpeed", ctypes.c_ushort),
         ("wRightMotorSpeed", ctypes.c_ushort),
     ]
-
-
-class RumbleReader:
-    """Resynchronising parser for the 6-byte rumble frames coming back from
-    the WSL helper's stdout (the reverse channel of the gamepad bridge)."""
-
-    def __init__(self):
-        self._buf = bytearray()
-
-    def feed(self, data):
-        """Add raw bytes, yield every complete (left, right) rumble pair."""
-        self._buf.extend(data)
-        frames = []
-        while True:
-            start = self._buf.find(RUMBLE_MAGIC0)
-            if start == -1:
-                self._buf.clear()
-                break
-            if start > 0:
-                del self._buf[:start]
-            if len(self._buf) < RUMBLE_SIZE:
-                break
-            if self._buf[1] != RUMBLE_MAGIC1:
-                del self._buf[0]
-                continue
-            _, _, left, right = struct.unpack(
-                RUMBLE_FORMAT, bytes(self._buf[:RUMBLE_SIZE]))
-            del self._buf[:RUMBLE_SIZE]
-            frames.append((left, right))
-        return frames
-
-
-def pack_frame(index, connected, buttons=0, lt=0, rt=0,
-               lx=0, ly=0, rx=0, ry=0):
-    """Build a 16-byte controller frame. Pure function, testable anywhere."""
-    flags = 0x01 if connected else 0x00
-    return struct.pack(
-        FRAME_FORMAT, FRAME_MAGIC0, FRAME_MAGIC1, index & 0xFF, flags,
-        buttons & 0xFFFF, lt & 0xFF, rt & 0xFF,
-        lx, ly, rx, ry,
-    )
 
 
 def _load_xinput():

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "com2tty"
-version = "0.2.0"
+version = "0.3.0"
 description = "A Windows COM port to WSL ttyUSB forwarder"
 readme = "README.md"
 authors = [
@@ -32,6 +32,9 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"com2tty.wsl" = ["assets/*.in"]
 
 [tool.ruff]
 target-version = "py38"

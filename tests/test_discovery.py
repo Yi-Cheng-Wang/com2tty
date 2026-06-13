@@ -1,4 +1,4 @@
-"""Tests for com2tty.discovery (the --list port enumeration)."""
+"""Tests for com2tty.windows.discovery (the --list port enumeration)."""
 import os
 import sys
 import unittest
@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
-from com2tty.discovery import (
+from com2tty.windows.discovery import (
     _busid,
     collect_ports,
     format_port_table,
@@ -130,6 +130,29 @@ class TestPrintPortList(unittest.TestCase):
         with patch("builtins.print") as mock_print:
             print_port_list()
         mock_print.assert_called_once_with("No serial ports found.")
+
+    @patch("serial.tools.list_ports.comports")
+    def test_json_output(self, mock_comports):
+        import json
+        mock_comports.return_value = [
+            _port("COM17", "USB Serial Device", vid=0x2E8A, pid=0xF00F,
+                  location="1-6:x.0", serial_number="SER123"),
+        ]
+        with patch("builtins.print") as mock_print:
+            print_port_list(as_json=True)
+        mock_print.assert_called_once()
+        data = json.loads(mock_print.call_args[0][0])
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]["device"], "COM17")
+        self.assertEqual(data[0]["vid_pid"], "2E8A:F00F")
+        self.assertEqual(data[0]["board"], "pico")
+
+    @patch("serial.tools.list_ports.comports", return_value=[])
+    def test_json_output_empty_is_valid_json(self, mock_comports):
+        import json
+        with patch("builtins.print") as mock_print:
+            print_port_list(as_json=True)
+        self.assertEqual(json.loads(mock_print.call_args[0][0]), [])
 
 
 if __name__ == "__main__":

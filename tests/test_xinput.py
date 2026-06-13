@@ -5,8 +5,8 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
-from com2tty import xinput as xi
-from com2tty import pad_bridge as pb
+from com2tty.windows import gamepad_host as xi
+from com2tty.wsl import evdev_sink as pb
 
 
 class TestPackFrame(unittest.TestCase):
@@ -44,7 +44,7 @@ class TestPackFrame(unittest.TestCase):
 class TestGamepadSource(unittest.TestCase):
 
     def test_rejects_bad_index(self):
-        with patch("com2tty.xinput._load_xinput"):
+        with patch("com2tty.windows.gamepad_host._load_xinput"):
             with self.assertRaises(ValueError):
                 xi.GamepadSource(7)
 
@@ -54,7 +54,7 @@ class TestGamepadSource(unittest.TestCase):
         # GamepadSource prefers the ordinal-100 export (XInputGetStateEx);
         # serve the same implementation there.
         fake_dll.__getitem__.return_value = fake_dll.XInputGetState
-        with patch("com2tty.xinput._load_xinput", return_value=fake_dll):
+        with patch("com2tty.windows.gamepad_host._load_xinput", return_value=fake_dll):
             return xi.GamepadSource(0), fake_dll
 
     def test_disconnected(self):
@@ -82,7 +82,7 @@ class TestGamepadSource(unittest.TestCase):
         fake_dll = MagicMock()
         fake_dll.XInputGetState.side_effect = impl
         fake_dll.__getitem__.return_value = fake_dll.XInputGetState
-        with patch("com2tty.xinput._load_xinput", return_value=fake_dll):
+        with patch("com2tty.windows.gamepad_host._load_xinput", return_value=fake_dll):
             src = xi.GamepadSource(0)
 
         changed, frame = src.poll()
@@ -106,7 +106,7 @@ class TestGetStateExFallback(unittest.TestCase):
     def test_falls_back_to_documented_call(self):
         fake_dll = MagicMock()
         fake_dll.__getitem__.side_effect = AttributeError("no ordinal 100")
-        with patch("com2tty.xinput._load_xinput", return_value=fake_dll):
+        with patch("com2tty.windows.gamepad_host._load_xinput", return_value=fake_dll):
             src = xi.GamepadSource(0)
         self.assertIs(src._get_state, fake_dll.XInputGetState)
 
@@ -116,7 +116,7 @@ class TestSetRumble(unittest.TestCase):
     def _source(self):
         fake_dll = MagicMock()
         fake_dll.__getitem__.return_value = fake_dll.XInputGetState
-        with patch("com2tty.xinput._load_xinput", return_value=fake_dll):
+        with patch("com2tty.windows.gamepad_host._load_xinput", return_value=fake_dll):
             return xi.GamepadSource(0), fake_dll
 
     def test_success(self):
@@ -192,18 +192,18 @@ class TestLoadXinput(unittest.TestCase):
             return "dll-" + name
 
     def test_returns_first_available_dll(self):
-        with patch("com2tty.xinput.ctypes") as mc:
+        with patch("com2tty.windows.gamepad_host.ctypes") as mc:
             mc.windll = self._OkLoader()
             self.assertEqual(xi._load_xinput(), "dll-xinput1_4")
 
     def test_falls_through_to_next_dll(self):
-        with patch("com2tty.xinput.ctypes") as mc:
+        with patch("com2tty.windows.gamepad_host.ctypes") as mc:
             mc.windll = self._SecondOkLoader()
             # xinput1_4 fails, so the next candidate (xinput1_3) is used.
             self.assertEqual(xi._load_xinput(), "dll-xinput1_3")
 
     def test_raises_when_no_dll_found(self):
-        with patch("com2tty.xinput.ctypes") as mc:
+        with patch("com2tty.windows.gamepad_host.ctypes") as mc:
             mc.windll = self._FailLoader()
             with self.assertRaises(OSError):
                 xi._load_xinput()

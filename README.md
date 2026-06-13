@@ -101,6 +101,19 @@ The following options apply to both modes.
 -l, --list             List the serial ports Windows can see (device name,
                        VID:PID, USB bus id, serial number, detected board,
                        description) and exit.
+--json                 With --list: print the port list as a JSON array
+                       instead of an aligned table, for scripts and IDE
+                       integrations.
+--doctor               Run an environment self-check (WSL, python3, drive
+                       automounting, fuser, TCP port availability, leftovers
+                       from crashed sessions, /dev/uinput, the XInput DLL)
+                       and exit. Exit status 1 when a required check fails.
+--auto-respawn         Rebuild the bridge automatically when the WSL helper
+                       dies, for example after `wsl --shutdown` or a WSL
+                       servicing update: com2tty waits until WSL answers
+                       again and re-creates the same endpoint. In serial
+                       mode this implies --wait. Applies to serial and
+                       gamepad mode alike.
 -d, --debug            Enable verbose debug logging on standard error.
 --distro NAME          WSL distribution to use (default: the WSL default
                        distribution). Useful when the default distribution
@@ -122,6 +135,10 @@ port [port ...]        Windows COM port(s) to bridge, for example COM3, or
 --rfc2217-port PORT    TCP port for the in-WSL RFC 2217 forwarder
                        (default: 4000). The UF2 relay uses PORT + 1; with
                        multiple ports, each additional port uses PORT + 2i.
+--wait                 If the COM port is not present yet, wait for it to
+                       appear instead of failing, then bridge it. Useful
+                       when com2tty is started before the device is
+                       plugged in.
 --bytesize {5,6,7,8}   Serial byte size (default: 8).
 --parity {N,E,O,S,M}   Parity: none, even, odd, space, or mark (default: N).
 --stopbits {1,1.5,2}   Stop bits (default: 1).
@@ -139,7 +156,12 @@ port [port ...]        Windows COM port(s) to bridge, for example COM3, or
 
 ```text
 --gamepad              Select gamepad mode. No COM port is required.
---pad-index {0,1,2,3}  XInput controller slot to forward (default: 0).
+--pad-index {0,1,2,3} [...]
+                       XInput controller slot(s) to forward (default: 0).
+                       Several slots may be given (--pad-index 0 1) to
+                       forward multiple controllers at once; each gets its
+                       own WSL helper and endpoint (/tmp/com2pad0,
+                       /tmp/com2pad1, ...).
 --pad-name NAME        Device name advertised inside WSL
                        (default: "Microsoft X-Box 360 pad").
 --uinput               Create a real /dev/input device through /dev/uinput
@@ -202,7 +224,15 @@ stale Windows handle and waits for the device to come back, first under its
 original COM name and then by scanning for its USB serial number, because
 Windows may assign a different COM number after a replug. Once the device
 reappears the bridge resumes automatically; the WSL endpoint stays in place
-the whole time.
+the whole time. The waiting loops are event-driven: com2tty registers for
+Windows device-change notifications (`WM_DEVICECHANGE`), so a replugged
+device resumes the moment Windows enumerates it rather than on the next
+polling tick (plain polling remains as the fallback).
+
+The complementary case — WSL itself going away, for example through
+`wsl --shutdown` or a WSL update — is covered by `--auto-respawn`: instead
+of exiting when the WSL helper dies, com2tty waits until WSL answers again
+and rebuilds the bridge with the same endpoint paths.
 
 ### Bridging multiple ports
 
@@ -253,9 +283,11 @@ com2tty @pad
 ### Automatic baud-rate detection
 
 When the baud rate is left at its default value of `auto`, com2tty queries the
-rate that Windows has configured for the port and uses it. If detection fails,
-the bridge falls back to 9600 baud. To set the rate explicitly, pass a numeric
-value to `--baud`.
+rate that Windows has configured for the port and uses it. The rate is read
+directly from the Win32 `GetCommState` API, which works regardless of the
+Windows display language; parsing the `mode.com` output is kept only as a
+fallback. If detection fails, the bridge falls back to 9600 baud. To set the
+rate explicitly, pass a numeric value to `--baud`.
 
 ```cmd
 com2tty COM3 --baud auto
@@ -343,7 +375,13 @@ these ports during an upload. Run com2tty only on hosts you trust, and choose a
 non-default `--rfc2217-port` if another local service needs the default port. To
 reclaim a port left open by a previous com2tty session, the helper only
 terminates processes whose command line identifies them as a com2tty bridge; an
-unrelated service occupying the port is never killed.
+unrelated service occupying the port is never killed. A *running* com2tty
+session is never killed either: each session refreshes a heartbeat marker for
+its ports, so a second invocation that reuses the same `--rfc2217-port` reports
+the conflict and leaves the first bridge intact. Two sessions can run
+concurrently by giving the second one a different `--rfc2217-port` and
+`--wsl-tty`; each session removes only its own block from the shell startup
+files when it exits.
 
 ### Gamepad mode
 
@@ -379,6 +417,24 @@ A consumer inside WSL reads 24-byte Linux `input_event` records from the FIFO an
 interprets them using the device profile below. This tier is suited to programs
 that read the stream directly. Standard applications and game engines that
 enumerate `/dev/input` devices do not read a FIFO and require the uinput tier.
+
+Force feedback is available in this tier through a second FIFO created at
+`<path>.ff` (by default `/tmp/com2pad0.ff`): the consumer writes 6-byte rumble
+frames into it — the bytes `0xFB 0xFE` followed by the strong (left,
+low-frequency) and weak (right, high-frequency) motor magnitudes as two
+little-endian unsigned 16-bit values — and com2tty forwards them to the
+physical controller's motors, exactly as the uinput tier does for kernel
+`FF_RUMBLE` effects.
+
+To forward several controllers at once, pass several slots:
+
+```cmd
+com2tty --gamepad --pad-index 0 1
+```
+
+Each slot gets its own WSL helper and its own endpoint (`/tmp/com2pad0`,
+`/tmp/com2pad1`, ...); in the uinput tier each helper creates its own
+`/dev/input` device, as if several physical controllers were attached.
 
 #### Opt-in tier: a real device through /dev/uinput
 
@@ -456,8 +512,9 @@ feedback. When a game or emulator inside WSL plays a rumble effect, the
 effect's magnitudes travel back through the bridge to the Windows host, which
 drives the physical controller's motors through `XInputSetState`. The strong
 (left, low-frequency) and weak (right, high-frequency) motors map directly to
-their XInput counterparts. The `/tmp` stream tier has no reverse channel and
-therefore no force feedback.
+their XInput counterparts. In the `/tmp` stream tier the same reverse channel
+is reached by writing rumble frames into the `<path>.ff` FIFO, as described
+in [the default tier](#default-tier-the-tmp-event-stream).
 
 The forwarded signal matches a real controller at the level of these event codes,
 ranges, and resolutions, but it is not bit-for-bit identical to a controller
@@ -471,48 +528,68 @@ available. These differences are inherent to the approach.
 
 The package is organised around a host process on Windows and a helper process
 inside WSL connected by the standard input and output streams of the helper.
+The code under `src/com2tty/` is split by where it runs: `cli/` is the
+command-line layer, `core/` holds the dependency-free definitions both sides
+share, `windows/` runs on the Windows interpreter, and `wsl/` runs on the
+Linux interpreter inside WSL.
 
-`cli.py` parses the command line (after `profiles.py` expands any `@profile`
-tokens) and dispatches to an entry function in `host.py`: `run_bridge` in
+`cli/` parses the command line (after `cli/profiles.py` expands any `@profile`
+tokens) and dispatches to an entry function in `windows/`: `run_bridge` in
 serial mode, `run_multi_bridge` when several ports are given, and
-`run_gamepad_bridge` in gamepad mode. `discovery.py` implements `--list`.
-`__main__.py` and the console entry point both call `cli.main`, and
-`__init__.py` holds the package version.
+`run_gamepad_bridge` in gamepad mode. `windows/discovery.py` implements
+`--list` and `windows/doctor.py` implements `--doctor`. `__main__.py` and the
+console entry point both call `cli.main`, and `__init__.py` holds the package
+version.
 
-`host.py` is the Windows side. In serial mode `run_bridge` opens the COM port with
-`pyserial`, spawns the WSL helper with `wsl python3 -u bridge.py`, and runs three
-threads: one relays bytes from the COM port to the helper's standard input, one
-relays bytes from the helper's standard output to the COM port, and one reads the
-helper's standard error. The standard error stream carries a line-oriented control
-protocol whose messages are prefixed with `[CONTROL]`; these messages drive
-dynamic serial-setting changes, the RFC 2217 session lifecycle, and the UF2 upload
-sequence. `host.py` also contains the hot-plug reconnect logic and the routine
-that writes a transferred UF2 image to the correct Windows drive. The board
-detection and reset sequences live in `boards.py`, the UF2 drive lookup and
-AutoPlay suppression in `uf2.py`, and the console colour handling in
-`banner.py`; `host.py` re-exports these names for backwards compatibility.
+`core/` defines the contracts both interpreters rely on: `core/protocol.py`
+holds the `[CONTROL]` message catalogue and the dispatcher the host routes
+stderr lines through, `core/frames.py` the binary gamepad frame codecs,
+`core/boards.py` the USB VID classification with the reset timing data, and
+`core/constants.py` the shared paths, ports, and marker strings.
 
-`bridge.py` is the WSL side for serial forwarding. It creates a pseudo terminal
-with `openpty`, symlinks the requested path to the pseudo-terminal slave, falling
-back to `/tmp` if the requested path is not writable, and runs a `select` loop
-that relays data between the helper's standard input and output and the
-pseudo-terminal master. It also starts the RFC 2217 forwarder thread and the UF2
-relay thread, writes the PlatformIO environment variables into `~/.bashrc`, and
-installs the `picotool` interceptor. `rfc2217_server.py` provides the redirector
-that implements the RFC 2217 protocol for the forwarder.
+`windows/` is the Windows side. In serial mode `run_bridge` in
+`windows/bridge_app.py` opens the COM port with `pyserial`, spawns the WSL
+helper with `wsl python3 -u bridge.py` (through `windows/wsl_process.py`), and
+runs three threads: one relays bytes from the COM port to the helper's
+standard input, one relays bytes from the helper's standard output to the COM
+port, and one reads the helper's standard error. The standard error stream
+carries a line-oriented control protocol whose messages are prefixed with
+`[CONTROL]`; the handlers in `windows/control_handler.py` drive dynamic
+serial-setting changes, the RFC 2217 session lifecycle, and the UF2 upload
+sequence (including the routine that writes a transferred UF2 image to the
+correct Windows drive, via `windows/uf2_flash.py`). The hot-plug reconnect
+logic lives in `windows/serial_host.py` and the board reset sequences in
+`windows/board_reset.py`. The raw OS-level interventions -- AutoPlay
+suppression, Explorer window closing, `WM_DEVICECHANGE` wake-ups, and console
+VT mode -- are isolated under `windows/os_hacks/`.
 
-The gamepad path reuses the same spawn-and-pipe transport. `xinput.py` is the
-Windows side: it polls an XInput controller slot through `ctypes` (preferring
-the `XInputGetStateEx` export so the Guide button is visible) and packs each
-state snapshot into a fixed 16-byte frame, sending a frame only when the state
-changes. `pad_bridge.py` is the WSL side: it parses the frames, translates them
-into evdev events, and writes them to one of two sinks. The default sink writes to
-a `/tmp` FIFO, and the opt-in sink creates a real device through `/dev/uinput`
-using raw `ioctl` calls. Both sinks share the same event-encoding code, so the
-byte stream they produce is identical. In the uinput sink the helper also
-services the kernel's force-feedback upload handshake and streams played
-rumble effects back over its stdout, where the host applies them to the
-physical controller with `XInputSetState`.
+`wsl/` is the WSL side, restricted to the Python standard library.
+`wsl/serial_app.py` (launched through the `bridge.py` shim at the package
+root) creates a pseudo terminal with `openpty` via `wsl/pty_manager.py`,
+symlinks the requested path to the pseudo-terminal slave, falling back to
+`/tmp` if the requested path is not writable, and runs a `select` loop that
+relays data between the helper's standard input and output and the
+pseudo-terminal master. It also starts the RFC 2217 forwarder and UF2 relay
+threads (`wsl/servers/`), writes the PlatformIO environment variables into
+`~/.bashrc` (`wsl/integrations/shell_env.py`), and installs the `picotool`
+interceptor (`wsl/integrations/picotool.py`).
+`windows/rfc2217_redirector.py` provides the redirector that implements the
+RFC 2217 protocol for the forwarder.
+
+The gamepad path reuses the same spawn-and-pipe transport.
+`windows/gamepad_host.py` is the Windows side: it polls an XInput controller
+slot through `ctypes` (preferring the `XInputGetStateEx` export so the Guide
+button is visible) and packs each state snapshot into a fixed 16-byte frame,
+sending a frame only when the state changes. `wsl/gamepad_app.py` (launched
+through the `pad_bridge.py` shim) is the WSL side: it parses the frames,
+translates them into evdev events, and writes them to one of the two sinks in
+`wsl/evdev_sink.py`. The default sink writes to a `/tmp` FIFO, and the opt-in
+sink creates a real device through `/dev/uinput` using raw `ioctl` calls. Both
+sinks share the same event-encoding code, so the byte stream they produce is
+identical. In the uinput sink the helper also services the kernel's
+force-feedback upload handshake and streams played rumble effects back over
+its stdout, where the host applies them to the physical controller with
+`XInputSetState`.
 
 For a detailed account of the control protocol, the board reset sequences, the
 reconnection model, the binary frame formats, and the known hardware-unverified
@@ -571,6 +648,11 @@ convention, the linting requirements, and the manual end-to-end verification
 step, is documented in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Troubleshooting
+
+Run `com2tty --doctor` first: it probes the whole environment (WSL, the
+selected distribution's `python3`, drive automounting, `fuser`, the RFC 2217
+and UF2 relay TCP ports, leftovers from crashed sessions, `/dev/uinput`
+access, and the XInput DLL) and prints one actionable line per check.
 
 At startup com2tty verifies the WSL environment and reports a specific error if
 a prerequisite is missing. The checks and their remedies are:

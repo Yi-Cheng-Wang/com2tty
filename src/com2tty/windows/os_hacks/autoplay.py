@@ -1,91 +1,22 @@
-"""UF2 flash support utilities on the Windows side.
+"""Temporary AutoPlay suppression while a UF2 bootloader drive is mounted.
 
-Drive discovery, USB-serial-to-drive mapping, and the AutoPlay suppression
-used while a UF2 mass-storage bootloader is mounted.
+Windows AutoPlay would pop up an Explorer window (or a toast) the moment the
+BOOTSEL mass-storage drive enumerates, inviting the user to interact with a
+drive the bridge is about to write and unmount. The suppressor flips the
+``DisableAutoplay`` registry value for the duration of the flash and restores
+the exact prior state afterwards -- including across crashes, via a marker
+file persisted *before* the registry is touched.
 """
 import json
 import logging
 import os
-import subprocess
+
+from ...core.constants import AUTOPLAY_MARKER_FILENAME
 
 try:
     import winreg
 except ImportError:
     winreg = None
-
-
-def md5_hexdigest(data):
-    import hashlib
-    try:
-        return hashlib.md5(data, usedforsecurity=False).hexdigest()
-    except TypeError:  # Python < 3.9 has no usedforsecurity flag
-        return hashlib.md5(data).hexdigest()
-
-
-def list_removable_drives():
-    """Candidate roots for the BOOTSEL mass-storage drive.
-
-    Checking the drive type first keeps the scan off disconnected network
-    drives, where os.path.exists can block for tens of seconds.
-    """
-    import string
-    try:
-        import ctypes
-        get_drive_type = ctypes.windll.kernel32.GetDriveTypeW
-        DRIVE_REMOVABLE = 2
-        return [f"{d}:\\" for d in string.ascii_uppercase
-                if get_drive_type(f"{d}:\\") == DRIVE_REMOVABLE]
-    except Exception:
-        return [f"{d}:\\" for d in string.ascii_uppercase
-                if os.path.exists(f"{d}:\\")]
-
-
-def get_drive_by_serial(serial_num):
-    """Use PowerShell/CIM to map a USB Serial Number to a logical Windows Drive Letter.
-
-    The serial number originates from an external USB device descriptor and is
-    therefore untrusted input. It is handed to PowerShell through an environment
-    variable -- never interpolated into the script text -- and matched as a
-    regex-escaped literal, so a hostile serial (containing quotes, ``$(...)``,
-    backticks, or regex metacharacters) cannot inject PowerShell or corrupt the
-    match.
-    """
-    ps_cmd = r'''
-$serial = $env:COM2TTY_TARGET_SERIAL
-$escaped = [regex]::Escape($serial)
-$drives = Get-CimInstance Win32_DiskDrive
-$partitions = Get-Partition
-$result = @()
-foreach ($d in $drives) {
-    if ($d.PNPDeviceID -match $escaped) {
-        foreach ($p in $partitions) {
-            if ($p.DiskNumber -eq $d.Index -and $p.DriveLetter) {
-                $result += [PSCustomObject]@{DriveLetter=($p.DriveLetter + ":\"); PNPDeviceID=$d.PNPDeviceID}
-            }
-        }
-    }
-}
-$result | ConvertTo-Json -Compress
-    '''
-    try:
-        env = dict(os.environ)
-        env["COM2TTY_TARGET_SERIAL"] = serial_num
-        res = subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd],
-                             capture_output=True, text=True,
-                             creationflags=0x08000000, env=env)
-        output = res.stdout.strip()
-        if not output:
-            return None
-
-        data = json.loads(output)
-        if isinstance(data, dict):
-            return data.get('DriveLetter')
-        elif isinstance(data, list) and len(data) > 0:
-            return data[0].get('DriveLetter')
-    except Exception as e:
-        logging.debug(f"Failed to map USB serial to drive: {e}")
-    return None
-
 
 _AUTOPLAY_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Explorer\AutoplayHandlers"
 _AUTOPLAY_VALUE_NAME = "DisableAutoplay"
@@ -93,7 +24,7 @@ _AUTOPLAY_VALUE_NAME = "DisableAutoplay"
 
 def _autoplay_marker_path():
     import tempfile
-    return os.path.join(tempfile.gettempdir(), "com2tty_autoplay_state.json")
+    return os.path.join(tempfile.gettempdir(), AUTOPLAY_MARKER_FILENAME)
 
 
 def _restore_autoplay_state(existed, original_value):
