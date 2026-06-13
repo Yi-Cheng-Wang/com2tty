@@ -33,6 +33,9 @@ package-dir = {"" = "src"}
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"com2tty.wsl" = ["assets/*.in"]
+
 [tool.ruff]
 target-version = "py38"
 line-length = 120
