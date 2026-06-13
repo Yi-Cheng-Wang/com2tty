@@ -18,4 +18,4 @@ if __package__ in (None, ""):  # executed as a script inside WSL
 from com2tty.wsl.serial_app import main  # noqa: E402
 
 if __name__ == "__main__":  # pragma: no cover
-    main()
+    sys.exit(main())

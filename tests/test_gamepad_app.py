@@ -73,7 +73,7 @@ class TestRunGamepadBridge(unittest.TestCase):
         run_gamepad_bridge(pad_index=0)
         _time.sleep(0.05)  # let daemon threads finish for coverage
 
-        proc.terminate.assert_called()  # poll None in finally -> terminate
+        proc.wait.assert_called()  # graceful shutdown waits for helper exit
 
     @patch("builtins.print")
     @patch("com2tty.windows.gamepad_app.get_wsl_path", return_value="/wsl/pad.py")
@@ -115,7 +115,7 @@ class TestRunGamepadBridge(unittest.TestCase):
         run_gamepad_bridge(pad_index=0)
         _time.sleep(0.05)
 
-        proc.terminate.assert_called()
+        proc.wait.assert_called()  # graceful shutdown waits for helper exit
 
     @patch("builtins.print")
     @patch("com2tty.windows.gamepad_app.get_wsl_path", return_value="/wsl/pad.py")
@@ -136,7 +136,32 @@ class TestRunGamepadBridge(unittest.TestCase):
         run_gamepad_bridge(pad_index=0)
         _time.sleep(0.05)
 
-        proc.terminate.assert_called()
+        proc.wait.assert_called()  # graceful shutdown waits for helper exit
+
+    @patch("builtins.print")
+    @patch("com2tty.windows.gamepad_app.time.sleep", side_effect=KeyboardInterrupt())
+    @patch("threading.Thread")
+    @patch("com2tty.windows.gamepad_app.get_wsl_path", return_value="/wsl/pad.py")
+    @patch("os.path.exists", return_value=True)
+    @patch("subprocess.Popen")
+    @patch("com2tty.windows.gamepad_host.GamepadSource")
+    @patch("com2tty.windows.gamepad_app.check_wsl_environment")
+    def test_cleanup_does_not_close_read_pipes(self, mock_check, mock_src_cls,
+                                               mock_pop, mock_ex, mock_wsl,
+                                               mock_thr, mock_sleep, mock_pr):
+        mock_src_cls.return_value = self._fake_src()
+        proc = self._fake_proc(poll=None)
+        mock_pop.return_value = proc
+
+        run_gamepad_bridge(pad_index=0)
+
+        # The read pipes must NOT be closed from the main thread: a daemon
+        # reader is blocked inside read() and closing the pipe would deadlock
+        # on Windows. terminate_wsl_helper closes stdin and lets the helper
+        # exit on EOF instead.
+        proc.stdout.close.assert_not_called()
+        proc.stderr.close.assert_not_called()
+        proc.wait.assert_called()  # graceful shutdown waits for helper exit
 
     # --- mocked threads: deterministic main-loop branches ---
 
@@ -161,7 +186,7 @@ class TestRunGamepadBridge(unittest.TestCase):
         run_gamepad_bridge(pad_index=0)
 
         proc.stdin.write.assert_called()   # send path executed
-        proc.terminate.assert_called()
+        proc.wait.assert_called()  # graceful shutdown waits for helper exit
 
     @patch("builtins.print")
     @patch("com2tty.windows.gamepad_app.time.sleep")

@@ -52,6 +52,28 @@ def open_pty():
     return master_fd, slave_fd, slave_name
 
 
+def _refuse_if_foreign_live_pty(path, our_slave):
+    """Refuse to replace a link pointing at another live session's pty slave.
+
+    The tty path (default /tmp/ttyUSB0) is shared across sessions. Without this
+    guard a second session would unlink the first's link and repoint it at its
+    own pty, silently stealing the first session's serial endpoint. A dangling
+    link (the previous owner's pty is gone) is fair game and is left for the
+    normal unlink/symlink below to replace.
+    """
+    if not os.path.islink(path):
+        return
+    try:
+        dest = os.readlink(path)
+    except OSError:
+        return
+    if dest != our_slave and dest.startswith("/dev/pts/") and os.path.exists(dest):
+        raise FileExistsError(
+            f"{path} is already bound to another live com2tty session's serial "
+            f"device ({dest}); refusing to hijack it. Use a different --wsl-tty "
+            f"path for this session.")
+
+
 def create_symlink_with_fallback(slave_name, target_path):
     """Symlink the pty slave at ``target_path``, falling back to /tmp.
 
@@ -59,8 +81,12 @@ def create_symlink_with_fallback(slave_name, target_path):
     rather than demand sudo, fall back to a user-writable /tmp path and
     print the one-time command that creates the privileged alias.
 
-    Returns the path actually created. Raises when even the fallback fails.
+    Returns the path actually created. Raises when even the fallback fails, or
+    when the target already belongs to another live session (anti-hijack).
     """
+    # Checked before the try so the anti-hijack error propagates instead of
+    # being swallowed into the /tmp fallback below.
+    _refuse_if_foreign_live_pty(target_path, slave_name)
     try:
         if os.path.lexists(target_path):
             os.unlink(target_path)
@@ -68,14 +94,17 @@ def create_symlink_with_fallback(slave_name, target_path):
         sys.stderr.write(f"Successfully symlinked {target_path} -> {slave_name}\n")
         sys.stderr.flush()
         return target_path
-    except PermissionError:
-        # Fallback to /tmp if write permission to dev is denied
+    except OSError:
+        # Fall back to /tmp for any filesystem reason the target path is
+        # unusable -- not just permission denied, but also a read-only
+        # filesystem (EROFS) or a missing parent directory (ENOENT).
         basename = os.path.basename(target_path)
         fallback_path = f"/tmp/{basename}"
         sys.stderr.write(f"Warning: Permission denied creating symlink at {target_path}.\n")
         sys.stderr.write(f"Attempting fallback to user-writable path: {fallback_path}...\n")
         sys.stderr.flush()
 
+        _refuse_if_foreign_live_pty(fallback_path, slave_name)
         if os.path.lexists(fallback_path):
             os.unlink(fallback_path)
         os.symlink(slave_name, fallback_path)

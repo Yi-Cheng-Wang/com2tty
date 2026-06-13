@@ -167,6 +167,10 @@ def check_xinput(os_name=os.name):
 
 def run_doctor(distro=None, rfc2217_port=4000):
     """Run all checks, print one line per result, return the exit status."""
+    # Each WSL probe can block for up to 30s if WSL is cold-starting or hung;
+    # without this the tool looks frozen while it waits.
+    print("Running com2tty environment checks (WSL probes can take a few "
+          "seconds each if WSL is starting up)...", flush=True)
     results = [check_wsl_exe()]
     wsl_ok = results[0][0] == OK
     if wsl_ok:

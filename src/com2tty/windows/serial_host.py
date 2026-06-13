@@ -80,7 +80,16 @@ def get_commstate_baudrate(port, _kernel32=None):
 
     try:
         kernel32 = _kernel32 if _kernel32 is not None else ctypes.windll.kernel32
+        # Declare the Win32 signatures so 64-bit handles/pointers are not
+        # truncated to ctypes' default 32-bit int.
+        kernel32.CreateFileW.argtypes = [
+            ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p]
         kernel32.CreateFileW.restype = ctypes.c_void_p
+        kernel32.GetCommState.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        kernel32.GetCommState.restype = ctypes.c_int  # BOOL
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int  # BOOL
         # The \\.\ prefix is required for COM10 and above, harmless below.
         handle = kernel32.CreateFileW(
             "\\\\.\\" + port, GENERIC_READ | GENERIC_WRITE, 0, None,

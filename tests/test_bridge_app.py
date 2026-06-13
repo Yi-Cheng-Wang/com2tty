@@ -386,7 +386,7 @@ class TestRunBridge(unittest.TestCase):
                    False, 4000)
 
         mock_ser.return_value.close.assert_called()
-        proc.terminate.assert_called()
+        proc.wait.assert_called()  # graceful shutdown waits for helper exit
 
     @patch("com2tty.windows.bridge_app.get_wsl_path", return_value="/wsl/bridge.py")
     @patch("serial.Serial")
@@ -580,7 +580,7 @@ class TestRunBridgeSecondary(unittest.TestCase):
 
         cmd = mock_pop.call_args.args[0]
         self.assertIn("--no-env-setup", cmd)
-        proc.terminate.assert_called()  # poll() None -> terminated in finally
+        proc.wait.assert_called()  # poll() None -> graceful shutdown wait
         # Secondary banner replaces the env-var warning.
         printed = "\n".join(str(c.args[0]) for c in mock_pr.call_args_list
                             if c.args)

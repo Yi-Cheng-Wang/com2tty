@@ -372,15 +372,31 @@ class TmpStreamGamepad(GamepadSink):
 
     @staticmethod
     def _open_fifo(path):
-        # Replace a stale non-FIFO file if one is in the way.
+        # Replace whatever is in the way with a fresh FIFO. Inspect the path
+        # itself with lstat (not stat, which follows symlinks): a symlink --
+        # broken, or pointing at a non-FIFO -- must be removed outright rather
+        # than followed, both to avoid os.stat raising on a dangling link and
+        # to avoid writing through a link an attacker may have planted.
         if os.path.lexists(path):
             try:
-                if not stat.S_ISFIFO(os.stat(path).st_mode):
+                st = os.lstat(path)
+                if stat.S_ISLNK(st.st_mode) or not stat.S_ISFIFO(st.st_mode):
                     os.unlink(path)
             except OSError:
-                os.unlink(path)
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
         if not os.path.exists(path):
-            os.mkfifo(path, 0o666)
+            # Owner-only: the gamepad FIFO carries input events, so a
+            # world-writable pipe would let any local user inject inputs or
+            # read the stream. mkfifo's mode is masked by umask, so clear it
+            # for this call to guarantee the 0o600 bits actually land.
+            old_umask = os.umask(0o077)
+            try:
+                os.mkfifo(path, 0o600)
+            finally:
+                os.umask(old_umask)
         return os.open(path, os.O_RDWR | os.O_NONBLOCK)
 
     def open(self):

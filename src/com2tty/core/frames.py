@@ -40,6 +40,13 @@ def pack_frame(index, connected, buttons=0, lt=0, rt=0,
                lx=0, ly=0, rx=0, ry=0):
     """Build a 16-byte controller frame. Pure function, testable anywhere."""
     flags = 0x01 if connected else 0x00
+    # Clamp the stick axes to the signed 16-bit range. XInput already reports
+    # values in range, but an out-of-range caller would otherwise make
+    # struct.pack raise and crash the host instead of degrading gracefully
+    # (consistent with the masking applied to the other fields).
+    def _clip16(v):
+        return max(-32768, min(32767, v))
+    lx, ly, rx, ry = _clip16(lx), _clip16(ly), _clip16(rx), _clip16(ry)
     return struct.pack(
         FRAME_FORMAT, FRAME_MAGIC0, FRAME_MAGIC1, index & 0xFF, flags,
         buttons & 0xFFFF, lt & 0xFF, rt & 0xFF,

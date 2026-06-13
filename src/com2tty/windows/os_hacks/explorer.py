@@ -18,8 +18,31 @@ from ...core.constants import EXPLORER_WINDOW_CLASS, UF2_VOLUME_LABELS
 WM_CLOSE = 0x0010
 SW_HIDE = 0
 
-#: How often the background closer re-scans the desktop window list.
-CLOSER_SCAN_INTERVAL = 0.01
+#: How often the background closer re-scans the desktop window list. 100 ms
+#: is imperceptible to the user but enumerating every top-level window at
+#: 100 Hz burned noticeable CPU, especially with many windows open.
+CLOSER_SCAN_INTERVAL = 0.1
+
+
+def _declare_window_apis(ctypes, EnumWindows, EnumWindowsProc, GetClassNameW,
+                         GetWindowTextW, ShowWindow, PostMessageW):
+    """Pin the user32 signatures so 64-bit HWNDs are not truncated.
+
+    Window handles are pointer-sized; passed through ctypes' default 32-bit
+    int argument type they would be clipped on 64-bit Windows, addressing the
+    wrong (or no) window.
+    """
+    EnumWindows.argtypes = [EnumWindowsProc, ctypes.c_void_p]
+    EnumWindows.restype = ctypes.c_bool
+    GetClassNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+    GetClassNameW.restype = ctypes.c_int
+    GetWindowTextW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+    GetWindowTextW.restype = ctypes.c_int
+    ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    ShowWindow.restype = ctypes.c_bool
+    PostMessageW.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p]
+    PostMessageW.restype = ctypes.c_bool
 
 
 def close_explorer_for_drive(drive_letter):
@@ -32,6 +55,9 @@ def close_explorer_for_drive(drive_letter):
         GetWindowTextW = ctypes.windll.user32.GetWindowTextW
         ShowWindow = ctypes.windll.user32.ShowWindow
         PostMessageW = ctypes.windll.user32.PostMessageW
+        _declare_window_apis(ctypes, EnumWindows, EnumWindowsProc,
+                             GetClassNameW, GetWindowTextW, ShowWindow,
+                             PostMessageW)
 
         dl = drive_letter[0].upper()
         # Use the parenthesised "(X:)" form Explorer renders in titles; a
@@ -61,7 +87,7 @@ class BootselWindowCloser:
     """Background thread closing BOOTSEL Explorer windows as they appear.
 
     Scans every ``CLOSER_SCAN_INTERVAL`` seconds while a UF2 flash is in
-    progress, so a window AutoPlay manages to open is hidden within ~10 ms.
+    progress, so a window AutoPlay manages to open is hidden within ~100 ms.
     ``target_letters`` is a *live* list: the flash routine appends the
     discovered drive letter once known, and subsequent scans match it too.
     """
@@ -90,6 +116,9 @@ class BootselWindowCloser:
             GetWindowTextW = ctypes.windll.user32.GetWindowTextW
             ShowWindow = ctypes.windll.user32.ShowWindow
             PostMessageW = ctypes.windll.user32.PostMessageW
+            _declare_window_apis(ctypes, EnumWindows, EnumWindowsProc,
+                                 GetClassNameW, GetWindowTextW, ShowWindow,
+                                 PostMessageW)
 
             def foreach_window(hwnd, lParam):
                 class_name = ctypes.create_unicode_buffer(256)

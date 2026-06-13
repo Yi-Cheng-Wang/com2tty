@@ -9,6 +9,16 @@ def enable_vt_mode():
     try:
         import ctypes
         kernel32 = ctypes.windll.kernel32
+        # GetStdHandle returns a HANDLE (pointer-sized); without an explicit
+        # restype ctypes truncates it to a 32-bit int before it is handed to
+        # Get/SetConsoleMode.
+        kernel32.GetStdHandle.argtypes = [ctypes.c_uint32]
+        kernel32.GetStdHandle.restype = ctypes.c_void_p
+        kernel32.GetConsoleMode.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+        kernel32.GetConsoleMode.restype = ctypes.c_int  # BOOL
+        kernel32.SetConsoleMode.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        kernel32.SetConsoleMode.restype = ctypes.c_int  # BOOL
         handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
         mode = ctypes.c_uint32()
         if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):

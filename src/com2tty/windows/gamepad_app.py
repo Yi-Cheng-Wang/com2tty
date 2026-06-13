@@ -99,8 +99,12 @@ def run_gamepad_bridge(pad_index=0, poll_hz=250, name="Microsoft X-Box 360 pad",
                     break
                 for left, right in reader.feed(data):
                     src.set_rumble(left, right)
-        except Exception:
-            pass
+        except Exception as e:
+            # Don't die silently: without this the rumble channel just stops
+            # with no clue why. Shutdown-time pipe errors are expected, so
+            # only surface a failure while the bridge is meant to be running.
+            if not shutdown_event.is_set():
+                logging.warning(f"Gamepad rumble reader thread stopped: {e}")
 
     t_logs = threading.Thread(target=read_wsl_logs, daemon=True)
     t_out = threading.Thread(target=drain_wsl_stdout, daemon=True)
@@ -146,6 +150,11 @@ def run_gamepad_bridge(pad_index=0, poll_hz=250, name="Microsoft X-Box 360 pad",
     finally:
         shutdown_event.set()
         logging.info("Cleaning up gamepad bridge...")
+        # terminate_wsl_helper closes the helper's stdin, which the helper's
+        # select loop sees as EOF and exits on; the daemon reader threads then
+        # unblock when proc.stdout/stderr reach EOF. Do NOT close those read
+        # pipes here: closing a pipe another thread is blocked reading
+        # deadlocks on Windows (the reader holds the file lock).
         terminate_wsl_helper(proc)
         logging.info("Gamepad bridge stopped successfully.")
     return exit_reason
