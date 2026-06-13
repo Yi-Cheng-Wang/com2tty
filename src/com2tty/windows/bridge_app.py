@@ -279,7 +279,9 @@ def _print_bridge_banner(port, board_type, rfc2217_port, usb_serial, env_setup):
         print(f"{yellow}  [WARNING] Environment variables injected into your WSL shell rc (~/.bashrc, ~/.zshrc){reset}")
         print(f"{yellow}  Please OPEN A NEW WSL TERMINAL or run `source ~/.bashrc` (or ~/.zshrc){reset}")
     else:
-        print(f"{cyan}  Secondary bridge: PlatformIO env vars are owned by the first port.{reset}")
+        print(f"{cyan}  Secondary bridge: PlatformIO env vars were set up once by the{reset}")
+        print(f"{cyan}  primary (first) port -- no shell changes are needed here. Use the{reset}")
+        print(f"{cyan}  primary bridge's terminal output for the `source` instructions.{reset}")
     print(f"{yellow}========================================================================{reset}\n")
 
 

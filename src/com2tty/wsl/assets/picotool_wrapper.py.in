@@ -12,6 +12,12 @@ def main():
             break
 
     if not target_file:
+        # Not a flashing invocation (e.g. `picotool info`, `reboot`, `help`):
+        # hand off to the real binary that interception renamed aside, so the
+        # non-flashing subcommands keep working while the bridge is active.
+        real_binary = sys.argv[0] + '.real'
+        if os.path.exists(real_binary):
+            os.execv(real_binary, [real_binary] + args)
         sys.exit(0)
 
     if target_file.endswith('.elf'):

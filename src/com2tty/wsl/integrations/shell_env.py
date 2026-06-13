@@ -8,13 +8,46 @@ sessions do not remove each other's configuration, and stale blocks left by
 crashed sessions are reclaimed on the next injection.
 """
 import os
+import stat
 import sys
+import tempfile
 
 from ...core.constants import (
     RC_MARKER_END_PREFIX as MARKER_END_PREFIX,
     RC_MARKER_START_PREFIX as MARKER_START_PREFIX,
 )
 from ..liveness import pid_alive
+
+
+def _atomic_write_lines(path, lines):
+    """Replace ``path`` with ``lines`` atomically, preserving its mode.
+
+    Rewriting a real shell rc (``~/.bashrc``/``~/.zshrc``) in place with mode
+    ``"w"`` truncates it to zero before the new contents are written; a crash
+    or ``wsl --shutdown`` in that window leaves the user with an empty rc.
+    Instead, write a sibling temp file, flush+fsync it, then ``os.replace`` it
+    over the original so the rc is never observed half-written.
+    """
+    dir_name = os.path.dirname(path) or "."
+    try:
+        orig_mode = stat.S_IMODE(os.stat(path).st_mode)
+    except OSError:
+        orig_mode = None
+    fd, tmp = tempfile.mkstemp(dir=dir_name, prefix=".com2tty-rc-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.writelines(lines)
+            f.flush()
+            os.fsync(f.fileno())
+        if orig_mode is not None:
+            os.chmod(tmp, orig_mode)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def marker_start(pid=None):
@@ -158,8 +191,7 @@ def clean_rc(own_pid=None):
                     continue
                 if not in_block or keep_block:
                     new_lines.append(line)
-            with open(rc_path, "w") as f:
-                f.writelines(new_lines)
+            _atomic_write_lines(rc_path, new_lines)
             sys.stderr.write(f"Cleaned injection from {rc_path}\n")
             sys.stderr.flush()
         except Exception as e:

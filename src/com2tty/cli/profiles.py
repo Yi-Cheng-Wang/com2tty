@@ -93,10 +93,17 @@ def load_profile_args(name, search_paths=None):
 
 
 def expand_profiles(argv, search_paths=None):
-    """Replace every ``@name`` token in argv with that profile's arguments."""
+    """Replace every ``@name`` token in argv with that profile's arguments.
+
+    A literal argument value that must begin with ``@`` can be escaped by
+    doubling the marker: ``@@value`` is passed through as the literal
+    ``@value`` and is never interpreted as a profile reference.
+    """
     expanded = []
     for token in argv:
-        if token.startswith("@") and len(token) > 1:
+        if token.startswith("@@"):
+            expanded.append(token[1:])
+        elif token.startswith("@") and len(token) > 1:
             expanded.extend(load_profile_args(token[1:], search_paths))
         else:
             expanded.append(token)

@@ -9,6 +9,8 @@ pumps bytes between the pty master and the stdio pipes to the Windows host
 import argparse
 import os
 import select
+import signal
+import socket
 import sys
 import threading
 import time
@@ -35,6 +37,48 @@ from .servers.rfc2217_forwarder import run_rfc2217_server_thread
 from .servers.uf2_relay import run_uf2_relay_thread
 
 
+def _install_signal_handlers():
+    """Route terminating signals through the normal (finally) shutdown path.
+
+    The Windows host tears the helper down with ``proc.terminate()``, and the
+    kill-on-close Job Object reaps it when the console window is closed; inside
+    WSL both surface as SIGTERM/SIGHUP. Their default action terminates the
+    process *without* unwinding, so the finally cleanup (the ~/.bashrc block,
+    picotool interception, tty symlink, heartbeats) would be skipped and leak.
+    Raising KeyboardInterrupt instead routes them through the same teardown as
+    Ctrl+C, so every injection is cleaned up exactly as on a normal exit.
+    """
+    def _graceful(signum, frame):
+        raise KeyboardInterrupt
+
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue  # e.g. SIGHUP is absent on Windows
+        try:
+            signal.signal(sig, _graceful)
+        except (OSError, ValueError):
+            pass  # signals can only be installed from the main thread
+
+
+def _tcp_port_in_use(port):
+    """True when 127.0.0.1:port already has an active listener inside WSL.
+
+    Mirrors the servers' bind (SO_REUSEADDR) so the probe agrees with what
+    their real bind would do: it tolerates a TIME_WAIT leftover but reports a
+    live listener as in-use.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind(("127.0.0.1", port))
+        return False
+    except OSError:
+        return True
+    finally:
+        s.close()
+
+
 def build_arg_parser():
     parser = argparse.ArgumentParser(description="com2tty WSL Bridge Helper")
     parser.add_argument(
@@ -59,6 +103,8 @@ def build_arg_parser():
 
 def main():
     args = build_arg_parser().parse_args()
+    # Catch the host's terminate / Job-Object kill so cleanup always runs.
+    _install_signal_handlers()
     env_setup = args.rfc2217_port and not args.no_env_setup
 
     target_path = args.symlink
@@ -70,6 +116,25 @@ def main():
     # WSL clients open and close the virtual serial port.
     master_fd = None
     slave_fd = None
+    exit_code = 0
+
+    # Fail fast on a same-port conflict BEFORE any shared-state side effects
+    # (rc injection, picotool interception, the tty symlink). Starting anyway
+    # would hijack the other live session's shell config and serial endpoint
+    # and silently cross-wire uploads to its board.
+    if args.rfc2217_port:
+        uf2_port = args.rfc2217_port + 1
+        busy = next((p for p in (args.rfc2217_port, uf2_port)
+                     if _tcp_port_in_use(p)), None)
+        if busy is not None:
+            sys.stderr.write(
+                f"Refusing to start: TCP port {busy} is already in use inside "
+                f"WSL (another com2tty session on --rfc2217-port "
+                f"{args.rfc2217_port}?). Starting would hijack that session's "
+                f"shell config and tty link. Choose a different "
+                f"--rfc2217-port.\n")
+            sys.stderr.flush()
+            return 1
 
     if env_setup:
         # Self-heal anything a previous, crashed session left behind before we
@@ -90,7 +155,11 @@ def main():
         if args.rfc2217_port:
             uf2_port = args.rfc2217_port + 1
             alive_ports = [args.rfc2217_port, uf2_port]
-            touch_alive_files(alive_ports)
+            # NOTE: do not write the heartbeat here. The per-port reclaim
+            # (kill_leftover_listener) runs moments later and must not see this
+            # session's own freshly-written marker and mistake it for another
+            # live session holding the port. The select loop below registers
+            # the heartbeat once the ports are actually reclaimed/bound.
             if env_setup:
                 setup_picotool_interceptor(uf2_port)
             t_rfc2217 = threading.Thread(
@@ -119,6 +188,9 @@ def main():
     except Exception:  # pragma: no cover
         sys.stderr.write(f"WSL bridge error: {traceback.format_exc()}\n")
         sys.stderr.flush()
+        # Propagate a non-zero status so the host can tell a crashed helper
+        # apart from a clean shutdown; the finally block still runs cleanup.
+        exit_code = 1
     finally:
         # Clean up symlink and file descriptors
         if env_setup:
@@ -139,6 +211,7 @@ def main():
                 pass
         sys.stderr.write("WSL bridge shut down.\n")
         sys.stderr.flush()
+    return exit_code
 
 
 def _run_select_loop(master_fd, rfc2217_active, uf2_active, alive_ports):
@@ -148,7 +221,10 @@ def _run_select_loop(master_fd, rfc2217_active, uf2_active, alive_ports):
     lines and refreshes the session's per-port heartbeat files.
     """
     last_settings = None
-    last_alive_touch = time.time()
+    # 0.0 so the first loop pass registers the heartbeat immediately (the
+    # premature startup touch was removed to avoid self-detection); from then
+    # on it refreshes every ALIVE_TOUCH_INTERVAL.
+    last_alive_touch = 0.0
 
     while True:
         # Heartbeat: keep the per-port liveness markers fresh so another

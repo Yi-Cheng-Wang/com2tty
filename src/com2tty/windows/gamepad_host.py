@@ -8,6 +8,7 @@ sends 6-byte rumble frames back over its stdout. Both formats are defined
 in ``com2tty.core.frames``.
 """
 import ctypes
+import os
 
 from ..core.frames import (  # noqa: F401 (re-exports kept for compatibility)
     FRAME_FORMAT,
@@ -61,10 +62,16 @@ class _XINPUT_VIBRATION(ctypes.Structure):
 
 
 def _load_xinput():
+    # Load by absolute System32 path rather than bare name so a stray
+    # ``xinput1_4.dll`` in the current working directory cannot be loaded
+    # in preference to the system copy (DLL hijacking).
+    system_dir = os.path.join(
+        os.environ.get("SystemRoot", r"C:\Windows"), "System32")
     last_err = None
     for name in _XINPUT_DLLS:
+        dll_path = os.path.join(system_dir, name + ".dll")
         try:
-            return getattr(ctypes.windll, name)
+            return ctypes.WinDLL(dll_path)
         except OSError as exc:  # pragma: no cover - depends on host DLLs
             last_err = exc
             continue

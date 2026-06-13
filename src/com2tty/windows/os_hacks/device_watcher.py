@@ -75,6 +75,14 @@ class DeviceChangeWatcher:
             user32 = ctypes.windll.user32
             user32.CreateWindowExW.restype = ctypes.c_void_p
             user32.RegisterDeviceNotificationW.restype = ctypes.c_void_p
+            # DefWindowProcW returns an LRESULT (pointer-sized). Without an
+            # explicit restype ctypes truncates it to a 32-bit int, so the
+            # value the window procedure hands back to the OS is corrupted on
+            # 64-bit Windows.
+            user32.DefWindowProcW.restype = ctypes.c_ssize_t
+            user32.DefWindowProcW.argtypes = [
+                ctypes.c_void_p, ctypes.c_uint,
+                ctypes.c_void_p, ctypes.c_void_p]
 
             hwnd = user32.CreateWindowExW(
                 0, "STATIC", "com2tty-devnotify", 0, 0, 0, 0, 0,
