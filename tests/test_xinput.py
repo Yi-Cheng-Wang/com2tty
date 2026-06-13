@@ -1,3 +1,4 @@
+import ntpath
 import os
 import sys
 import unittest
@@ -199,9 +200,11 @@ class TestLoadXinput(unittest.TestCase):
         with patch("com2tty.windows.gamepad_host.ctypes") as mc:
             mc.WinDLL.side_effect = lambda path: seen.append(path) or "ok"
             xi._load_xinput()
-        # Every load attempt used an absolute path rooted at System32, never
-        # a bare name resolvable from the current working directory.
-        self.assertTrue(all(os.path.isabs(p) and "System32" in p for p in seen))
+        # Every load attempt used an absolute Windows path rooted at System32,
+        # never a bare name resolvable from the current working directory. Use
+        # ntpath so the check is correct on non-Windows CI too (the production
+        # path is always a Windows path regardless of the test host).
+        self.assertTrue(all(ntpath.isabs(p) and "System32" in p for p in seen))
 
     def test_raises_when_no_dll_found(self):
         with patch("com2tty.windows.gamepad_host.ctypes") as mc:

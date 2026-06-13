@@ -94,7 +94,10 @@ class TestAssignKillOnCloseJob(unittest.TestCase):
 
     def test_success_uses_default_windll(self):
         k = _ok_kernel32()
-        with patch.object(wp.ctypes, "WinDLL", return_value=k) as m_windll:
+        # create=True so this also runs on non-Windows CI, where ctypes has no
+        # WinDLL attribute to patch.
+        with patch.object(wp.ctypes, "WinDLL", return_value=k,
+                          create=True) as m_windll:
             job = _assign_kill_on_close_job(1234)
         m_windll.assert_called_once()
         self.assertEqual(job, 0x1000)
