@@ -165,12 +165,14 @@ def check_xinput(os_name=os.name):
         return (WARN, "XInput DLL (gamepad)", str(e))
 
 
-def run_doctor(distro=None, rfc2217_port=4000):
-    """Run all checks, print one line per result, return the exit status."""
-    # Each WSL probe can block for up to 30s if WSL is cold-starting or hung;
-    # without this the tool looks frozen while it waits.
-    print("Running com2tty environment checks (WSL probes can take a few "
-          "seconds each if WSL is starting up)...", flush=True)
+def collect_doctor_results(distro=None, rfc2217_port=4000):
+    """Run every applicable check and return a list of (status, label, detail).
+
+    The check chain short-circuits the WSL-dependent probes when WSL itself
+    is missing, exactly like ``run_doctor`` does when printing. Split out so
+    callers that want structured results (e.g. the dashboard's Doctor tab)
+    can render them however they like instead of scraping printed text.
+    """
     results = [check_wsl_exe()]
     wsl_ok = results[0][0] == OK
     if wsl_ok:
@@ -189,6 +191,16 @@ def run_doctor(distro=None, rfc2217_port=4000):
         results.append(check_uinput(distro))
     results.append(check_autoplay_marker())
     results.append(check_xinput())
+    return results
+
+
+def run_doctor(distro=None, rfc2217_port=4000):
+    """Run all checks, print one line per result, return the exit status."""
+    # Each WSL probe can block for up to 30s if WSL is cold-starting or hung;
+    # without this the tool looks frozen while it waits.
+    print("Running com2tty environment checks (WSL probes can take a few "
+          "seconds each if WSL is starting up)...", flush=True)
+    results = collect_doctor_results(distro, rfc2217_port)
 
     for status, label, detail in results:
         line = f"[{status:>4}] {label}"

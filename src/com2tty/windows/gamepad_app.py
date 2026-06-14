@@ -22,6 +22,20 @@ from .wsl_process import (
 )
 
 
+def _log_wsl_line(msg):
+    """Log one line of WSL gamepad-helper stderr at a severity that matches
+    its control marker, so a degraded run (e.g. /dev/uinput not accessible,
+    permission too low) surfaces as a warning instead of hiding among the
+    INFO chatter -- the dashboard turns warnings into toasts.
+    """
+    if "PAD_ERROR" in msg:
+        logging.error(f"[WSL] {msg}")
+    elif "PAD_UINPUT_UNAVAILABLE" in msg or "Falling back" in msg:
+        logging.warning(f"[WSL] {msg}")
+    else:
+        logging.info(f"[WSL] {msg}")
+
+
 def run_gamepad_bridge(pad_index=0, poll_hz=250, name="Microsoft X-Box 360 pad",
                        use_uinput=False, tmp_path="/tmp/com2pad0", distro=None,
                        stop_event=None):
@@ -77,7 +91,7 @@ def run_gamepad_bridge(pad_index=0, poll_hz=250, name="Microsoft X-Box 360 pad",
                     break
                 msg = line.decode("utf-8", errors="replace").rstrip()
                 if msg:
-                    logging.info(f"[WSL] {msg}")
+                    _log_wsl_line(msg)
         except Exception as e:
             if not shutdown_event.is_set():
                 logging.debug(f"Error in WSL log thread: {e}")
@@ -161,6 +175,9 @@ def run_gamepad_bridge(pad_index=0, poll_hz=250, name="Microsoft X-Box 360 pad",
 
 
 def _print_gamepad_banner(pad_index, name, poll_hz, use_uinput, tmp_path):
+    from .os_hacks.console import banners_enabled
+    if not banners_enabled():
+        return
     yellow, cyan, green, reset = get_banner_colors()
     if use_uinput:
         sink_mode = "uinput (real /dev/input device, one-time root)"

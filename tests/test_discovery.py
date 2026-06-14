@@ -11,8 +11,47 @@ from com2tty.windows.discovery import (
     _busid,
     collect_ports,
     format_port_table,
+    list_wsl_distros,
     print_port_list,
 )
+
+
+def _completed(returncode=0, stdout=b""):
+    return SimpleNamespace(returncode=returncode, stdout=stdout)
+
+
+class TestListWslDistros(unittest.TestCase):
+
+    @patch("com2tty.windows.discovery.shutil.which", return_value=None)
+    def test_no_wsl_returns_empty(self, mock_which):
+        self.assertEqual(list_wsl_distros(), [])
+
+    @patch("com2tty.windows.discovery.subprocess.run")
+    @patch("com2tty.windows.discovery.shutil.which", return_value="wsl.exe")
+    def test_decodes_utf16le_lines(self, mock_which, mock_run):
+        # wsl --list --quiet emits UTF-16LE, one distro per line.
+        raw = "Ubuntu-22.04\ndocker-desktop\n".encode("utf-16-le")
+        mock_run.return_value = _completed(0, raw)
+        self.assertEqual(list_wsl_distros(), ["Ubuntu-22.04", "docker-desktop"])
+
+    @patch("com2tty.windows.discovery.subprocess.run")
+    @patch("com2tty.windows.discovery.shutil.which", return_value="wsl.exe")
+    def test_strips_bom_and_blank_lines(self, mock_which, mock_run):
+        raw = "﻿Ubuntu\n\n".encode("utf-16-le")
+        mock_run.return_value = _completed(0, raw)
+        self.assertEqual(list_wsl_distros(), ["Ubuntu"])
+
+    @patch("com2tty.windows.discovery.subprocess.run")
+    @patch("com2tty.windows.discovery.shutil.which", return_value="wsl.exe")
+    def test_nonzero_returncode_is_empty(self, mock_which, mock_run):
+        mock_run.return_value = _completed(1, b"")
+        self.assertEqual(list_wsl_distros(), [])
+
+    @patch("com2tty.windows.discovery.subprocess.run",
+           side_effect=OSError("boom"))
+    @patch("com2tty.windows.discovery.shutil.which", return_value="wsl.exe")
+    def test_subprocess_error_is_empty(self, mock_which, mock_run):
+        self.assertEqual(list_wsl_distros(), [])
 
 
 def _port(device, description="", vid=None, pid=None, location=None,

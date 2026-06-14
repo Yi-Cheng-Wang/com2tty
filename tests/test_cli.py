@@ -239,11 +239,16 @@ class TestCliGamepad(unittest.TestCase):
         mock_pad.assert_called_once()
         mock_serial.assert_not_called()
 
+    @patch("com2tty.windows.dashboard.run_dashboard", return_value=0)
     @patch("sys.argv", ["com2tty"])
-    def test_missing_port_without_gamepad_errors(self):
-        # argparse parser.error raises SystemExit
-        with self.assertRaises(SystemExit):
+    def test_no_args_launches_dashboard(self, mock_dashboard):
+        # No COM port and no other mode flag now drops into the dashboard TUI
+        # instead of erroring on the missing positional argument.
+        with self.assertRaises(SystemExit) as ctx:
             main()
+        self.assertEqual(ctx.exception.code, 0)
+        mock_dashboard.assert_called_once_with(distro=None, rfc2217_port=4000,
+                                               debug=False)
 
     @patch("com2tty.cli.run_gamepad_bridge")
     @patch("sys.argv", ["com2tty", "COM3", "--gamepad"])
@@ -316,6 +321,51 @@ class TestCliGamepad(unittest.TestCase):
         main()
         mock_exit.assert_called_once_with(1)
         mock_tb.assert_called_once()
+
+
+class TestCliDashboard(unittest.TestCase):
+
+    @patch("com2tty.windows.dashboard.run_dashboard", return_value=0)
+    @patch("sys.argv", ["com2tty", "--dashboard"])
+    def test_explicit_dashboard_flag(self, mock_dashboard):
+        with self.assertRaises(SystemExit) as ctx:
+            main()
+        self.assertEqual(ctx.exception.code, 0)
+        mock_dashboard.assert_called_once_with(distro=None, rfc2217_port=4000,
+                                               debug=False)
+
+    @patch("com2tty.windows.dashboard.run_dashboard", return_value=0)
+    @patch("sys.argv", ["com2tty", "--dashboard", "--distro", "Ubuntu",
+                        "--rfc2217-port", "5000", "--debug"])
+    def test_dashboard_propagates_options(self, mock_dashboard):
+        with self.assertRaises(SystemExit):
+            main()
+        mock_dashboard.assert_called_once_with(distro="Ubuntu",
+                                               rfc2217_port=5000, debug=True)
+
+    @patch("com2tty.windows.dashboard.run_dashboard", return_value=1)
+    @patch("sys.argv", ["com2tty", "--dashboard"])
+    def test_dashboard_exit_status_propagates(self, mock_dashboard):
+        with self.assertRaises(SystemExit) as ctx:
+            main()
+        self.assertEqual(ctx.exception.code, 1)
+
+    @patch("com2tty.windows.dashboard.run_dashboard")
+    @patch("com2tty.cli.run_bridge")
+    @patch("sys.argv", ["com2tty", "COM3"])
+    def test_port_does_not_launch_dashboard(self, mock_run, mock_dashboard):
+        main()
+        mock_dashboard.assert_not_called()
+        mock_run.assert_called_once()
+
+    @patch("com2tty.windows.dashboard.run_dashboard")
+    @patch("com2tty.windows.doctor.run_doctor", return_value=0)
+    @patch("sys.argv", ["com2tty", "--doctor"])
+    def test_doctor_does_not_launch_dashboard(self, mock_doctor, mock_dashboard):
+        with self.assertRaises(SystemExit):
+            main()
+        mock_dashboard.assert_not_called()
+        mock_doctor.assert_called_once()
 
 
 if __name__ == "__main__":

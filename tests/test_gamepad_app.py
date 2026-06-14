@@ -9,9 +9,36 @@ import time as _time
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
 from com2tty.windows.gamepad_app import (
+    _log_wsl_line,
     run_gamepad_bridge,
     run_multi_gamepad_bridge,
 )
+
+
+class TestWslLogLevel(unittest.TestCase):
+    """WSL stderr lines are logged at a severity matching their marker."""
+
+    @patch("com2tty.windows.gamepad_app.logging")
+    def test_uinput_unavailable_is_warning(self, mock_log):
+        _log_wsl_line("[CONTROL] PAD_UINPUT_UNAVAILABLE: Permission denied")
+        mock_log.warning.assert_called_once()
+        mock_log.info.assert_not_called()
+
+    @patch("com2tty.windows.gamepad_app.logging")
+    def test_fallback_line_is_warning(self, mock_log):
+        _log_wsl_line("Falling back to the root-free /tmp stream at /tmp/x")
+        mock_log.warning.assert_called_once()
+
+    @patch("com2tty.windows.gamepad_app.logging")
+    def test_pad_error_is_error(self, mock_log):
+        _log_wsl_line("[CONTROL] PAD_ERROR: cannot init sink: boom")
+        mock_log.error.assert_called_once()
+
+    @patch("com2tty.windows.gamepad_app.logging")
+    def test_ordinary_line_is_info(self, mock_log):
+        _log_wsl_line("[CONTROL] PAD_READY: real device created")
+        mock_log.info.assert_called_once()
+        mock_log.warning.assert_not_called()
 
 
 class TestRunGamepadBridge(unittest.TestCase):

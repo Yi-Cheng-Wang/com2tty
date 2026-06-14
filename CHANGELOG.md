@@ -4,6 +4,35 @@ All notable changes to com2tty are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Interactive dashboard (`--dashboard`): a Textual terminal user interface that
+  manages serial and gamepad forwarding and the environment doctor from a single
+  screen. It lists detected COM ports and XInput controller slots in tables that
+  refresh on a timer, attaches and detaches devices, allocates a distinct WSL
+  endpoint and RFC 2217 port to each attached serial device automatically,
+  switches the active WSL distribution, renders the doctor results, tails a
+  unified activity log, surfaces action-required messages as dismissable notices
+  in the lower-right corner, and renders the README inside the terminal with F1.
+  The layout reflows to the terminal size.
+- `textual`, version 0.40.0 or later, is now a host runtime dependency used only
+  by the dashboard. The command-line modes do not require it, and the dashboard
+  prints an installation hint and exits with a non-zero status when it cannot be
+  imported.
+
+### Changed
+
+- Running `com2tty` with no positional COM port and no other mode flag now opens
+  the dashboard instead of reporting a missing-argument error. The command-line
+  modes are unchanged and remain available for scripting and one-shot bridges.
+
+### Fixed
+
+- A WSL distribution passed with `--distro` is now honoured by the dashboard
+  rather than reset to the default distribution when the interface starts.
+
 ## [0.3.1] - 2026-06-13
 
 ### Added
