@@ -264,6 +264,9 @@ def _resolve_board_type(port, board):
 
 
 def _print_bridge_banner(port, board_type, rfc2217_port, usb_serial, env_setup):
+    from .os_hacks.console import banners_enabled
+    if not banners_enabled():
+        return
     yellow, cyan, green, reset = get_banner_colors()
     board_label = BOARD_LABELS.get(board_type, board_type)
     print(f"\n{yellow}========================================================================{reset}")

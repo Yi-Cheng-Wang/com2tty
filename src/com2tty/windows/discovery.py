@@ -4,9 +4,47 @@ Enumerates the serial ports Windows can see -- including the USB bus
 location ("bus id", e.g. ``2-6``) read straight from the device descriptor,
 so no usbipd is needed -- and classifies the board family by USB VID.
 """
+import shutil
+import subprocess
+
 import serial.tools.list_ports
 
 from ..core.boards import classify_vid
+from ..core.constants import CREATE_NO_WINDOW
+
+
+def list_wsl_distros():
+    """Return the names of installed WSL distributions (best-effort).
+
+    ``wsl --list --quiet`` prints one distribution name per line. On Windows
+    the output is UTF-16LE (often with a BOM), so it is decoded as such and
+    the trailing NUL/whitespace noise is stripped. Any failure -- WSL not
+    installed, the call erroring or timing out -- yields an empty list, so the
+    dashboard can treat "no distributions" and "could not ask" identically and
+    simply fall back to the default distribution.
+    """
+    if shutil.which("wsl") is None:
+        return []
+    try:
+        res = subprocess.run(
+            ["wsl", "--list", "--quiet"],
+            capture_output=True, timeout=10,
+            creationflags=CREATE_NO_WINDOW,
+        )
+    except Exception:
+        return []
+    if res.returncode != 0:
+        return []
+    # Drop NULs and any byte-order mark before splitting; str.strip() leaves
+    # a leading U+FEFF in place, which would corrupt the first distro name.
+    text = (res.stdout or b"").decode("utf-16-le", errors="replace")
+    text = text.replace("\x00", "").replace("﻿", "")
+    distros = []
+    for line in text.splitlines():
+        name = line.strip()
+        if name:
+            distros.append(name)
+    return distros
 
 
 def _busid(location):

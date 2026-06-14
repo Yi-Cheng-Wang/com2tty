@@ -63,6 +63,14 @@ def main():
     )
 
     parser.add_argument(
+        "--dashboard",
+        action="store_true",
+        help="Launch the interactive management dashboard (TUI). This is also "
+             "the default when com2tty is run with no COM port and no other "
+             "mode flag."
+    )
+
+    parser.add_argument(
         "--wait",
         action="store_true",
         help="Serial mode: if the COM port is not present yet, wait for it "
@@ -227,6 +235,18 @@ def main():
         stream=sys.stderr
     )
 
+    # Dashboard is the zero-config default: with no COM port and no other
+    # mode flag (or an explicit --dashboard), drop into the interactive TUI
+    # instead of erroring on the missing positional argument. Explicit
+    # command-line modes below still win when their flags/ports are given.
+    wants_cli_mode = (parsed_args.doctor or parsed_args.list_ports
+                      or parsed_args.gamepad or bool(parsed_args.port))
+    if parsed_args.dashboard or not wants_cli_mode:
+        from com2tty.windows.dashboard import run_dashboard
+        sys.exit(run_dashboard(distro=parsed_args.distro,
+                               rfc2217_port=parsed_args.rfc2217_port,
+                               debug=parsed_args.debug))
+
     if parsed_args.doctor:
         from com2tty.windows.doctor import run_doctor
         sys.exit(run_doctor(distro=parsed_args.distro,
@@ -280,8 +300,13 @@ def main():
             sys.exit(1)
         return
 
-    if not parsed_args.port:
-        parser.error("the 'port' argument is required unless --gamepad or --list is used")
+    # Defensive guard: the no-port case is already handled by the dashboard
+    # dispatch above (no port and no mode flag enters the dashboard), so by the
+    # time control reaches here a port has always been supplied. Kept against
+    # future changes to that dispatch; it is therefore intentionally uncovered.
+    if not parsed_args.port:  # pragma: no cover
+        parser.error("the 'port' argument is required unless --gamepad, "
+                     "--list, or --dashboard is used")
 
     # A respawned bridge re-opens the COM port from scratch; the device may
     # re-enumerate while WSL restarts, so waiting for it is implied.

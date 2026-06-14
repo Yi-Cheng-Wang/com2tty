@@ -2,6 +2,22 @@
 import os
 import sys
 
+# The CLI prints multi-line colour banners straight to stdout. That is fine on
+# a normal terminal, but the dashboard TUI owns the screen -- raw prints punch
+# holes through the Textual layout. The dashboard flips this off while it runs
+# (and surfaces the important banner content as notifications instead).
+_BANNERS_ENABLED = True
+
+
+def set_banners_enabled(enabled):
+    """Enable/disable the stdout startup banners process-wide."""
+    global _BANNERS_ENABLED
+    _BANNERS_ENABLED = bool(enabled)
+
+
+def banners_enabled():
+    return _BANNERS_ENABLED
+
 
 def enable_vt_mode():
     """Enable ANSI escape processing on the Windows console (legacy conhost
