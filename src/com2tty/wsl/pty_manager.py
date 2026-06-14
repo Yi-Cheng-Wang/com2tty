@@ -74,6 +74,45 @@ def _refuse_if_foreign_live_pty(path, our_slave):
             f"path for this session.")
 
 
+def _link_fallback(slave_name, fallback_path, basename):
+    """Create the /tmp fallback link, dodging the sticky-bit ownership trap.
+
+    /tmp is world-writable but sticky (+t): a pre-existing ``/tmp/ttyUSB0``
+    owned by another user cannot be unlinked, so ``os.unlink`` raises
+    ``PermissionError``. Rather than crash, retreat to a user-scoped path
+    (``/tmp/ttyUSB0_<user>``, then ``..._<pid>``) that this process owns.
+    """
+    candidates = [fallback_path]
+    try:
+        import getpass
+        # getpass.getuser() trusts user-controllable env vars (USER/LOGNAME);
+        # take only the final path component so a value like "../x" cannot
+        # steer the symlink out of /tmp.
+        username = os.path.basename(getpass.getuser())
+        if username:
+            candidates.append(f"/tmp/{basename}_{username}")
+    except Exception:
+        pass
+    candidates.append(f"/tmp/{basename}_{os.getpid()}")
+
+    last_err = None
+    for path in candidates:
+        try:
+            _refuse_if_foreign_live_pty(path, slave_name)
+            if os.path.lexists(path):
+                os.unlink(path)
+            os.symlink(slave_name, path)
+            return path
+        except PermissionError as exc:
+            last_err = exc
+            sys.stderr.write(
+                f"Warning: cannot use {path} (permission denied, sticky /tmp?); "
+                "trying a user-scoped path.\n")
+            sys.stderr.flush()
+            continue
+    raise last_err
+
+
 def create_symlink_with_fallback(slave_name, target_path):
     """Symlink the pty slave at ``target_path``, falling back to /tmp.
 
@@ -104,10 +143,7 @@ def create_symlink_with_fallback(slave_name, target_path):
         sys.stderr.write(f"Attempting fallback to user-writable path: {fallback_path}...\n")
         sys.stderr.flush()
 
-        _refuse_if_foreign_live_pty(fallback_path, slave_name)
-        if os.path.lexists(fallback_path):
-            os.unlink(fallback_path)
-        os.symlink(slave_name, fallback_path)
+        fallback_path = _link_fallback(slave_name, fallback_path, basename)
 
         sys.stderr.write(f"Fallback successful: {fallback_path} -> {slave_name}\n")
         sys.stderr.write("--------------------------------------------------\n")
