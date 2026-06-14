@@ -1,11 +1,15 @@
-"""Tests for the dashboard TUI (com2tty.windows.dashboard.app) and the
+"""Tests for the dashboard TUI (com2tty.windows.dashboard) and the
 ``run_dashboard`` entry point.
 
 The view is exercised through Textual's headless ``run_test`` pilot. Each
 scenario builds a ``DashboardApp`` with a fake ``BridgeManager`` (so no real
 WSL helper is spawned) and patches port/distro discovery, then drives the same
-handlers the UI invokes. Async scenarios are wrapped in ``asyncio.run`` so the
-file stays plain ``unittest`` like the rest of the suite.
+tab-widget methods the UI invokes. Async scenarios are wrapped in
+``asyncio.run`` so the file stays plain ``unittest`` like the rest of the suite.
+
+Since the v4 refactor each pane is its own widget (``SerialTab``,
+``GamepadTab``, ``DoctorTab``); the attach/detach/run logic lives on those tabs
+and the shared chrome (notices, distro switch, summary) lives on the app.
 """
 import asyncio
 import logging
@@ -24,7 +28,10 @@ from textual.widgets import Button, DataTable, MarkdownViewer, Select, Static
 from com2tty.windows.dashboard.app import (
     PAD_SLOTS,
     DashboardApp,
+    DoctorTab,
+    GamepadTab,
     ReadmeScreen,
+    SerialTab,
     _local_readme,
     _readme_text,
 )
@@ -60,9 +67,21 @@ def _build_app():
     return app
 
 
+def _serial_tab(app):
+    return app.query_one(SerialTab)
+
+
+def _gamepad_tab(app):
+    return app.query_one(GamepadTab)
+
+
+def _doctor_tab(app):
+    return app.query_one(DoctorTab)
+
+
 @asynccontextmanager
 async def _running(ports=PORTS, distros=("Ubuntu",), size=(100, 30)):
-    with patch("com2tty.windows.dashboard.app.collect_ports",
+    with patch("com2tty.windows.dashboard._tabs.collect_ports",
                side_effect=lambda: list(ports)), \
          patch("com2tty.windows.dashboard.app.list_wsl_distros",
                return_value=list(distros)):
@@ -102,14 +121,14 @@ class TestReadmeHelpers(unittest.TestCase):
         self.assertGreater(len(text), 100)
 
     def test_readme_text_falls_back_to_package_metadata(self):
-        with patch("com2tty.windows.dashboard.app._local_readme",
+        with patch("com2tty.windows.dashboard._constants._local_readme",
                    return_value=None):
             text = _readme_text()
         self.assertTrue(text)
 
     def test_readme_text_none_when_unavailable(self):
         import importlib.metadata as md
-        with patch("com2tty.windows.dashboard.app._local_readme",
+        with patch("com2tty.windows.dashboard._constants._local_readme",
                    return_value=None), \
              patch.object(md, "metadata", side_effect=Exception("boom")):
             self.assertIsNone(_readme_text())
@@ -142,6 +161,21 @@ class TestDashboardMount(unittest.TestCase):
                 self.assertIn("no serial ports", str(serial.get_row_at(0)[0]))
         asyncio.run(scenario())
 
+    def test_tab_content_is_laid_out_and_visible(self):
+        # Regression: wrapping each pane in a plain Widget collapsed it to zero
+        # height, hiding the table and pushing the docked action bar to a
+        # negative y (off-screen). The tab widgets must be vertical containers
+        # that fill their TabPane, so the active tab's content has real height
+        # and its action bar stays on-screen.
+        async def scenario():
+            async with _running(size=(100, 40)) as (app, _):
+                serial = app.query_one(SerialTab)
+                self.assertGreater(serial.size.height, 0)
+                self.assertGreater(
+                    app.query_one("#serial-table", DataTable).size.height, 0)
+                self.assertGreaterEqual(app.query_one(".actionbar").region.y, 0)
+        asyncio.run(scenario())
+
     def test_unmount_restores_log_handlers(self):
         async def scenario():
             root = logging.getLogger()
@@ -163,7 +197,7 @@ class TestSerialFlow(unittest.TestCase):
             async with _running() as (app, pilot):
                 table = app.query_one("#serial-table", DataTable)
                 table.move_cursor(row=0)
-                app._attach_serial()
+                _serial_tab(app).attach()
                 await pilot.pause()
                 self.assertTrue(app.manager.is_attached("serial", "COM3"))
                 self.assertEqual(str(table.get_row_at(0)[3]), "/tmp/ttyUSB0")
@@ -183,7 +217,7 @@ class TestSerialFlow(unittest.TestCase):
                 app.query_one("#serial-stopbits", Select).value = 2.0
                 app.query_one("#serial-xonxoff").value = True
                 app.query_one("#serial-table", DataTable).move_cursor(row=0)
-                app._attach_serial()
+                _serial_tab(app).attach()
                 await pilot.pause()
                 call = app.manager._serial_runner.calls[0]
                 self.assertEqual(call["baud"], "115200")
@@ -198,7 +232,7 @@ class TestSerialFlow(unittest.TestCase):
         async def scenario():
             async with _running(ports=[]) as (app, pilot):
                 # The placeholder row maps to no device.
-                app._attach_serial()
+                _serial_tab(app).attach()
                 await pilot.pause()
                 self.assertEqual(len(app._notices), 1)
                 self.assertEqual(app.manager.list_bridges(), [])
@@ -208,9 +242,9 @@ class TestSerialFlow(unittest.TestCase):
         async def scenario():
             async with _running() as (app, pilot):
                 app.query_one("#serial-table", DataTable).move_cursor(row=0)
-                app._attach_serial()
+                _serial_tab(app).attach()
                 await pilot.pause()
-                app._attach_serial()  # COM3 already attached
+                _serial_tab(app).attach()  # COM3 already attached
                 await pilot.pause()
                 # First notice = attach instructions; second = "already attached".
                 self.assertEqual(len(app._notices), 2)
@@ -220,9 +254,9 @@ class TestSerialFlow(unittest.TestCase):
         async def scenario():
             async with _running() as (app, pilot):
                 app.query_one("#serial-table", DataTable).move_cursor(row=0)
-                app._attach_serial()
+                _serial_tab(app).attach()
                 await pilot.pause()
-                app._detach_serial()
+                _serial_tab(app).detach()
                 await app.workers.wait_for_complete()
                 await pilot.pause()
                 self.assertFalse(app.manager.is_attached("serial", "COM3"))
@@ -232,7 +266,7 @@ class TestSerialFlow(unittest.TestCase):
         async def scenario():
             async with _running() as (app, pilot):
                 app.query_one("#serial-table", DataTable).move_cursor(row=0)
-                app._detach_serial()
+                _serial_tab(app).detach()
                 await app.workers.wait_for_complete()
                 await pilot.pause()
                 self.assertGreaterEqual(len(app._notices), 1)
@@ -241,7 +275,7 @@ class TestSerialFlow(unittest.TestCase):
     def test_refresh_action_and_periodic(self):
         async def scenario():
             ports = list(PORTS)
-            with patch("com2tty.windows.dashboard.app.collect_ports",
+            with patch("com2tty.windows.dashboard._tabs.collect_ports",
                        side_effect=lambda: list(ports)), \
                  patch("com2tty.windows.dashboard.app.list_wsl_distros",
                        return_value=[]):
@@ -270,12 +304,12 @@ class TestGamepadFlow(unittest.TestCase):
             async with _running() as (app, pilot):
                 table = app.query_one("#gamepad-table", DataTable)
                 table.move_cursor(row=1)
-                app._attach_gamepad()
+                _gamepad_tab(app).attach()
                 await pilot.pause()
                 self.assertTrue(app.manager.is_attached("gamepad", 1))
                 self.assertEqual(str(table.get_row_at(1)[1]), "/tmp/com2pad1")
                 self.assertIn("1 pad", _summary(app))
-                app._detach_gamepad()
+                _gamepad_tab(app).detach()
                 await app.workers.wait_for_complete()
                 await pilot.pause()
                 self.assertFalse(app.manager.is_attached("gamepad", 1))
@@ -286,7 +320,7 @@ class TestGamepadFlow(unittest.TestCase):
             async with _running() as (app, pilot):
                 app.query_one("#gamepad-table", DataTable).move_cursor(row=0)
                 app.query_one("#gamepad-poll").value = "fast"
-                app._attach_gamepad()
+                _gamepad_tab(app).attach()
                 await pilot.pause()
                 self.assertEqual(len(app._notices), 1)
                 self.assertFalse(app.manager.is_attached("gamepad", 0))
@@ -299,7 +333,7 @@ class TestGamepadFlow(unittest.TestCase):
                 app.query_one("#gamepad-uinput").value = True
                 with patch("com2tty.windows.doctor.check_uinput",
                            return_value=("WARN", "/dev/uinput", "not accessible")):
-                    app._attach_gamepad()
+                    _gamepad_tab(app).attach()
                     await app.workers.wait_for_complete()
                     await pilot.pause()
                 warnings = [n for n in app._notices
@@ -311,7 +345,7 @@ class TestGamepadFlow(unittest.TestCase):
         async def scenario():
             async with _running() as (app, pilot):
                 app.query_one("#gamepad-table", DataTable).move_cursor(row=0)
-                app._detach_gamepad()
+                _gamepad_tab(app).detach()
                 await app.workers.wait_for_complete()
                 await pilot.pause()
                 self.assertGreaterEqual(len(app._notices), 1)
@@ -342,10 +376,11 @@ class TestDoctor(unittest.TestCase):
     def test_render_doctor_summary_variants(self):
         async def scenario():
             async with _running() as (app, _):
-                app._render_doctor_results([("OK", "a", "")])
+                doctor = _doctor_tab(app)
+                doctor.render_results([("OK", "a", "")])
                 self.assertIn("All checks passed",
                               _doctor_summary(app))
-                app._render_doctor_results([("OK", "a", ""), ("WARN", "b", "x")])
+                doctor.render_results([("OK", "a", ""), ("WARN", "b", "x")])
                 self.assertIn("warning",
                               _doctor_summary(app))
         asyncio.run(scenario())
@@ -465,7 +500,7 @@ class TestResponsiveAndChrome(unittest.TestCase):
 
     def test_constructor_distro_kept_in_options(self):
         async def scenario():
-            with patch("com2tty.windows.dashboard.app.collect_ports",
+            with patch("com2tty.windows.dashboard._tabs.collect_ports",
                        return_value=[]), \
                  patch("com2tty.windows.dashboard.app.list_wsl_distros",
                        return_value=["Ubuntu"]):
@@ -512,25 +547,36 @@ class TestCoverageFill(unittest.TestCase):
     def test_button_dispatch_routes_every_id(self):
         async def scenario():
             async with _running() as (app, pilot):
-                for bid in ("serial-attach", "serial-detach", "serial-refresh",
-                            "gamepad-attach", "gamepad-detach", "doctor-run",
-                            "distro-refresh"):
-                    btn = app.query_one(f"#{bid}", Button)
-                    app.on_button_pressed(Button.Pressed(btn))
-                    await pilot.pause()
+                serial = _serial_tab(app)
+                gamepad = _gamepad_tab(app)
+                doctor = _doctor_tab(app)
+                # Each tab handles and stops its own buttons.
+                tab_buttons = [
+                    (serial, "serial-attach"), (serial, "serial-detach"),
+                    (serial, "serial-refresh"), (gamepad, "gamepad-attach"),
+                    (gamepad, "gamepad-detach"), (doctor, "doctor-run"),
+                ]
                 with patch("com2tty.windows.doctor.collect_doctor_results",
                            return_value=[("OK", "x", "")]):
+                    for tab, bid in tab_buttons:
+                        btn = app.query_one(f"#{bid}", Button)
+                        tab.on_button_pressed(Button.Pressed(btn))
+                        await pilot.pause()
                     await app.workers.wait_for_complete()
+                # App-level chrome buttons route through the app handler.
+                app.on_button_pressed(
+                    Button.Pressed(app.query_one("#distro-refresh", Button)))
                 await pilot.pause()
         asyncio.run(scenario())
 
     def test_attach_serial_read_options_error(self):
         async def scenario():
             async with _running() as (app, pilot):
+                serial = _serial_tab(app)
                 app.query_one("#serial-table", DataTable).move_cursor(row=0)
-                with patch.object(app, "_read_serial_options",
+                with patch.object(serial, "read_options",
                                   side_effect=ValueError("bad opt")):
-                    app._attach_serial()
+                    serial.attach()
                     await pilot.pause()
                 self.assertTrue(any("bad opt" in getattr(n, "notice_message", "")
                                     for n in app._notices))
@@ -539,7 +585,7 @@ class TestCoverageFill(unittest.TestCase):
     def test_detach_serial_no_selection(self):
         async def scenario():
             async with _running(ports=[]) as (app, pilot):
-                app._detach_serial()
+                _serial_tab(app).detach()
                 await app.workers.wait_for_complete()
                 await pilot.pause()
                 self.assertGreaterEqual(len(app._notices), 1)
@@ -548,15 +594,16 @@ class TestCoverageFill(unittest.TestCase):
     def test_gamepad_no_selection_warns(self):
         async def scenario():
             async with _running() as (app, pilot):
+                gamepad = _gamepad_tab(app)
                 table = app.query_one("#gamepad-table", DataTable)
                 # Push the cursor past the real slots so the selection resolves
                 # to None (clearing the table does not reset cursor_row).
                 table.add_row("x", "-", "-")
                 table.move_cursor(row=len(PAD_SLOTS))
-                self.assertIsNone(app._selected_slot())
-                app._attach_gamepad()
+                self.assertIsNone(gamepad.selected_slot())
+                gamepad.attach()
                 await pilot.pause()
-                app._detach_gamepad()
+                gamepad.detach()
                 await app.workers.wait_for_complete()
                 await pilot.pause()
                 self.assertGreaterEqual(len(app._notices), 1)
@@ -566,9 +613,9 @@ class TestCoverageFill(unittest.TestCase):
         async def scenario():
             async with _running() as (app, pilot):
                 app.query_one("#gamepad-table", DataTable).move_cursor(row=0)
-                app._attach_gamepad()
+                _gamepad_tab(app).attach()
                 await pilot.pause()
-                app._attach_gamepad()  # slot 0 already attached
+                _gamepad_tab(app).attach()  # slot 0 already attached
                 await pilot.pause()
                 self.assertTrue(any("already attached"
                                     in getattr(n, "notice_message", "")
@@ -578,7 +625,7 @@ class TestCoverageFill(unittest.TestCase):
     def test_periodic_refresh_swallows_errors(self):
         async def scenario():
             async with _running() as (app, pilot):
-                with patch("com2tty.windows.dashboard.app.collect_ports",
+                with patch("com2tty.windows.dashboard._tabs.collect_ports",
                            side_effect=OSError("enum failed")):
                     app._periodic_refresh()  # must not raise
                 await pilot.pause()
@@ -587,7 +634,7 @@ class TestCoverageFill(unittest.TestCase):
     def test_restore_cursor_when_selection_vanishes(self):
         async def scenario():
             ports = list(PORTS)
-            with patch("com2tty.windows.dashboard.app.collect_ports",
+            with patch("com2tty.windows.dashboard._tabs.collect_ports",
                        side_effect=lambda: list(ports)), \
                  patch("com2tty.windows.dashboard.app.list_wsl_distros",
                        return_value=[]):
@@ -596,7 +643,7 @@ class TestCoverageFill(unittest.TestCase):
                     await pilot.pause()
                     app.query_one("#serial-table", DataTable).move_cursor(row=1)
                     ports.pop()  # remove the selected COM5
-                    app.refresh_serial_table()
+                    _serial_tab(app).refresh_table()
                     await pilot.pause()
                     self.assertEqual(
                         app.query_one("#serial-table", DataTable).row_count, 1)
@@ -605,7 +652,7 @@ class TestCoverageFill(unittest.TestCase):
     def test_invalid_theme_is_ignored(self):
         async def scenario():
             with patch("com2tty.windows.dashboard.app.THEME", "no-such-theme"), \
-                 patch("com2tty.windows.dashboard.app.collect_ports",
+                 patch("com2tty.windows.dashboard._tabs.collect_ports",
                        return_value=[]), \
                  patch("com2tty.windows.dashboard.app.list_wsl_distros",
                        return_value=[]):
@@ -638,7 +685,7 @@ class TestCoverageFill(unittest.TestCase):
         class _BadPath:
             def read_text(self, encoding=None):
                 raise OSError("locked")
-        with patch("com2tty.windows.dashboard.app._local_readme",
+        with patch("com2tty.windows.dashboard._constants._local_readme",
                    return_value=_BadPath()):
             text = _readme_text()
         self.assertTrue(text)  # fell back to package metadata

@@ -255,6 +255,43 @@ class TestInjectRc(unittest.TestCase):
              patch("com2tty.wsl.integrations.shell_env.clean_rc"):
             inject_rc(4000)  # should not raise
 
+    def test_append_is_atomic(self):
+        # The block must be written through _atomic_write_lines, never an
+        # in-place append that a crash could truncate (issue 5).
+        f = tempfile.NamedTemporaryFile(mode="w", suffix=".bashrc", delete=False)
+        f.write("old\n")
+        f.close()
+        try:
+            # clean_rc (called first) is stubbed so the only atomic write left
+            # is the injection itself.
+            with patch("com2tty.wsl.integrations.shell_env.get_rc_files",
+                       return_value=[f.name]), \
+                 patch("com2tty.wsl.integrations.shell_env.clean_rc"), \
+                 patch("com2tty.wsl.integrations.shell_env._atomic_write_lines") as m_atomic:
+                inject_rc(4000)
+            m_atomic.assert_called_once()
+            written_path, written_lines = m_atomic.call_args.args
+            self.assertEqual(written_path, f.name)
+            self.assertEqual(written_lines[0], "old\n")
+            self.assertTrue(any(MARKER_START in ln for ln in written_lines))
+        finally:
+            os.unlink(f.name)
+
+    def test_preserves_existing_content_exactly(self):
+        f = tempfile.NamedTemporaryFile(mode="w", suffix=".bashrc", delete=False)
+        f.write("line1\nline2\n")
+        f.close()
+        try:
+            with patch("com2tty.wsl.integrations.shell_env.get_rc_files",
+                       return_value=[f.name]):
+                inject_rc(4000)
+            with open(f.name) as fh:
+                text = fh.read()
+            self.assertTrue(text.startswith("line1\nline2\n"))
+            self.assertIn(MARKER_END, text)
+        finally:
+            os.unlink(f.name)
+
 
 
 class TestFishConf(unittest.TestCase):

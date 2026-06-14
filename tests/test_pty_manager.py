@@ -61,6 +61,82 @@ class TestCreateSymlinkAntiHijack(unittest.TestCase):
         m_symlink.assert_not_called()
 
 
+class TestStickyBitFallback(unittest.TestCase):
+    """When the privileged target is unwritable, the /tmp fallback must cope
+    with a sticky /tmp that forbids unlinking another user's link (issue 2)."""
+
+    @patch("os.path.islink", return_value=False)
+    @patch("os.path.lexists", return_value=True)
+    def test_permission_error_retries_user_scoped_path(self, m_lex, m_islink):
+        # target symlink fails (privileged path) -> fall back to /tmp; the
+        # first /tmp candidate cannot be unlinked (sticky-bit, foreign owner),
+        # so a user-scoped candidate is used instead.
+        def fake_symlink(src, dst):
+            if dst == "/dev/ttyUSB0":
+                raise OSError("read-only fs")
+            # /tmp candidates succeed.
+
+        def fake_unlink(path):
+            if path == "/tmp/ttyUSB0":
+                raise PermissionError("sticky /tmp, not owner")
+
+        with patch("os.symlink", create=True, side_effect=fake_symlink) as m_sym, \
+                patch("os.unlink", create=True, side_effect=fake_unlink), \
+                patch("getpass.getuser", return_value="alice"):
+            result = create_symlink_with_fallback("/dev/pts/3", "/dev/ttyUSB0")
+
+        self.assertEqual(result, "/tmp/ttyUSB0_alice")
+        m_sym.assert_any_call("/dev/pts/3", "/tmp/ttyUSB0_alice")
+
+    @patch("os.path.islink", return_value=False)
+    @patch("os.path.lexists", return_value=False)
+    def test_plain_tmp_fallback_when_no_permission_problem(self, m_lex, m_islink):
+        def fake_symlink(src, dst):
+            if dst == "/dev/ttyUSB0":
+                raise OSError("read-only fs")
+
+        with patch("os.symlink", create=True, side_effect=fake_symlink), \
+                patch("os.unlink", create=True):
+            result = create_symlink_with_fallback("/dev/pts/3", "/dev/ttyUSB0")
+
+        self.assertEqual(result, "/tmp/ttyUSB0")
+
+    @patch("os.path.islink", return_value=False)
+    @patch("os.path.lexists", return_value=True)
+    def test_getuser_failure_falls_through_to_pid(self, m_lex, m_islink):
+        # If getpass.getuser() raises (no resolvable username), the user-scoped
+        # candidate is skipped and the pid-scoped one is used.
+        def fake_symlink(src, dst):
+            if dst == "/dev/ttyUSB0":
+                raise OSError("read-only fs")
+
+        def fake_unlink(path):
+            if path == "/tmp/ttyUSB0":
+                raise PermissionError("sticky /tmp")
+
+        with patch("os.symlink", create=True, side_effect=fake_symlink), \
+                patch("os.unlink", create=True, side_effect=fake_unlink), \
+                patch("getpass.getuser", side_effect=OSError("no username")), \
+                patch("os.getpid", return_value=4242):
+            result = create_symlink_with_fallback("/dev/pts/3", "/dev/ttyUSB0")
+
+        self.assertEqual(result, "/tmp/ttyUSB0_4242")
+
+    @patch("os.path.islink", return_value=False)
+    @patch("os.path.lexists", return_value=True)
+    def test_raises_when_every_candidate_denied(self, m_lex, m_islink):
+        def fake_symlink(src, dst):
+            if dst == "/dev/ttyUSB0":
+                raise OSError("read-only fs")
+
+        with patch("os.symlink", create=True, side_effect=fake_symlink), \
+                patch("os.unlink", create=True,
+                      side_effect=PermissionError("denied")), \
+                patch("getpass.getuser", return_value="bob"):
+            with self.assertRaises(PermissionError):
+                create_symlink_with_fallback("/dev/pts/3", "/dev/ttyUSB0")
+
+
 class TestGetPtySettings(unittest.TestCase):
 
     def test_8n1_9600(self):
