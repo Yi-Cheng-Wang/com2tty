@@ -214,6 +214,53 @@ host parses those frames with the shared `RumbleReader` from `core/frames.py`
 and drives the physical controller's motors through `XInputSetState`. The FIFO sink has no
 reverse channel and therefore no force feedback.
 
+## The dashboard
+
+The interactive dashboard is a terminal user interface built on Textual. It is
+the default when `com2tty` runs with no positional COM port and no other mode
+flag, and it can be requested explicitly with `--dashboard`. It lives under
+`windows/dashboard/` and is deliberately split into a view and a service so that
+the management logic can be tested without a terminal.
+
+`windows/dashboard/manager.py` holds `BridgeManager`, the service layer. It owns
+no Textual dependency. Each attached device runs as one daemon thread that calls
+the existing `run_bridge` or `run_gamepad_bridge` entry point with a
+`threading.Event` stop signal, which those functions already honour, so the
+dashboard reuses the same session code as the command line rather than
+reimplementing it. The manager allocates resources the way `run_multi_bridge`
+does up front: every serial attach takes the lowest free slot index, from which
+it derives a distinct WSL endpoint (`/tmp/ttyUSB0`, `/tmp/ttyUSB1`, and so on),
+a distinct RFC 2217 port (the base port plus twice the index, the `+1` reserved
+for the UF2 relay), and the `env_setup` flag, which is set only for slot zero so
+that just one bridge writes the PlatformIO shell configuration. Detaching a
+device, or a bridge thread ending on its own, frees the slot for reuse, so the
+allocation stays compact as devices come and go. The runner callables are
+injectable, which is how the test suite drives the manager with fakes instead of
+spawning real WSL helpers.
+
+`windows/dashboard/app.py` holds `DashboardApp`, the Textual view, and a modal
+`ReadmeScreen`. Two measures keep the existing session code, which was written
+for a plain terminal, from corrupting the full-screen interface. First, the
+serial and gamepad sessions print colour banners to standard output and the
+command-line layer logs to standard error; both would punch through the Textual
+screen, so on mount the application silences the banners through
+`set_banners_enabled` in `windows/os_hacks/console.py` and detaches the root
+logger's stream handlers, routing every log record into an on-screen log widget
+instead, and it restores both on exit. Second, the action-required content of
+those banners is re-surfaced as dismissable notices, and any warning or error is
+also raised as a notice, so the operator is not expected to notice it in the
+scrolling log. The device tables refresh on a timer that rebuilds a table only
+when its content actually changed, so an unplugged device updates without
+flicker. The layout is responsive: breakpoint classes toggled on the screen from
+the resize handler reflow it, placing the log beside the tabs on a wide terminal
+and below them otherwise. The README that the F1 binding renders in the terminal
+is read from the checkout's `README.md` when one is found by walking up to the
+project root, and otherwise from the long description embedded in the installed
+package metadata, so the documentation shown always matches the running version.
+When Textual cannot be imported, `windows/dashboard/__init__.py` prints an
+installation hint and returns a non-zero status rather than failing, leaving the
+command-line modes usable.
+
 ## Binary frame formats
 
 Both gamepad frame formats are defined once in `core/frames.py` and imported by
@@ -258,7 +305,14 @@ orchestrate the serial and gamepad sessions (`run_bridge`,
 `run_multi_gamepad_bridge`); `gamepad_host.py` polls XInput;
 `rfc2217_redirector.py` adapts pyserial's RFC 2217 machinery to the pipe;
 `uf2_flash.py` locates the bootloader drive; `discovery.py` and `doctor.py`
-implement `--list` and `--doctor`. The `windows/os_hacks/` facade isolates
+implement `--list` and `--doctor` (and `discovery.py` also enumerates the
+installed WSL distributions for the dashboard's distribution selector). The
+`windows/dashboard/` package is the interactive terminal interface: `__init__.py`
+exposes `run_dashboard` and degrades gracefully when Textual is absent,
+`manager.py` holds the `BridgeManager` service that runs and tracks the bridge
+sessions as threads with per-device endpoint and port allocation, and `app.py`
+holds the Textual `DashboardApp` view and its modal README reader. The
+`windows/os_hacks/` facade isolates
 the raw OS-level interventions: `autoplay.py` (registry AutoPlay
 suppression with crash recovery), `explorer.py` (closing Explorer windows
 on the bootloader drive), `device_watcher.py` (`WM_DEVICECHANGE` wake-ups),
@@ -275,9 +329,11 @@ picotool interception with its `assets/` wrapper template.
 
 ## Dependencies and integration points
 
-The Windows host depends only on `pyserial`. The WSL helper uses only the Python
-standard library, so the guest distribution needs nothing beyond `python3` on its
-`PATH`. The bridge integrates with PlatformIO by exporting
+The Windows host depends on `pyserial` for the serial transport and on `textual`
+for the interactive dashboard; the command-line modes need only `pyserial`, and
+the dashboard degrades to an installation hint when `textual` is absent. The WSL
+helper uses only the Python standard library, so the guest distribution needs
+nothing beyond `python3` on its `PATH`. The bridge integrates with PlatformIO by exporting
 `PLATFORMIO_UPLOAD_PORT` and `PLATFORMIO_MONITOR_PORT` into the WSL user's shell
 startup files for bash, zsh, and fish, and with esptool, bossac, and `picotool`
 through the RFC 2217 forwarder and the UF2 relay. On minimal distributions the
