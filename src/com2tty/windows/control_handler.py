@@ -74,7 +74,12 @@ class SettingsHandler:
         changes = []
         with self._lock:
             for part in parts:
-                k, v = part.split("=")
+                # A malformed token (no '=') must not abort the whole update;
+                # skip it and keep applying the remaining settings.
+                if "=" not in part:
+                    logging.warning(f"Skipping malformed settings token: {part!r}")
+                    continue
+                k, v = part.split("=", 1)
                 if k == "baud" and v != "None":
                     new_baud = int(v)
                     # 0 is the termios B0 hangup pseudo-rate;
@@ -133,7 +138,7 @@ class Rfc2217SessionController:
     """
 
     def __init__(self, proc, ser, board_type, usb_serial, shutdown_event,
-                 rfc2217_active_event, rfc2217_data_queue):
+                 rfc2217_active_event, rfc2217_data_queue, ser_lock=None):
         self._proc = proc
         self._ser = ser
         self._board_type = board_type
@@ -141,6 +146,11 @@ class Rfc2217SessionController:
         self._shutdown_event = shutdown_event
         self._active_event = rfc2217_active_event
         self._data_queue = rfc2217_data_queue
+        # The same lock the dynamic-SETTINGS handler holds. Passing it upholds
+        # reopen_serial_port's documented contract -- a reopen's close/open is
+        # serialised against any other thread that cycles this handle -- rather
+        # than letting it fall back to a private, uncoordinated lock.
+        self._ser_lock = ser_lock
         self._redirector_stop = None
         self._redirector_thread = None
         # Application-port name to restore after a SAMD bootloader upload.
@@ -237,7 +247,8 @@ class Rfc2217SessionController:
             if self._samd_app_port:
                 ser.port = self._samd_app_port
             if not reopen_serial_port(ser, self._usb_serial,
-                                      self._shutdown_event, max_attempts=60):
+                                      self._shutdown_event, max_attempts=60,
+                                      ser_lock=self._ser_lock):
                 logging.warning("[SAMD] Application port did not reappear "
                                 "after upload.")
             self._samd_app_port = None
@@ -262,7 +273,7 @@ class Uf2UploadController:
     REOPEN_ATTEMPTS = 60         # x 0.5 s = up to 30 s for post-flash reboot
 
     def __init__(self, proc, ser, board_type, usb_serial, shutdown_event,
-                 uf2_active_event, uf2_data_queue):
+                 uf2_active_event, uf2_data_queue, ser_lock=None):
         self._proc = proc
         self._ser = ser
         self._board_type = board_type
@@ -270,6 +281,11 @@ class Uf2UploadController:
         self._shutdown_event = shutdown_event
         self._active_event = uf2_active_event
         self._data_queue = uf2_data_queue
+        # The same lock the dynamic-SETTINGS handler holds. Passing it upholds
+        # reopen_serial_port's documented contract -- the post-flash reopen's
+        # close/open is serialised against any other thread that cycles this
+        # handle -- rather than falling back to a private, uncoordinated lock.
+        self._ser_lock = ser_lock
 
     def on_ready(self, msg):
         port_str = msg.payload if msg.payload is not None else "?"
@@ -329,18 +345,21 @@ class Uf2UploadController:
             closer = BootselWindowCloser(target_letters)
             closer.start()
 
-        with AutoplaySuppressor():
-            # Trigger BOOTSEL mode directly from host — this is the reliable path.
-            # The RFC2217 1200bps open/close from PlatformIO may not reliably
-            # reach the COM port through the relay chain, so we do it ourselves.
-            if self._board_type in UF2_FAMILIES:
-                pico_manual_reset(self._ser)
+        try:
+            with AutoplaySuppressor():
+                # Trigger BOOTSEL mode directly from host — this is the reliable path.
+                # The RFC2217 1200bps open/close from PlatformIO may not reliably
+                # reach the COM port through the relay chain, so we do it ourselves.
+                if self._board_type in UF2_FAMILIES:
+                    pico_manual_reset(self._ser)
 
-            logging.info("[UF2] Locating target drive...")
-            self._flash(uf2_data, target_letters)
-
-        if closer is not None:
-            closer.stop()
+                logging.info("[UF2] Locating target drive...")
+                self._flash(uf2_data, target_letters)
+        finally:
+            # Always stop the window-closer thread, even if the flash raises,
+            # so it does not leak and keep polling Explorer indefinitely.
+            if closer is not None:
+                closer.stop()
 
     def on_upload_end(self, msg):
         # After UF2 flash, the Pico reboots and the COM port
@@ -355,7 +374,8 @@ class Uf2UploadController:
             # then USB CDC re-enumeration by Windows.
             if not reopen_serial_port(self._ser, self._usb_serial,
                                       self._shutdown_event,
-                                      max_attempts=self.REOPEN_ATTEMPTS):
+                                      max_attempts=self.REOPEN_ATTEMPTS,
+                                      ser_lock=self._ser_lock):
                 logging.error("[UF2] COM port did not reappear after 30s. Bridge may not function until device reconnects.")
         self._active_event.clear()
         logging.info("[UF2] Upload pipeline complete.")
@@ -437,7 +457,7 @@ def build_control_dispatcher(proc, ser, shutdown_event, rfc2217_active_event,
 
     rfc = Rfc2217SessionController(proc, ser, board_type, usb_serial,
                                    shutdown_event, rfc2217_active_event,
-                                   rfc2217_data_queue)
+                                   rfc2217_data_queue, ser_lock=ser_lock)
     dispatcher.register(protocol.RFC2217_READY, rfc.on_ready)
     dispatcher.register(protocol.RFC2217_CONNECT, rfc.on_connect)
     dispatcher.register(protocol.RFC2217_DISCONNECT, rfc.on_disconnect)
@@ -445,7 +465,7 @@ def build_control_dispatcher(proc, ser, shutdown_event, rfc2217_active_event,
 
     uf2 = Uf2UploadController(proc, ser, board_type, usb_serial,
                               shutdown_event, uf2_active_event,
-                              uf2_data_queue)
+                              uf2_data_queue, ser_lock=ser_lock)
     dispatcher.register(protocol.UF2_READY, uf2.on_ready)
     dispatcher.register(protocol.UF2_UPLOAD_START, uf2.on_upload_start)
     dispatcher.register(protocol.UF2_UPLOAD_END, uf2.on_upload_end)

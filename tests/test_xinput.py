@@ -142,6 +142,33 @@ class TestSetRumble(unittest.TestCase):
         self.assertTrue(src.set_rumble(0x1FFFF, -1))
 
 
+class TestCtypesSignatures(unittest.TestCase):
+    """XInput functions must have explicit argtypes/restype so ctypes does
+    not guess (truncating the unsigned return and mis-sizing the pointer
+    arguments on 64-bit) (issue 3)."""
+
+    def _source(self):
+        import ctypes
+        fake_dll = MagicMock()
+        fake_dll.__getitem__.return_value = fake_dll.XInputGetState
+        with patch("com2tty.windows.gamepad_host._load_xinput", return_value=fake_dll):
+            return xi.GamepadSource(0), ctypes
+
+    def test_get_state_signature_declared(self):
+        src, ctypes = self._source()
+        self.assertEqual(src._get_state.restype, ctypes.c_ulong)
+        self.assertEqual(
+            src._get_state.argtypes,
+            [ctypes.c_ulong, ctypes.POINTER(xi._XINPUT_STATE)])
+
+    def test_set_state_signature_declared(self):
+        src, ctypes = self._source()
+        self.assertEqual(src._set_state.restype, ctypes.c_ulong)
+        self.assertEqual(
+            src._set_state.argtypes,
+            [ctypes.c_ulong, ctypes.POINTER(xi._XINPUT_VIBRATION)])
+
+
 class TestRumbleReader(unittest.TestCase):
 
     def test_roundtrip_with_pad_bridge(self):

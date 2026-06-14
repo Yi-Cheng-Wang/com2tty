@@ -210,14 +210,18 @@ def inject_rc(port, monitor_path="/tmp/ttyUSB0"):
     )
     for rc_path in get_rc_files():
         try:
-            prefix = ""
+            lines = []
             if os.path.exists(rc_path):
                 with open(rc_path, "r") as f:
-                    content = f.read()
-                    if content and not content.endswith("\n"):
-                        prefix = "\n"
-            with open(rc_path, "a") as f:
-                f.write(prefix + block)
+                    lines = f.readlines()
+                # Guarantee the existing content ends with a newline so the
+                # appended block starts on its own line.
+                if lines and not lines[-1].endswith("\n"):
+                    lines[-1] = lines[-1] + "\n"
+            lines.append(block)
+            # Append atomically: a crash mid-write must not leave the user's
+            # rc file truncated or half-written (it is sourced by every shell).
+            _atomic_write_lines(rc_path, lines)
             sys.stderr.write(f"Injected environment variables to {rc_path}\n")
             sys.stderr.flush()
         except Exception as e:
