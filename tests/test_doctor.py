@@ -20,6 +20,7 @@ from com2tty.windows.doctor import (
     check_uinput,
     check_autoplay_marker,
     check_xinput,
+    collect_doctor_results,
     run_doctor,
 )
 
@@ -319,5 +320,23 @@ class TestRunDoctor(unittest.TestCase):
                 p.stop()
 
 
-if __name__ == "__main__":
-    unittest.main()
+class TestCollectDoctorResults(unittest.TestCase):
+    """The structured API behind both run_doctor and the dashboard's table."""
+
+    @patch("com2tty.windows.doctor.check_xinput",
+           return_value=(OK, "XInput DLL", ""))
+    @patch("com2tty.windows.doctor.check_autoplay_marker",
+           return_value=(OK, "AutoPlay marker", "none"))
+    @patch("com2tty.windows.doctor.check_wsl_exe",
+           return_value=(FAIL, "wsl.exe on PATH", "not found"))
+    def test_returns_structured_tuples_and_gates_on_wsl(
+            self, mock_wsl, mock_marker, mock_xinput):
+        results = collect_doctor_results(distro=None, rfc2217_port=4000)
+        # Every entry is a (status, label, detail) triple.
+        for status, label, detail in results:
+            self.assertIn(status, (OK, WARN, FAIL, SKIP))
+            self.assertIsInstance(label, str)
+        labels = [label for _, label, _ in results]
+        # WSL missing: no in-WSL probe ran, but host-side checks still did.
+        self.assertNotIn("python3 in WSL", labels)
+        self.assertIn("XInput DLL", labels)

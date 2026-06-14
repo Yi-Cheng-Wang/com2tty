@@ -7,9 +7,49 @@ import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
 from com2tty.windows.os_hacks.console import (
+    banners_enabled,
     enable_vt_mode,
     get_banner_colors,
+    set_banners_enabled,
 )
+
+
+class TestBannerToggle(unittest.TestCase):
+
+    def tearDown(self):
+        # Never leave banners disabled for other tests / the CLI.
+        set_banners_enabled(True)
+
+    def test_default_enabled(self):
+        self.assertTrue(banners_enabled())
+
+    def test_toggle_off_and_on(self):
+        set_banners_enabled(False)
+        self.assertFalse(banners_enabled())
+        set_banners_enabled(True)
+        self.assertTrue(banners_enabled())
+
+    def test_disabled_banner_prints_nothing(self):
+        from com2tty.windows.bridge_app import _print_bridge_banner
+        import io
+        from contextlib import redirect_stdout
+
+        set_banners_enabled(False)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            _print_bridge_banner("COM3", "rp2040", 4000, "ABC123", True)
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_disabled_gamepad_banner_prints_nothing(self):
+        from com2tty.windows.gamepad_app import _print_gamepad_banner
+        import io
+        from contextlib import redirect_stdout
+
+        set_banners_enabled(False)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            _print_gamepad_banner(0, "Pad", 250, False, "/tmp/com2pad0")
+        self.assertEqual(buf.getvalue(), "")
 
 
 class TestBannerColors(unittest.TestCase):
