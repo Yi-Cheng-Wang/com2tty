@@ -32,6 +32,28 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - A WSL distribution passed with `--distro` is now honoured by the dashboard
   rather than reset to the default distribution when the interface starts.
+- The post-upload serial-port reopen is now serialised against the
+  dynamic-settings handler. The RFC 2217 and UF2 upload controllers now share
+  that handler's lock instead of each falling back to a private one, extending
+  the 0.3.0 reopen-lock fix to cover the upload-path reopens.
+- The WSL helper no longer crashes when the user-writable `/tmp` fallback for
+  the tty symlink is blocked by the sticky bit. If `/tmp/ttyUSB0` is owned by
+  another user and cannot be unlinked, the helper retreats to a user-scoped
+  path (`/tmp/ttyUSB0_<user>`, then a PID-scoped one) instead of raising a
+  `PermissionError`.
+- The XInput functions (`XInputGetState`, the undocumented `XInputGetStateEx`,
+  and `XInputSetState`) now declare their `ctypes` argument and return types, so
+  the unsigned 32-bit status is not truncated and the pointer arguments are
+  sized correctly on 64-bit Python.
+- A malformed dynamic line-settings token from WSL (one without `=`) is now
+  skipped with a warning instead of aborting the whole settings update, so the
+  remaining valid tokens still apply.
+- The serial-mode environment-variable injection now appends to the shell
+  startup files atomically. The 0.3.1 fix made the cleanup rewrite atomic, but
+  the append path still used a plain append that a crash could leave truncated.
+- A failed UF2 flash no longer leaks the background Explorer-window-closer
+  thread. The closer is now stopped in a `finally` block, so an error during the
+  flash cannot leave it polling indefinitely.
 
 ## [0.3.1] - 2026-06-13
 

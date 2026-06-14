@@ -614,10 +614,13 @@ Linux interpreter inside WSL.
 `cli/` parses the command line (after `cli/profiles.py` expands any `@profile`
 tokens) and dispatches to an entry function in `windows/`: `run_bridge` in
 serial mode, `run_multi_bridge` when several ports are given, and
-`run_gamepad_bridge` in gamepad mode. `windows/discovery.py` implements
-`--list` and `windows/doctor.py` implements `--doctor`. `__main__.py` and the
-console entry point both call `cli.main`, and `__init__.py` holds the package
-version.
+`run_gamepad_bridge` in gamepad mode. The layer is split by responsibility:
+`cli/parser.py` declares the flag surface, `cli/dispatch.py` selects and runs
+exactly one mode, and `cli/__init__.py` wires the two together under a single
+top-level error boundary (so a `KeyboardInterrupt` is a clean exit and any
+other failure is logged once and exits non-zero). `windows/discovery.py`
+implements `--list` and `windows/doctor.py` implements `--doctor`. `__main__.py`
+and the console entry point both call `cli.main`.
 
 When no COM port and no other mode flag is given, or when `--dashboard` is
 passed, `cli.main` calls `run_dashboard` in `windows/dashboard/`, the interactive
@@ -626,9 +629,13 @@ management. `windows/dashboard/manager.py` holds a `BridgeManager` that starts,
 stops, and tracks the same `run_bridge` and `run_gamepad_bridge` sessions as
 background threads and assigns each attached serial device a distinct WSL
 endpoint and RFC 2217 port, and `windows/dashboard/app.py` is the Textual
-application that renders the tabs, the activity log, and the device tables and
-drives the manager. The manager carries no user-interface dependency, so it is
-tested directly; only the application imports Textual.
+application that supplies the shared chrome -- the header, the WSL-distro
+switcher, the dismissable notice strip, and the activity log -- and sequences
+startup and shutdown. Each pane is its own widget in `windows/dashboard/_tabs.py`
+(`SerialTab`, `GamepadTab`, `DoctorTab`); a tab owns its table, its form, and
+its attach/detach/run logic and drives the manager directly. The manager
+carries no user-interface dependency, so it is tested directly; only the
+application imports Textual.
 
 `core/` defines the contracts both interpreters rely on: `core/protocol.py`
 holds the `[CONTROL]` message catalogue and the dispatcher the host routes

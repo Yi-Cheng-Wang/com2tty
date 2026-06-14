@@ -238,8 +238,23 @@ allocation stays compact as devices come and go. The runner callables are
 injectable, which is how the test suite drives the manager with fakes instead of
 spawning real WSL helpers.
 
-`windows/dashboard/app.py` holds `DashboardApp`, the Textual view, and a modal
-`ReadmeScreen`. Two measures keep the existing session code, which was written
+`windows/dashboard/app.py` holds `DashboardApp`, the Textual view. The
+application itself supplies only the shared chrome -- the header, the WSL-distro
+switcher, the dismissable notice strip, the status-bar device tally, and the
+activity log -- and sequences startup and shutdown; it does not contain the
+per-pane logic. Each of the three panes is a self-contained widget in
+`windows/dashboard/_tabs.py`: `SerialTab`, `GamepadTab`, and `DoctorTab`. A tab
+owns its table, its form fields, and its attach, detach, or run logic, and it
+drives the `BridgeManager` directly, reaching the application only for the
+shared chrome it does not own, such as raising a notice or updating the device
+tally. The tab widgets are vertical containers, so each fills its tab pane and
+lays its table and docked action bar out correctly rather than collapsing. The
+modal README reader, `ReadmeScreen`, lives in `windows/dashboard/_screens.py`.
+The remaining helper modules separate the stylesheet (`_styles.py`), the logging
+handler that feeds the on-screen log (`_log_handler.py`), and the shared
+constants together with the README lookup (`_constants.py`).
+
+Two measures keep the existing session code, which was written
 for a plain terminal, from corrupting the full-screen interface. First, the
 serial and gamepad sessions print colour banners to standard output and the
 command-line layer logs to standard error; both would punch through the Textual
@@ -282,9 +297,13 @@ holds the package version, `__main__.py` lets the package run as
 `python -m com2tty`, and `bridge.py`/`pad_bridge.py` are the WSL entry shims
 described under "The transport".
 
-`cli/` is the user-interface layer: `cli/__init__.py` defines the argument
-parser, expands `@profile` tokens, and dispatches to the mode facades;
-`cli/profiles.py` loads named argument sets from an INI file.
+`cli/` is the user-interface layer, split by responsibility: `cli/parser.py`
+declares the argument surface, `cli/dispatch.py` selects and runs exactly one
+mode by calling the facades in `windows/`, and `cli/__init__.py` expands
+`@profile` tokens and wires the two together under a single top-level error
+boundary, so a `KeyboardInterrupt` exits cleanly and any other failure is logged
+once and exits non-zero. `cli/profiles.py` loads named argument sets from an INI
+file.
 
 `core/` contains the dependency-free definitions both interpreters share:
 `constants.py` (paths, ports, marker strings, timing), `protocol.py` (the
@@ -310,8 +329,14 @@ installed WSL distributions for the dashboard's distribution selector). The
 `windows/dashboard/` package is the interactive terminal interface: `__init__.py`
 exposes `run_dashboard` and degrades gracefully when Textual is absent,
 `manager.py` holds the `BridgeManager` service that runs and tracks the bridge
-sessions as threads with per-device endpoint and port allocation, and `app.py`
-holds the Textual `DashboardApp` view and its modal README reader. The
+sessions as threads with per-device endpoint and port allocation, `app.py` holds
+the Textual `DashboardApp` that supplies the shared chrome and sequences startup
+and shutdown, `_tabs.py` holds the three self-contained pane widgets
+(`SerialTab`, `GamepadTab`, `DoctorTab`) that own their tables, forms, and
+attach, detach, and run logic, `_screens.py` holds the modal README reader, and
+`_styles.py`, `_log_handler.py`, and `_constants.py` hold the stylesheet, the
+on-screen log handler, and the shared constants with the README lookup
+respectively. The
 `windows/os_hacks/` facade isolates
 the raw OS-level interventions: `autoplay.py` (registry AutoPlay
 suppression with crash recovery), `explorer.py` (closing Explorer windows
