@@ -41,7 +41,7 @@ to Linux tools running in WSL.
 
 The Windows host requires Python 3.8 or later. Two runtime dependencies are
 installed automatically with the package: `pyserial`, version 3.5 or later,
-which drives the serial transport, and `textual`, version 0.40.0 or later, which
+which drives the serial transport, and `textual`, version 1.0.0 or later, which
 renders the interactive dashboard described under [Dashboard mode](#dashboard-mode).
 The command-line modes do not require `textual`; if it cannot be imported, the
 dashboard prints an installation hint and the command-line modes continue to
@@ -216,8 +216,16 @@ and flow control), then attach it. Each attached port is assigned a distinct WSL
 endpoint and RFC 2217 port automatically, shown in the table's Endpoint column,
 so several ports can be bridged concurrently without manual bookkeeping; the
 first attached port owns the PlatformIO environment setup, exactly as in
-multi-port command-line mode. Detaching a port stops its bridge and frees its
-endpoint for reuse.
+multi-port command-line mode. A "Link under /dev" option (in the advanced
+settings) requests the endpoint under `/dev`, mirroring the gamepad uinput tier:
+the device is served under the user-writable `/tmp` path, and the dashboard
+continuously checks whether the `/dev` path resolves to it. While the one-time
+alias is missing it shows the `/tmp` path and pops the `sudo ln -sf` command to
+create the alias; the moment you run that command the Endpoint column switches
+to the `/dev` path automatically, with no need to re-attach (and it reverts to
+`/tmp` if the alias is later removed). The device name (the `ttyUSB0` part) is
+yours to choose through the "WSL path" field, and the `/dev` link reuses that
+name. Detaching a port stops its bridge and frees its endpoint for reuse.
 
 The Gamepads tab lists the four XInput controller slots. Select a slot, set the
 polling rate, the advertised device name, and whether to use the privileged
@@ -232,10 +240,16 @@ Action-required messages, such as the instruction to reload the WSL shell after
 an attach, appear as dismissable notice cards in the lower-right corner; warnings
 and errors surface there as well. Each card is closed with its close control;
 information and warning cards also clear themselves after a short delay, while
-error cards remain until dismissed. Pressing F1 opens the project README rendered
-inside the terminal, so the documentation is available without leaving the
-application. The layout reflows to the size of the terminal, placing the activity
-log beside the tabs on a wide window and below them on a narrow one.
+error cards remain until dismissed. Pressing F1 opens the project README,
+rendered as Markdown inside the terminal (with a close button), so the
+documentation is available without leaving the application; drag to select a
+passage and press Ctrl+C to copy it. When an
+action needs a one-time privileged step the operator lacks -- the `/dev/uinput`
+setup for the gamepad uinput tier, or exposing a serial device under `/dev` --
+the dashboard pops a small dialog containing the exact commands with a button
+that copies them to the clipboard. The layout reflows to the size of the
+terminal, placing the activity log beside the tabs on a wide window and below
+them on a narrow one.
 
 If the `textual` dependency cannot be imported, `com2tty` prints an installation
 hint instead of starting the dashboard, and the command-line modes described
@@ -320,8 +334,9 @@ port directly.
 Frequently used argument sets can be saved as named profiles in an INI file,
 either `com2tty.ini` in the current directory or `.com2tty.ini` in the user
 profile directory. Keys are the long option names (dashes and underscores are
-both accepted), `port` supplies the positional argument, and boolean keys
-take `true` or `false`.
+both accepted), `port` supplies the positional argument (and may list several
+whitespace-separated ports, for example `port = COM3 COM5`, to drive multi-port
+mode), and boolean keys take `true` or `false`.
 
 ```ini
 [myboard]
@@ -441,10 +456,14 @@ USB serial number. If the detected board type is wrong (for example a board whos
 USB-UART chip is not recognised), override it with `--board`.
 
 The RFC 2217 forwarder and the UF2 relay listen on the loopback interface
-(`127.0.0.1`) inside the WSL distribution and perform no authentication. On a
-single-user machine this is not exposed to the network, but on a shared or
-multi-user WSL host any local user in the same distribution could connect to
-these ports during an upload. Run com2tty only on hosts you trust, and choose a
+(`127.0.0.1`) inside the WSL distribution. The UF2 relay authenticates the
+intercepted `picotool` wrapper with a per-session token: the wrapper presents
+the token (held only in its owner-readable `/tmp` script) before its image is
+accepted, so another local user on a shared WSL host cannot push firmware to the
+relay during an upload. The RFC 2217 forwarder still performs no authentication.
+On a single-user machine neither is exposed to the network, but on a shared or
+multi-user WSL host any local user in the same distribution could connect to the
+RFC 2217 port during an upload. Run com2tty only on hosts you trust, and choose a
 non-default `--rfc2217-port` if another local service needs the default port. To
 reclaim a port left open by a previous com2tty session, the helper only
 terminates processes whose command line identifies them as a com2tty bridge; an
