@@ -29,7 +29,15 @@ def get_pty_settings(fd):
         bytesize_map = {termios.CS5: 5, termios.CS6: 6, termios.CS7: 7, termios.CS8: 8}
         bytesize = bytesize_map.get(cs_val, 8)
         if cflag & termios.PARENB:
-            parity = 'O' if (cflag & termios.PARODD) else 'E'
+            # CMSPAR (stick parity) selects mark/space; PARODD then picks which.
+            # The host SETTINGS handler accepts S/M, so detect them here too
+            # rather than mis-reporting them as plain odd/even. CMSPAR is a
+            # Linux extension that may be absent, so probe it defensively.
+            cmspar = getattr(termios, 'CMSPAR', 0)
+            if cmspar and (cflag & cmspar):
+                parity = 'M' if (cflag & termios.PARODD) else 'S'
+            else:
+                parity = 'O' if (cflag & termios.PARODD) else 'E'
         else:
             parity = 'N'
         stopbits = '2' if (cflag & termios.CSTOPB) else '1'

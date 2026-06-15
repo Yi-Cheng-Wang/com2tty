@@ -33,6 +33,7 @@ from textual.widgets import (
 
 from com2tty.core.boards import BOARD_CHOICES
 from com2tty.windows.dashboard._constants import PAD_SLOTS, _STATUS_STYLES
+from com2tty.windows.dashboard._remediation import UINPUT_SETUP
 from com2tty.windows.discovery import collect_ports
 
 
@@ -91,6 +92,21 @@ class SerialTab(_DeviceTab):
                 yield Checkbox("Auto-respawn", value=False, compact=True,
                                id="serial-respawn")
             with Collapsible(title="Advanced serial settings", collapsed=True):
+                # Endpoint placement: kept here (a vertically-stacking section)
+                # rather than the main control row so it never overlaps the
+                # other controls on a narrow terminal.
+                with Horizontal(classes="controls"):
+                    # Informational: shows the one-time `sudo ln -sf` command on
+                    # attach. The device is always served at /tmp; the dashboard
+                    # auto-detects whatever /dev alias the user creates, so this
+                    # is optional guidance, not configuration.
+                    yield Checkbox("Show /dev link command", value=False,
+                                   compact=True, id="serial-dev")
+                with Horizontal(classes="controls"):
+                    yield Label("WSL path")
+                    yield Input(placeholder="(auto /tmp/ttyUSBn — rename the "
+                                "WSL endpoint)", compact=True,
+                                id="serial-wslpath")
                 with Horizontal(classes="controls"):
                     yield Label("Byte size")
                     yield Select([("8", 8), ("7", 7), ("6", 6), ("5", 5)],
@@ -134,17 +150,40 @@ class SerialTab(_DeviceTab):
     # -- table rendering (UI thread only) -----------------------------------
 
     def _endpoints(self):
-        """device -> allocated WSL endpoint, for live serial bridges."""
-        return {b["key"]: b["endpoint"] for b in self.app.manager.list_bridges()
+        """device -> displayed WSL endpoint for live serial bridges.
+
+        Shows the auto-detected ``/dev`` alias when the user has created one for
+        the bridge's ``/tmp`` endpoint, otherwise the ``/tmp`` endpoint itself.
+        """
+        return {b["key"]: (b["dev_alias"] or b["endpoint"])
+                for b in self.app.manager.list_bridges()
                 if b["kind"] == "serial" and b["endpoint"]}
 
-    def refresh_table(self) -> None:
+    @work(thread=True, exclusive=True, group="serial-ports")
+    def refresh_table_worker(self) -> None:
+        """Enumerate ports off the UI thread, then rebuild the table on it.
+
+        ``serial.tools.list_ports.comports()`` queries the Windows SetupAPI and
+        can block for hundreds of milliseconds; running it on the periodic timer
+        (UI thread) made the dashboard hitch/freeze. The worker does only the
+        blocking enumeration and marshals the rows back for rendering. A
+        transient enumeration error is swallowed -- the next tick retries.
+        """
+        try:
+            ports = collect_ports()
+        except Exception:
+            return
+        self.app.call_from_thread(self.refresh_table, ports)
+
+    def refresh_table(self, ports=None) -> None:
         manager = self.app.manager
+        if ports is None:
+            ports = collect_ports()
         endpoints = self._endpoints()
         rows = [(row["device"], row["board"], row["vid_pid"] or "-",
                  endpoints.get(row["device"], "-"),
                  manager.is_attached("serial", row["device"]))
-                for row in collect_ports()]
+                for row in ports]
         signature = tuple(rows)
         if signature == self._signature:
             return
@@ -184,8 +223,8 @@ class SerialTab(_DeviceTab):
             self.app.emit_notice(str(exc), "com2tty", "warning")
             return
         try:
-            self.app.manager.start_serial_bridge(device, distro=self.app.distro,
-                                                 **options)
+            bridge_id = self.app.manager.start_serial_bridge(
+                device, distro=self.app.distro, **options)
         except ValueError as exc:
             self.app.emit_notice(str(exc), "com2tty", "warning")
             return
@@ -196,9 +235,25 @@ class SerialTab(_DeviceTab):
             "(or ~/.zshrc) to load the PlatformIO environment.",
             f"{device} attached", "information", 12.0,
         )
+        # Optional guidance: if the user asked, show the one-time command that
+        # aliases the device under /dev. The device is served at the /tmp
+        # endpoint; the /dev name is the user's to choose (the dashboard
+        # auto-detects whatever they create -- see poll_dev_aliases), so this
+        # just pre-fills the /tmp basename as a sensible default.
+        if self.query_one("#serial-dev", Checkbox).value:
+            from com2tty.windows.dashboard._remediation import serial_dev_link
+            endpoint = (self.app.manager.get(bridge_id) or {}).get("endpoint")
+            if endpoint:
+                name = endpoint.rsplit("/", 1)[-1]
+                self.app.show_command_help(
+                    *serial_dev_link(endpoint, "/dev/" + name))
 
     def read_options(self):
-        """Collect every serial form field into start_serial_bridge kwargs."""
+        """Collect every serial form field into start_serial_bridge kwargs.
+
+        The "Show /dev link command" checkbox is read separately in ``attach``
+        (it drives a UI hint, not a bridge option), so it is not included here.
+        """
         baud = self.query_one("#serial-baud", Input).value.strip() or "auto"
         return dict(
             baud=baud,
@@ -210,7 +265,34 @@ class SerialTab(_DeviceTab):
             rtscts=self.query_one("#serial-rtscts", Checkbox).value,
             dsrdtr=self.query_one("#serial-dsrdtr", Checkbox).value,
             auto_respawn=self.query_one("#serial-respawn", Checkbox).value,
+            wsl_path=self.query_one("#serial-wslpath", Input).value.strip() or None,
         )
+
+    @work(thread=True, group="serial-dev-poll", exclusive=True)
+    def poll_dev_aliases(self) -> None:
+        """Auto-detect a ``/dev`` alias for each serial bridge's ``/tmp`` endpoint.
+
+        Run from the periodic refresh: scan ``/dev`` inside WSL for a symlink the
+        user created pointing at each bridge's ``/tmp`` endpoint, and record it
+        so the Endpoint column shows the ``/dev`` path (reverting to ``/tmp`` if
+        the alias is removed). This needs no configuration -- the user can run
+        ``sudo ln -sf /tmp/ttyUSB0 /dev/<anyname>`` and the dashboard finds it.
+        """
+        from com2tty.windows.doctor import find_dev_aliases
+
+        manager = self.app.manager
+        serial = [b for b in manager.list_bridges() if b["kind"] == "serial"]
+        if not serial:
+            return
+        aliases = find_dev_aliases(self.app.distro,
+                                   [b["endpoint"] for b in serial])
+        changed = False
+        for bridge in serial:
+            dev = aliases.get(bridge["endpoint"]) or None
+            if manager.set_dev_alias(bridge["bridge_id"], dev):
+                changed = True
+        if changed:
+            self.app.call_from_thread(self.refresh_table)
 
     @work(thread=True, group="detach")
     def detach(self) -> None:
@@ -341,31 +423,39 @@ class GamepadTab(_DeviceTab):
             self.app.emit_notice(str(exc), "com2tty", "warning")
             return
         self.refresh_table()
-        endpoint = tmp_path or f"/tmp/com2pad{slot}"
+        fallback = tmp_path or f"/tmp/com2pad{slot}"
         if use_uinput:
-            message = ("uinput mode: a real /dev/input device needs a writable "
-                       f"/dev/uinput. If it is not, it falls back to {endpoint}.")
-            # Probe the permission so an insufficient one is a clear warning,
-            # not something buried in the log.
-            self._check_uinput_worker(slot)
+            message = ("uinput mode: creating a real /dev/input device. If "
+                       f"/dev/uinput is not writable it falls back to {fallback}.")
+            # Probe the permission so an insufficient one becomes a clear
+            # warning plus a copy-pasteable command modal, and the endpoint
+            # column reflects the real (fallback) sink -- not buried in the log.
+            self._check_uinput_worker(slot, fallback)
         else:
-            message = (f"WSL endpoint: {endpoint} (root-free evdev stream). "
+            message = (f"WSL endpoint: {fallback} (root-free evdev stream). "
                        "Point your WSL app at this FIFO.")
         self.app.emit_notice(message, f"Gamepad slot {slot} attached",
                              "information", 12.0)
 
     @work(thread=True, group="uinput", exclusive=True)
-    def _check_uinput_worker(self, slot) -> None:
+    def _check_uinput_worker(self, slot, fallback) -> None:
         from com2tty.windows.doctor import WARN, check_uinput
 
         status, _, detail = check_uinput(self.app.distro)
         if status == WARN:
+            # The bridge will fall back to the /tmp stream: correct the endpoint
+            # column away from the optimistic uinput label, surface the one-time
+            # root setup as copy-pasteable commands, and explain in a toast.
+            self.app.manager.set_endpoint(f"gamepad:{slot}", fallback)
+            self.app.call_from_thread(self.refresh_table)
+            self.app.call_from_thread(self.app.show_command_help, *UINPUT_SETUP)
             self.app.call_from_thread(
                 self.app.emit_notice,
                 f"Gamepad slot {slot}: insufficient /dev/uinput permission -- "
-                f"{detail} Falling back to the /tmp stream until the one-time "
-                "root setup is done (see README).",
-                "com2tty", "warning", 14.0,
+                f"{detail} Using the /tmp stream for now. After the one-time "
+                "root setup (commands shown), DETACH AND RE-ATTACH this gamepad "
+                "for uinput to take effect.",
+                "com2tty", "warning", 16.0,
             )
 
     @work(thread=True, group="detach")
@@ -403,12 +493,18 @@ class DoctorTab(Vertical):
     its ``TabPane`` and the result table is given height.
     """
 
+    def __init__(self):
+        super().__init__()
+        # Remediation topics from the last run that have a copy-pasteable fix.
+        self._remediations = []
+
     def compose(self) -> ComposeResult:
         yield Static("Checks the WSL/Python/uinput environment com2tty needs.",
                      classes="hint")
         with Horizontal(classes="controls"):
             yield Button("Run environment checks", id="doctor-run",
                          variant="primary")
+            yield Button("Setup commands", id="doctor-fix")
         yield Static("", id="doctor-summary")
         yield DataTable(id="doctor-table", cursor_type="row",
                         zebra_stripes=True, classes="tab-table")
@@ -445,6 +541,8 @@ class DoctorTab(Vertical):
     def render_results(self, results) -> None:
         from com2tty.windows.doctor import FAIL, WARN
 
+        from com2tty.windows.dashboard._remediation import remediation_for_results
+
         table = self.query_one("#doctor-table", DataTable)
         table.clear()
         for status, label, detail in results:
@@ -466,7 +564,40 @@ class DoctorTab(Vertical):
             summary = Text("All checks passed.", style="bold green")
         self.query_one("#doctor-summary", Static).update(summary)
 
+        # Surface copy-pasteable fixes for any check that warned/failed and has
+        # a known remedy, so the user is pointed at the 'Setup commands' button.
+        self._remediations = remediation_for_results(results)
+        if self._remediations:
+            self.app.emit_notice(
+                f"{len(self._remediations)} check(s) have copy-paste setup "
+                "commands — press 'Setup commands' to view them.",
+                "com2tty", "information", 12.0)
+
+    def show_fixes(self) -> None:
+        """Open a copy-pasteable command modal for the last run's remedies."""
+        topics = self._remediations
+        if not topics:
+            self.app.emit_notice("No setup commands needed; run the checks "
+                                 "first.", "com2tty", "information")
+            return
+        if len(topics) == 1:
+            self.app.show_command_help(*topics[0])
+            return
+        # Several remedies: aggregate into one modal, each under a comment.
+        commands = []
+        for title, _explanation, cmds in topics:
+            commands.append(f"# {title}")
+            commands.extend(cmds)
+            commands.append("")
+        self.app.show_command_help(
+            "Setup commands",
+            "Copy-pasteable fixes for the checks that need attention:",
+            commands)
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "doctor-run":
             self.run()
+            event.stop()
+        elif event.button.id == "doctor-fix":
+            self.show_fixes()
             event.stop()

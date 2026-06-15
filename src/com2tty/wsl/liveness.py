@@ -17,6 +17,7 @@ from ..core.constants import (  # noqa: F401 (re-exported for callers)
     ALIVE_TTL,
     PICOTOOL_OWNER_FILE,
 )
+from .secure_io import secure_write
 
 
 def alive_file_path(port):
@@ -24,11 +25,14 @@ def alive_file_path(port):
 
 
 def touch_alive_files(ports):
-    """Refresh the heartbeat files that mark this session's ports as live."""
+    """Refresh the heartbeat files that mark this session's ports as live.
+
+    Written via secure_write so a symlink planted at the fixed heartbeat path
+    under sticky /tmp cannot redirect the write (see wsl.secure_io).
+    """
     for port in ports:
         try:
-            with open(alive_file_path(port), "w") as f:
-                f.write(str(os.getpid()))
+            secure_write(alive_file_path(port), str(os.getpid()), mode=0o600)
         except Exception:
             pass
 
@@ -83,7 +87,12 @@ def pid_alive(pid):
             cmdline = f.read()
     except OSError:
         return False
-    return b"com2tty" in cmdline or b"bridge.py" in cmdline
+    # Require BOTH markers: the helper is always launched by path as
+    # ``python3 -u .../com2tty/bridge.py`` (or pad_bridge.py, which also
+    # contains "bridge.py"). The previous OR matched any unrelated process
+    # whose command line merely mentioned "com2tty" or some other bridge.py,
+    # which could wrongly keep a recycled PID "alive" and block reclamation.
+    return b"com2tty" in cmdline and b"bridge.py" in cmdline
 
 
 def read_pid_file(path):

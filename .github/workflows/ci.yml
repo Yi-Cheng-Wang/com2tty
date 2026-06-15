@@ -4,6 +4,14 @@ on:
   push:
   pull_request:
 
+# Least privilege by default: jobs only get read access to the repo. The
+# publish job authenticates to PyPI with an API token secret, so it needs no
+# extra GitHub token scopes. (A future hardening is to drop the long-lived
+# token in favour of PyPI Trusted Publishing, which would instead require
+# `permissions: id-token: write` on the publish job only.)
+permissions:
+  contents: read
+
 jobs:
   lint:
     runs-on: ubuntu-latest

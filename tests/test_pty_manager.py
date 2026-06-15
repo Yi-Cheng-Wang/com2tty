@@ -165,6 +165,27 @@ class TestGetPtySettings(unittest.TestCase):
             _, _, par, _ = get_pty_settings(3)
         self.assertEqual(par, "O")
 
+    def test_space_parity(self):
+        # CMSPAR (stick parity) without PARODD = space parity. CMSPAR is patched
+        # in so the branch is exercised on the mock termios too (Windows CI).
+        cmspar = 0x40000000
+        cflag = termios.CS8 | termios.PARENB | cmspar
+        attrs = [0, 0, cflag, 0, 0, termios.B9600, 0]
+        with patch("com2tty.wsl.pty_manager.termios.CMSPAR", cmspar, create=True), \
+                patch("com2tty.wsl.pty_manager.termios.tcgetattr", return_value=attrs):
+            _, _, par, _ = get_pty_settings(3)
+        self.assertEqual(par, "S")
+
+    def test_mark_parity(self):
+        # CMSPAR with PARODD = mark parity.
+        cmspar = 0x40000000
+        cflag = termios.CS8 | termios.PARENB | termios.PARODD | cmspar
+        attrs = [0, 0, cflag, 0, 0, termios.B9600, 0]
+        with patch("com2tty.wsl.pty_manager.termios.CMSPAR", cmspar, create=True), \
+                patch("com2tty.wsl.pty_manager.termios.tcgetattr", return_value=attrs):
+            _, _, par, _ = get_pty_settings(3)
+        self.assertEqual(par, "M")
+
     def test_returns_none_on_exception(self):
         with patch("com2tty.wsl.pty_manager.termios.tcgetattr",
                    side_effect=Exception("bad fd")):

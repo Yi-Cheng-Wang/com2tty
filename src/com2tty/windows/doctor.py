@@ -146,6 +146,59 @@ def check_uinput(distro):
             "(see the README for the one-time setup)")
 
 
+# Probe run inside WSL with python3: for each /tmp endpoint passed as an
+# argument, find a /dev/* symlink that resolves to the same live device, so the
+# dashboard can auto-discover a `sudo ln -sf <tmp> /dev/<name>` alias the user
+# created -- whatever name they chose -- without being told it in advance. The
+# endpoint's real target must be a live pty slave (/dev/pts/N) for a match to
+# count, so a stale/dangling link never reports a phantom alias.
+_DEV_ALIAS_PROBE = (
+    "import os,sys\n"
+    "def find(tmp):\n"
+    " try: target=os.path.realpath(tmp)\n"
+    " except OSError: return ''\n"
+    " if not (target.startswith('/dev/pts/') and os.path.exists(target)): return ''\n"
+    " try: names=sorted(os.listdir('/dev'))\n"
+    " except OSError: return ''\n"
+    " for name in names:\n"
+    "  p='/dev/'+name\n"
+    "  if os.path.islink(p):\n"
+    "   try:\n"
+    "    if os.path.realpath(p)==target: return p\n"
+    "   except OSError: pass\n"
+    " return ''\n"
+    # Emit '-' (not an empty field) when no alias is found, so the marker
+    # survives the caller's .strip() of the captured stdout's trailing line.
+    "for tmp in sys.argv[1:]:\n"
+    " sys.stdout.write(tmp+'\\t'+(find(tmp) or '-')+'\\n')\n"
+)
+
+
+def find_dev_aliases(distro, tmp_paths):
+    """Map each ``/tmp`` endpoint to a ``/dev/*`` symlink aliasing it, or None.
+
+    Runs one probe inside WSL that scans ``/dev`` for a top-level symlink whose
+    real target matches each endpoint's live pseudo-terminal slave. This is how
+    the dashboard auto-detects a ``sudo ln -sf /tmp/ttyUSB0 /dev/ttyACM0`` alias
+    the user created by hand, with any name, and reflects it in the Endpoint
+    column -- no ``/dev`` name has to be configured in advance. Returns ``{}``
+    on any failure so the caller simply shows the ``/tmp`` paths.
+    """
+    paths = [p for p in (tmp_paths or []) if p]
+    if not paths:
+        return {}
+    rc, out, _err = _run(wsl_command(distro, "python3", "-c",
+                                     _DEV_ALIAS_PROBE, *paths))
+    aliases = {}
+    if rc != 0:
+        return aliases
+    for line in out.splitlines():
+        if "\t" in line:
+            tmp, dev = line.split("\t", 1)
+            aliases[tmp] = None if dev in ("", "-") else dev
+    return aliases
+
+
 def check_autoplay_marker():
     if os.path.exists(_autoplay_marker_path()):
         return (WARN, "AutoPlay recovery marker",

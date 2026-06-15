@@ -68,7 +68,7 @@ from com2tty.windows.dashboard._constants import (
     _readme_text,
 )
 from com2tty.windows.dashboard._log_handler import _RichLogHandler
-from com2tty.windows.dashboard._screens import ReadmeScreen
+from com2tty.windows.dashboard._screens import CommandHelpScreen, ReadmeScreen
 from com2tty.windows.dashboard._styles import DASHBOARD_CSS
 from com2tty.windows.dashboard._tabs import DoctorTab, GamepadTab, SerialTab
 from com2tty.windows.dashboard.manager import BridgeManager
@@ -199,8 +199,15 @@ class DashboardApp(App):
         # default), which would shadow this method and register the interval
         # with a null callback (so the tables would never refresh).
         # A transient enumeration error must not kill the recurring timer.
+        # Serial port enumeration blocks (Windows SetupAPI), so it runs off the
+        # UI thread; the gamepad table is pure in-memory state and stays sync.
         try:
-            self.query_one(SerialTab).refresh_table()
+            serial = self.query_one(SerialTab)
+            serial.refresh_table_worker()
+            # Auto-detect any /dev alias the user created for a bridge's /tmp
+            # endpoint so the Endpoint column tracks it appearing/disappearing
+            # without a re-attach (and without any pre-configuration).
+            serial.poll_dev_aliases()
             self.query_one(GamepadTab).refresh_table()
         except Exception:  # noqa: BLE001 - best-effort periodic refresh
             logging.debug("Periodic refresh failed", exc_info=True)
@@ -321,9 +328,15 @@ class DashboardApp(App):
     # -- actions / bindings -------------------------------------------------
 
     def action_refresh(self) -> None:
+        # Switch to the Serial Ports tab so the refreshed table is actually
+        # visible, then refresh it (the binding is useless if the result is on
+        # a tab the user is not looking at).
+        self.query_one(TabbedContent).active = "serial-tab"
         self.query_one(SerialTab).refresh_table()
 
     def action_run_doctor(self) -> None:
+        # Switch to the Doctor tab so the run's results are on screen.
+        self.query_one(TabbedContent).active = "doctor-tab"
         self.query_one(DoctorTab).run()
 
     def action_open_readme(self) -> None:
@@ -334,6 +347,52 @@ class DashboardApp(App):
                              "Docs", "warning")
             return
         self.push_screen(ReadmeScreen(text))
+
+    def set_clipboard_text(self, text) -> None:
+        """Copy text to the clipboard, robust against terminals ignoring OSC 52.
+
+        Textual's ``copy_to_clipboard`` only emits an OSC 52 escape sequence,
+        which many Windows terminals drop. The dashboard is a Windows process,
+        so it sets the clipboard directly via the in-process Win32 API
+        (``windows/os_hacks/clipboard.py``) and falls back to the OSC 52 path
+        only off Windows or if that call fails. That call starts no child
+        process, so -- unlike the previous ``clip.exe`` subprocess -- it cannot
+        disturb the Windows console mode and freeze/crash the dashboard when
+        the user copies (e.g. Ctrl+C in the README).
+
+        The write runs on a worker thread, not the UI thread. Setting the
+        clipboard broadcasts a change notification to every clipboard listener
+        (third-party clipboard managers, and Windows' own Clipboard History /
+        Cloud Clipboard sync), and ``SetClipboardData``/``CloseClipboard``
+        block until those listeners respond -- which can take hundreds of
+        milliseconds. Doing that on the UI thread is what made copying feel
+        laggy: the whole dashboard stalled until the broadcast returned.
+        Off-loading it keeps the UI responsive while still using our own
+        clipboard implementation.
+        """
+        self._set_clipboard_text_worker(text)
+
+    @work(thread=True, group="clipboard", exclusive=True)
+    def _set_clipboard_text_worker(self, text) -> None:
+        """Perform the (potentially blocking) clipboard write off the UI thread.
+
+        ``exclusive`` means a fresh copy supersedes one still draining a slow
+        listener chain -- the last copy wins, which is what the user expects.
+        """
+        from com2tty.windows.os_hacks.clipboard import set_windows_clipboard
+        if not set_windows_clipboard(text):
+            # OSC 52 writes to the terminal through the app, so it must run on
+            # the UI thread; marshal the fallback back there.
+            self.call_from_thread(self.copy_to_clipboard, text)
+
+    def show_command_help(self, title, explanation, commands) -> None:
+        """Pop a modal of copy-pasteable remediation commands.
+
+        Public so the tabs (e.g. the gamepad uinput-permission path) can
+        proactively surface the exact one-time setup commands when they detect
+        a deficiency, instead of leaving them in the scrolling log.
+        """
+        self.push_screen(CommandHelpScreen(title, explanation, commands))
 
     # -- event handlers -----------------------------------------------------
 
