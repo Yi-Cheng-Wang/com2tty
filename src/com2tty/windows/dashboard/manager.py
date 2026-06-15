@@ -22,12 +22,12 @@ callables are injectable for the same reason -- tests pass fakes instead of
 spawning real WSL helpers.
 """
 import logging
-import re
 import threading
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
 from com2tty.core.constants import DEFAULT_RFC2217_PORT, DEFAULT_WSL_TTY
+from com2tty.core.util import indexed_path
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +41,12 @@ STOPPED = "stopped"
 FAILED = "failed"
 
 _LIVE_STATES = frozenset({STARTING, RUNNING, STOPPING})
+
+# Endpoint shown for a uinput gamepad bridge. The kernel assigns the actual
+# /dev/input/eventN number, so the table shows this device-class label rather
+# than the /tmp fallback path; it is replaced with the fallback path only if the
+# uinput permission probe shows the bridge will fall back (see GamepadTab).
+UINPUT_ENDPOINT_LABEL = "/dev/input/event* (uinput)"
 
 
 @dataclass
@@ -60,6 +66,13 @@ class BridgeRecord:
     index: Optional[int] = None
     endpoint: Optional[str] = None
     rfc2217_port: Optional[int] = None
+    # Gamepad only: whether the uinput tier was requested, so the UI can show
+    # the right endpoint (a real /dev/input device vs the /tmp fallback).
+    use_uinput: bool = False
+    # Serial only: the /dev/* symlink the user aliased this bridge's /tmp
+    # endpoint to (auto-detected by the dashboard, see find_dev_aliases), or
+    # None when no such alias exists. The UI shows it in place of the /tmp path.
+    dev_alias: Optional[str] = None
     _slot_freed: bool = field(default=False, repr=False)
 
     def snapshot(self) -> dict:
@@ -75,6 +88,8 @@ class BridgeRecord:
             "index": self.index,
             "endpoint": self.endpoint,
             "rfc2217_port": self.rfc2217_port,
+            "use_uinput": self.use_uinput,
+            "dev_alias": self.dev_alias,
         }
 
 
@@ -115,17 +130,33 @@ class BridgeManager:
     def start_serial_bridge(self, port, *, baud="auto", board="auto",
                             distro=None, bytesize=8, parity="N", stopbits=1,
                             xonxoff=False, rtscts=False, dsrdtr=False,
-                            wait=True, auto_respawn=False) -> str:
+                            wait=True, auto_respawn=False, wsl_path=None) -> str:
         """Attach a COM port. Returns the new bridge id.
 
         The WSL endpoint and RFC 2217 port are allocated automatically from
         the first free slot so several ports can coexist without colliding.
+        ``wsl_path`` overrides the default ``/tmp/ttyUSB{n}`` base, so the
+        device name (the ``ttyUSB0`` part) is the user's to choose.
+
+        The bridge always serves the pseudo terminal at this user-writable
+        ``/tmp`` endpoint. If the user later aliases it under ``/dev`` by hand
+        (``sudo ln -sf <endpoint> /dev/<anyname>``), the dashboard auto-detects
+        that alias (see :func:`com2tty.windows.doctor.find_dev_aliases` and the
+        Serial tab's poll) and records it in ``dev_alias`` for display -- so no
+        ``/dev`` name has to be configured up front and any name the user picks
+        is found.
         """
         bridge_id = f"serial:{port}"
         with self._lock:
+            self._reap_dead()
             self._reject_if_live(bridge_id, f"Serial {port}")
             index = self._allocate_serial_slot()
-            wsl_tty = self._indexed_path(self._wsl_tty_base, index)
+            # A bare device name (no separator) means "/tmp/<name>" so it is a
+            # real /tmp path, not a relative one.
+            base = wsl_path or self._wsl_tty_base
+            if "/" not in base:
+                base = "/tmp/" + base
+            wsl_tty = self._indexed_path(base, index)
             rfc2217_port = self._rfc2217_base + 2 * index
             kwargs = dict(
                 port=port, baud=baud, wsl_tty=wsl_tty, bytesize=bytesize,
@@ -157,18 +188,24 @@ class BridgeManager:
             tmp_path = f"/tmp/com2pad{pad_index}"
         bridge_id = f"gamepad:{pad_index}"
         with self._lock:
+            self._reap_dead()
             self._reject_if_live(bridge_id, f"Gamepad slot {pad_index}")
             kwargs = dict(
                 pad_index=pad_index, poll_hz=poll_hz, name=name,
                 use_uinput=use_uinput, tmp_path=tmp_path, distro=distro,
             )
+            # Show the real uinput device class up front; the /tmp fallback is
+            # only substituted later if the permission probe says it will fall
+            # back (so a successful uinput bridge never shows the /tmp path).
+            endpoint = UINPUT_ENDPOINT_LABEL if use_uinput else tmp_path
             record = BridgeRecord(
                 bridge_id=bridge_id, kind="gamepad", key=str(pad_index),
                 label=f"Gamepad slot {pad_index}",
-                stop_event=threading.Event(), endpoint=tmp_path,
+                stop_event=threading.Event(), endpoint=endpoint,
+                use_uinput=use_uinput,
             )
             self._launch(record, self._gamepad_runner, kwargs, auto_respawn)
-        logger.info("Attached %s on %s.", record.label, tmp_path)
+        logger.info("Attached %s on %s.", record.label, endpoint)
         return bridge_id
 
     def stop_bridge(self, bridge_id, timeout=5.0) -> bool:
@@ -202,12 +239,19 @@ class BridgeManager:
         """True while a ``{kind}:{key}`` bridge is still live."""
         bridge_id = f"{kind}:{key}"
         with self._lock:
+            self._reap_dead()
             record = self._bridges.get(bridge_id)
             return record is not None and record.state in _LIVE_STATES
 
     def list_bridges(self) -> List[dict]:
-        """Snapshots of every tracked bridge, for the UI to render."""
+        """Snapshots of every live bridge, for the UI to render.
+
+        Terminal (stopped/failed) records are reaped first, so a bridge that
+        ended on its own neither lingers in memory nor surfaces a stale
+        endpoint in the device table.
+        """
         with self._lock:
+            self._reap_dead()
             return [record.snapshot() for record in self._bridges.values()]
 
     def attached_counts(self) -> Dict[str, int]:
@@ -218,6 +262,7 @@ class BridgeManager:
         """
         counts: Dict[str, int] = {}
         with self._lock:
+            self._reap_dead()
             for record in self._bridges.values():
                 if record.state in _LIVE_STATES:
                     counts[record.kind] = counts.get(record.kind, 0) + 1
@@ -232,7 +277,53 @@ class BridgeManager:
             record = self._bridges.get(bridge_id)
             return record.snapshot() if record is not None else None
 
+    def set_endpoint(self, bridge_id, endpoint) -> bool:
+        """Update a tracked bridge's displayed endpoint.
+
+        Called (from a worker thread) when the gamepad uinput permission probe
+        shows the tier will fall back to the /tmp stream, so the Endpoint column
+        reflects the real sink instead of the optimistic one. Returns False when
+        the bridge is no longer tracked.
+        """
+        with self._lock:
+            record = self._bridges.get(bridge_id)
+            if record is None:
+                return False
+            record.endpoint = endpoint
+            return True
+
+    def set_dev_alias(self, bridge_id, dev_alias) -> bool:
+        """Record (or clear) the auto-detected ``/dev`` alias of a serial bridge.
+
+        Called from the Serial tab's periodic poll when it discovers (or loses)
+        a ``/dev/*`` symlink that the user aliased the bridge's ``/tmp`` endpoint
+        to. The displayed endpoint then shows the ``/dev`` path while it resolves
+        and reverts to ``/tmp`` when it is removed. Returns False (no change)
+        when the value is unchanged or the bridge is no longer tracked, so the
+        caller can tell whether a repaint is needed.
+        """
+        with self._lock:
+            record = self._bridges.get(bridge_id)
+            if record is None or record.dev_alias == dev_alias:
+                return False
+            record.dev_alias = dev_alias
+            return True
+
     # -- internals ----------------------------------------------------------
+
+    def _reap_dead(self) -> None:
+        """Drop records that have reached a terminal state. Caller holds lock.
+
+        A bridge that ends on its own (WSL exited, or its runner raised) leaves
+        a STOPPED/FAILED record behind. Its slot was already released by the
+        worker, so dropping the bookkeeping is all that remains; without it the
+        records accumulate unboundedly and keep showing a stale endpoint.
+        ``get`` deliberately does not reap, so a caller can still read the exit
+        reason of a specific bridge right after it stops.
+        """
+        for bridge_id in [bid for bid, rec in self._bridges.items()
+                          if rec.state in (STOPPED, FAILED)]:
+            del self._bridges[bridge_id]
 
     def _reject_if_live(self, bridge_id, label):
         """Caller must hold the lock."""
@@ -256,18 +347,12 @@ class BridgeManager:
 
     @staticmethod
     def _indexed_path(base, index) -> str:
-        """Per-slot WSL path: increment a trailing number, else append index.
+        """Per-slot WSL path, via the shared :func:`core.util.indexed_path`.
 
-        Mirrors ``bridge_app._derive_indexed_path`` so the dashboard and the
-        ``run_multi_bridge`` CLI path lay endpoints out identically
-        (/tmp/ttyUSB0 -> /tmp/ttyUSB1).
+        Keeps the dashboard and the ``run_multi_bridge`` CLI path laying
+        endpoints out identically (/tmp/ttyUSB0 -> /tmp/ttyUSB1).
         """
-        if index == 0:
-            return base
-        match = re.match(r"^(.*?)(\d+)$", base)
-        if match:
-            return f"{match.group(1)}{int(match.group(2)) + index}"
-        return f"{base}{index}"
+        return indexed_path(base, index)
 
     def _launch(self, record, runner, kwargs, auto_respawn) -> None:
         """Register the record and start its worker. Caller must hold lock."""

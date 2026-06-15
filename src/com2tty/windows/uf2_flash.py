@@ -9,14 +9,9 @@ import os
 import subprocess
 
 from ..core.constants import CREATE_NO_WINDOW
-
-
-def md5_hexdigest(data):
-    import hashlib
-    try:
-        return hashlib.md5(data, usedforsecurity=False).hexdigest()
-    except TypeError:  # Python < 3.9 has no usedforsecurity flag
-        return hashlib.md5(data).hexdigest()
+# Re-exported so existing importers (control_handler) keep the same path while
+# the implementation lives once in core.
+from ..core.util import md5_hexdigest  # noqa: F401
 
 
 def list_removable_drives():

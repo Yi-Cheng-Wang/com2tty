@@ -18,10 +18,11 @@ stdin/stdout pipes:
       <BBHH>  magic 0xFB 0xFE, strong/left motor, weak/right motor
 
 Both readers resynchronise on the magic prefix, so partial reads and stray
-bytes on the pipe are tolerated. This module is the single source of truth;
-``pad_bridge.py`` (which runs standalone inside WSL) carries a synchronised
-copy until it can import the package, and the test suite pins the two
-together.
+bytes on the pipe are tolerated. This module is the single source of truth for
+both ends of the pipe: the Windows host (``windows/gamepad_host.py``) and the
+WSL helper (``wsl/gamepad_app.py``) both import these codecs, and the WSL entry
+shim ``pad_bridge.py`` adds the package to ``sys.path`` so it can import them
+rather than carrying its own copy.
 """
 import struct
 

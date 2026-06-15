@@ -28,9 +28,14 @@ def _atomic_write_lines(path, lines):
     Instead, write a sibling temp file, flush+fsync it, then ``os.replace`` it
     over the original so the rc is never observed half-written.
     """
-    dir_name = os.path.dirname(path) or "."
+    # If the rc file is a symlink (common with dotfile managers that link
+    # ~/.bashrc into a tracked repo), rewrite the link's *target* and leave the
+    # link itself in place. Replacing the link with a regular file would
+    # silently detach the user's dotfiles setup.
+    target = os.path.realpath(path)
+    dir_name = os.path.dirname(target) or "."
     try:
-        orig_mode = stat.S_IMODE(os.stat(path).st_mode)
+        orig_mode = stat.S_IMODE(os.stat(target).st_mode)
     except OSError:
         orig_mode = None
     fd, tmp = tempfile.mkstemp(dir=dir_name, prefix=".com2tty-rc-")
@@ -41,7 +46,7 @@ def _atomic_write_lines(path, lines):
             os.fsync(f.fileno())
         if orig_mode is not None:
             os.chmod(tmp, orig_mode)
-        os.replace(tmp, path)
+        os.replace(tmp, target)
     except Exception:
         try:
             os.unlink(tmp)

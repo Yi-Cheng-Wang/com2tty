@@ -19,7 +19,7 @@ classifiers = [
 requires-python = ">=3.8"
 dependencies = [
     "pyserial>=3.5",
-    "textual>=0.40.0",
+    "textual>=1.0.0",
 ]
 
 [project.urls]

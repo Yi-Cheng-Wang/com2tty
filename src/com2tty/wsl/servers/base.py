@@ -57,8 +57,10 @@ def kill_leftover_listener(port):
                 cmdline = f.read().replace(b"\x00", b" ").decode("utf-8", "replace")
         except Exception:
             continue
-        # Reclaim the port only from another com2tty bridge instance.
-        if "bridge.py" in cmdline or "com2tty" in cmdline:
+        # Reclaim the port only from another com2tty bridge instance: require
+        # both markers (the helper runs as ".../com2tty/bridge.py") so an
+        # unrelated process that merely mentions one of them is never killed.
+        if "com2tty" in cmdline and "bridge.py" in cmdline:
             try:
                 os.kill(int(pid), signal.SIGKILL)
                 killed = True

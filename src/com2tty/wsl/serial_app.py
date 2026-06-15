@@ -8,6 +8,7 @@ pumps bytes between the pty master and the stdio pipes to the Windows host
 """
 import argparse
 import os
+import secrets
 import select
 import signal
 import socket
@@ -155,13 +156,20 @@ def main():
         if args.rfc2217_port:
             uf2_port = args.rfc2217_port + 1
             alive_ports = [args.rfc2217_port, uf2_port]
+            # Per-session secret shared only between the picotool wrapper (which
+            # embeds it in its owner-readable /tmp script) and the UF2 relay, so
+            # another local user cannot push firmware to the relay during an
+            # upload. Generated unconditionally: a secondary bridge installs no
+            # wrapper, so its relay holds a token no client can present and thus
+            # rejects every upload.
+            uf2_token = secrets.token_hex(16)
             # NOTE: do not write the heartbeat here. The per-port reclaim
             # (kill_leftover_listener) runs moments later and must not see this
             # session's own freshly-written marker and mistake it for another
             # live session holding the port. The select loop below registers
             # the heartbeat once the ports are actually reclaimed/bound.
             if env_setup:
-                setup_picotool_interceptor(uf2_port)
+                setup_picotool_interceptor(uf2_port, uf2_token)
             t_rfc2217 = threading.Thread(
                 target=run_rfc2217_server_thread,
                 args=(args.rfc2217_port, rfc2217_active, uf2_active),
@@ -170,7 +178,7 @@ def main():
             t_rfc2217.start()
             t_uf2_relay = threading.Thread(
                 target=run_uf2_relay_thread,
-                args=(uf2_port, uf2_active, rfc2217_active),
+                args=(uf2_port, uf2_active, rfc2217_active, uf2_token),
                 daemon=True
             )
             t_uf2_relay.start()
