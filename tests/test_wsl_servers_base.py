@@ -27,7 +27,7 @@ class TestKillLeftoverListener(unittest.TestCase):
         """A PID whose cmdline references our bridge is killed."""
         mock_sp.return_value = MagicMock(stdout=b" 1234\n")
         handle = mock_open.return_value.__enter__.return_value
-        handle.read.return_value = b"python3\x00bridge.py\x00--symlink"
+        handle.read.return_value = b"python3\x00/opt/com2tty/bridge.py\x00--symlink"
         kill_leftover_listener(4000)
         mock_kill.assert_called_once()
         self.assertEqual(mock_kill.call_args[0][0], 1234)
@@ -50,6 +50,26 @@ class TestKillLeftoverListener(unittest.TestCase):
         written = "".join(c.args[0] for c in mock_stderr.write.call_args_list)
         self.assertIn("unrelated process", written)
 
+    @patch("com2tty.wsl.servers.base.sys.stderr")
+    @patch("time.sleep")
+    @patch("com2tty.wsl.servers.base.os.kill")
+    @patch("builtins.open", new_callable=MagicMock)
+    @patch("subprocess.run")
+    def test_spares_lookalike_with_only_one_marker(self, mock_sp, mock_open,
+                                                   mock_kill, mock_sleep,
+                                                   mock_stderr):
+        """An unrelated 'bridge.py' (without com2tty in its path) is spared.
+
+        Regression for the tightened match: a single marker is no longer
+        enough to treat a PID as a com2tty bridge worth killing.
+        """
+        mock_sp.return_value = MagicMock(stdout=b" 4321\n")
+        handle = mock_open.return_value.__enter__.return_value
+        handle.read.return_value = b"python3\x00/home/u/other/bridge.py"
+        kill_leftover_listener(4000)
+        mock_kill.assert_not_called()
+        mock_sleep.assert_not_called()
+
     @patch("time.sleep")
     @patch("com2tty.wsl.servers.base.os.kill")
     @patch("builtins.open", side_effect=FileNotFoundError("no proc"))
@@ -71,7 +91,7 @@ class TestKillLeftoverListener(unittest.TestCase):
         """os.kill raising (process already gone) is tolerated."""
         mock_sp.return_value = MagicMock(stdout=b"1234\n")
         handle = mock_open.return_value.__enter__.return_value
-        handle.read.return_value = b"bridge.py"
+        handle.read.return_value = b"com2tty/bridge.py"
         kill_leftover_listener(4000)  # should not raise
 
     @patch("time.sleep")

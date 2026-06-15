@@ -67,6 +67,24 @@ class TestAtomicWriteLines(unittest.TestCase):
             _atomic_write_lines(path, ["new\n"])
             self.assertEqual(os.stat(path).st_mode & 0o777, expected)
 
+    def test_symlinked_rc_target_is_rewritten_and_link_preserved(self):
+        # A dotfile manager may symlink ~/.bashrc into a tracked repo. We must
+        # rewrite the link's target and keep the link itself rather than
+        # replacing it with a regular file (which would detach the dotfiles).
+        with tempfile.TemporaryDirectory() as d:
+            real = os.path.join(d, "dotfiles_bashrc")
+            link = os.path.join(d, ".bashrc")
+            with open(real, "w") as f:
+                f.write("old\n")
+            try:
+                os.symlink(real, link)
+            except (OSError, NotImplementedError):
+                self.skipTest("symlinks not permitted on this platform")
+            _atomic_write_lines(link, ["new\n"])
+            self.assertTrue(os.path.islink(link))  # link preserved
+            with open(real) as f:
+                self.assertEqual(f.read(), "new\n")  # target rewritten
+
     def test_cleans_up_temp_and_reraises_on_failure(self):
         captured = {}
         real_mkstemp = tempfile.mkstemp

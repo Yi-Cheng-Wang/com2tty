@@ -97,6 +97,49 @@ class TestBridgeManagerSerial(unittest.TestCase):
         self.assertTrue(call["wait"])
         mgr.stop_all()
 
+    def test_serial_endpoint_defaults_to_tmp_with_no_dev_alias(self):
+        # The bridge always serves at the auto-allocated /tmp endpoint; the /dev
+        # alias is discovered later (set_dev_alias), not configured here.
+        runner = _FakeRunner()
+        mgr = _make_manager(serial_runner=runner)
+        bid = mgr.start_serial_bridge("COM3")
+        self.assertTrue(_wait_for(lambda: _call_for(runner, "COM3")))
+        snap = mgr.get(bid)
+        self.assertEqual(snap["endpoint"], "/tmp/ttyUSB0")
+        self.assertIsNone(snap["dev_alias"])
+        self.assertEqual(_call_for(runner, "COM3")["wsl_tty"], "/tmp/ttyUSB0")
+        mgr.stop_all()
+
+    def test_serial_custom_wsl_path_renames_tmp_endpoint(self):
+        # wsl_path renames the /tmp endpoint (a bare name becomes /tmp/<name>).
+        runner = _FakeRunner()
+        mgr = _make_manager(serial_runner=runner)
+        bid = mgr.start_serial_bridge("COM3", wsl_path="ttyACM0")
+        self.assertTrue(_wait_for(lambda: _call_for(runner, "COM3")))
+        snap = mgr.get(bid)
+        self.assertEqual(snap["endpoint"], "/tmp/ttyACM0")
+        self.assertEqual(_call_for(runner, "COM3")["wsl_tty"], "/tmp/ttyACM0")
+        mgr.stop_all()
+
+    def test_set_dev_alias_records_and_reverts(self):
+        # The dashboard's auto-detection records whatever /dev alias the user
+        # created (any name) and can clear it again; only a real change reports
+        # True so the UI repaints just when needed.
+        runner = _FakeRunner()
+        mgr = _make_manager(serial_runner=runner)
+        bid = mgr.start_serial_bridge("COM3")
+        self.assertTrue(_wait_for(lambda: _call_for(runner, "COM3")))
+        self.assertTrue(mgr.set_dev_alias(bid, "/dev/ttyACM0"))
+        self.assertEqual(mgr.get(bid)["dev_alias"], "/dev/ttyACM0")
+        # Same value again is a no-op (no repaint needed).
+        self.assertFalse(mgr.set_dev_alias(bid, "/dev/ttyACM0"))
+        # Clearing it reverts to no alias.
+        self.assertTrue(mgr.set_dev_alias(bid, None))
+        self.assertIsNone(mgr.get(bid)["dev_alias"])
+        # An unknown bridge id is rejected.
+        self.assertFalse(mgr.set_dev_alias("serial:NOPE", "/dev/x"))
+        mgr.stop_all()
+
     def test_serial_auto_allocates_distinct_slots(self):
         runner = _FakeRunner()
         mgr = _make_manager(serial_runner=runner)  # base 4000, /tmp/ttyUSB0
@@ -169,6 +212,24 @@ class TestBridgeManagerSerial(unittest.TestCase):
             lambda: (mgr.get(bridge_id) or {}).get("state") == STOPPED))
         self.assertEqual(mgr.get(bridge_id)["exit_reason"], "wsl-exited")
 
+    def test_naturally_stopped_bridge_is_reaped_from_listings(self):
+        # Regression: a bridge that ends on its own must not linger in the
+        # UI-facing listings (unbounded growth + stale endpoint). get() still
+        # sees it until a listing reaps it, so the exit reason stays readable.
+        def quick(*, stop_event=None, **kwargs):
+            return "wsl-exited"
+
+        mgr = _make_manager(serial_runner=quick)
+        bridge_id = mgr.start_serial_bridge("COM3")
+        self.assertTrue(_wait_for(
+            lambda: (mgr.get(bridge_id) or {}).get("state") == STOPPED))
+
+        # The UI-facing reads reap the terminal record.
+        self.assertEqual(mgr.list_bridges(), [])
+        self.assertEqual(mgr.attached_counts(), {})
+        self.assertFalse(mgr.is_attached("serial", "COM3"))
+        self.assertIsNone(mgr.get(bridge_id))  # reaped by the reads above
+
 
 class TestBridgeManagerGamepad(unittest.TestCase):
 
@@ -187,6 +248,34 @@ class TestBridgeManagerGamepad(unittest.TestCase):
         self.assertEqual(call["name"], "Pad")
         mgr.stop_bridge(bridge_id)
         self.assertFalse(mgr.is_attached("gamepad", 1))
+
+    def test_uinput_endpoint_label_and_override(self):
+        runner = _FakeRunner()
+        mgr = _make_manager(gamepad_runner=runner)
+
+        bid = mgr.start_gamepad_bridge(0, use_uinput=True)
+        runner.started.wait(timeout=2.0)
+        # A uinput attach advertises the real device class, not the /tmp path.
+        snap = mgr.get(bid)
+        self.assertTrue(snap["use_uinput"])
+        self.assertIn("uinput", snap["endpoint"])
+        self.assertNotIn("/tmp", snap["endpoint"])
+        # The permission probe can correct it to the /tmp fallback.
+        self.assertTrue(mgr.set_endpoint(bid, "/tmp/com2pad0"))
+        self.assertEqual(mgr.get(bid)["endpoint"], "/tmp/com2pad0")
+        # Updating an unknown bridge is a no-op.
+        self.assertFalse(mgr.set_endpoint("gamepad:9", "/x"))
+        mgr.stop_all()
+
+    def test_non_uinput_endpoint_is_tmp_path(self):
+        runner = _FakeRunner()
+        mgr = _make_manager(gamepad_runner=runner)
+        bid = mgr.start_gamepad_bridge(1)  # default: /tmp stream
+        runner.started.wait(timeout=2.0)
+        snap = mgr.get(bid)
+        self.assertFalse(snap["use_uinput"])
+        self.assertEqual(snap["endpoint"], "/tmp/com2pad1")
+        mgr.stop_all()
 
 
 class TestBridgeManagerRespawn(unittest.TestCase):

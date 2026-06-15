@@ -55,6 +55,15 @@ class TestLoadProfileArgs(unittest.TestCase):
         args = load_profile_args("p", [path])
         self.assertEqual(args, ["--wsl-tty", "/tmp/x"])
 
+    def test_multiple_ports_drive_multi_port_mode(self):
+        # A whitespace-separated port list expands to several positionals, in
+        # order, so a profile can drive multi-port mode like the command line.
+        path = self._write("[multi]\nport = COM3 COM5\nbaud = 115200\n")
+        args = load_profile_args("multi", [path])
+        self.assertEqual(args[0], "COM3")
+        self.assertEqual(args[1], "COM5")
+        self.assertIn("--baud", args)
+
     def test_true_flag_included(self):
         path = self._write("[pad]\ngamepad = true\nuinput = yes\n")
         args = load_profile_args("pad", [path])
