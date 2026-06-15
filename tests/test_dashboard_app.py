@@ -859,6 +859,49 @@ class TestResponsiveAndChrome(unittest.TestCase):
                 self.assertIsNone(md._wrap_key)
         asyncio.run(scenario())
 
+    def test_selection_style_mirrors_each_textual_selection_model(self):
+        # _selection_style must reproduce however the *installed* Textual's
+        # Visual.to_strips derives the screen--selection style, and that
+        # derivation differs by version. Force each branch deterministically
+        # (independent of the installed Textual) by controlling the partial
+        # style's foreground:
+        #   - a transparent foreground => the modern overlay model: keep only
+        #     the blendable background so the text colour shows through;
+        #   - an opaque foreground => older Textual flattened the component, so
+        #     fall back to the pre-blended get_component_rich_style verbatim.
+        from textual.color import Color
+        from textual.style import Style
+        from com2tty.windows.dashboard import _screens
+
+        async def scenario():
+            async with _running(size=(100, 40)) as (app, pilot):
+                app.action_open_readme()
+                for _ in range(4):
+                    await pilot.pause()
+                md = app.screen.query_one("#readme-md", _MarkdownStatic)
+                background = Color(1, 2, 3)
+
+                # Modern overlay: transparent foreground -> background only.
+                modern = Style(background=background,
+                               foreground=Color(9, 9, 9, a=0))
+                with patch.object(_screens.Style, "from_styles",
+                                  return_value=modern):
+                    result = md._selection_style()
+                self.assertEqual(result, Style(background=background))
+
+                # Older flattened model: an opaque foreground means we must use
+                # the pre-blended rich style verbatim (a sentinel proves it).
+                flattened = Style(background=background,
+                                  foreground=Color(255, 255, 255))
+                sentinel = Style(background=Color(7, 7, 7))
+                with patch.object(_screens.Style, "from_styles",
+                                  return_value=flattened), \
+                        patch.object(_screens.Style, "from_rich_style",
+                                     return_value=sentinel):
+                    result = md._selection_style()
+                self.assertIs(result, sentinel)
+        asyncio.run(scenario())
+
     def test_refresh_binding_switches_to_serial_tab(self):
         # The 'r' binding must surface its result: switch to the Serial tab.
         async def scenario():

@@ -105,9 +105,27 @@ class _MarkdownStatic(Static):
         return strip._apply_link_style(self.link_style)
 
     def _selection_style(self) -> Style:
-        """The theme's text-selection style (the ``screen--selection`` class)."""
-        return Style.from_rich_style(
-            self.screen.get_component_rich_style("screen--selection"))
+        """The theme's text-selection style (the ``screen--selection`` class).
+
+        This must match how the installed Textual's ``Visual.to_strips``
+        derives it, or our lazy ``render_line`` drifts from a full render. That
+        derivation changed across versions, so we mirror it: newer Textual
+        overlays the component's *partial* style (a semi-transparent background,
+        transparent foreground) and blends it onto each row at render time;
+        older Textual flattened the component to an opaque, pre-blended style.
+        We detect which by the foreground the partial style carries -- a
+        transparent foreground means the modern overlay model -- and on the
+        modern path keep only the background so the text colour shows through.
+        """
+        partial = Style.from_styles(
+            self.screen.get_component_styles("screen--selection"))
+        foreground = partial.foreground
+        if foreground is not None and foreground.a:
+            # Older Textual: the selection style is flattened and pre-blended,
+            # carrying an opaque foreground -- use it verbatim.
+            return Style.from_rich_style(
+                self.screen.get_component_rich_style("screen--selection"))
+        return Style(background=partial.background)
 
 
 class ReadmeScreen(ModalScreen):
