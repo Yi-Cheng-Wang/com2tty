@@ -128,10 +128,13 @@ all other attribute access to the real port.
 For boards whose firmware is delivered as a UF2 image on a mass-storage
 bootloader, `wsl/integrations/picotool.py` intercepts the `picotool` binary
 inside WSL by renaming it to `picotool.real` and replacing it with a wrapper
-(rendered from the packaged template `wsl/assets/picotool_wrapper.py.in`). When
+(rendered from the packaged template `wsl/assets/picotool_wrapper.py.in`, with
+this session's relay port and authentication token substituted in). When
 PlatformIO invokes
-`picotool`, the wrapper sends the UF2 image to the UF2 relay, which forwards it
-to the host over standard output framed by the `UF2_UPLOAD_START` and
+`picotool`, the wrapper presents the session token and sends the UF2 image to the
+UF2 relay; the relay accepts the image only when the token matches (so another
+local user cannot inject firmware) and forwards it to the host over standard
+output framed by the `UF2_UPLOAD_START` and
 `UF2_UPLOAD_END` control messages and an MD5 checksum. The host accumulates the
 image, verifies the checksum, triggers the bootloader, locates the target
 mass-storage drive, and writes the image. To make the upload deterministic, the
@@ -214,6 +217,154 @@ host parses those frames with the shared `RumbleReader` from `core/frames.py`
 and drives the physical controller's motors through `XInputSetState`. The FIFO sink has no
 reverse channel and therefore no force feedback.
 
+## The dashboard
+
+The interactive dashboard is a terminal user interface built on Textual. It is
+the default when `com2tty` runs with no positional COM port and no other mode
+flag, and it can be requested explicitly with `--dashboard`. It lives under
+`windows/dashboard/` and is deliberately split into a view and a service so that
+the management logic can be tested without a terminal.
+
+`windows/dashboard/manager.py` holds `BridgeManager`, the service layer. It owns
+no Textual dependency. Each attached device runs as one daemon thread that calls
+the existing `run_bridge` or `run_gamepad_bridge` entry point with a
+`threading.Event` stop signal, which those functions already honour, so the
+dashboard reuses the same session code as the command line rather than
+reimplementing it. The manager allocates resources the way `run_multi_bridge`
+does up front: every serial attach takes the lowest free slot index, from which
+it derives a distinct WSL endpoint (`/tmp/ttyUSB0`, `/tmp/ttyUSB1`, and so on),
+a distinct RFC 2217 port (the base port plus twice the index, the `+1` reserved
+for the UF2 relay), and the `env_setup` flag, which is set only for slot zero so
+that just one bridge writes the PlatformIO shell configuration. Detaching a
+device, or a bridge thread ending on its own, frees the slot for reuse, so the
+allocation stays compact as devices come and go. The runner callables are
+injectable, which is how the test suite drives the manager with fakes instead of
+spawning real WSL helpers.
+
+`windows/dashboard/app.py` holds `DashboardApp`, the Textual view. The
+application itself supplies only the shared chrome -- the header, the WSL-distro
+switcher, the dismissable notice strip, the status-bar device tally, and the
+activity log -- and sequences startup and shutdown; it does not contain the
+per-pane logic. Each of the three panes is a self-contained widget in
+`windows/dashboard/_tabs.py`: `SerialTab`, `GamepadTab`, and `DoctorTab`. A tab
+owns its table, its form fields, and its attach, detach, or run logic, and it
+drives the `BridgeManager` directly, reaching the application only for the
+shared chrome it does not own, such as raising a notice or updating the device
+tally. The tab widgets are vertical containers, so each fills its tab pane and
+lays its table and docked action bar out correctly rather than collapsing. The
+modal screens live in `windows/dashboard/_screens.py`: `ReadmeScreen` shows the
+README rendered by the dashboard's own Markdown renderer
+(`windows/dashboard/_markdown.py`), which imports no Markdown library and not
+Textual's `Markdown` widget. `render_markdown` turns the source into one styled
+Textual `Content` -- headings, emphasis, inline code, fenced code blocks (padded
+into a block, content verbatim), lists, blockquotes, rules, links and tables,
+with all styling carried by spans and theme variables -- plus a map of heading
+anchors to line numbers. A single selectable `Static` (`_MarkdownStatic`)
+displays that `Content`. Using one widget is deliberate: the dashboard
+previously used Textual's `Markdown` widget, a deep tree of block widgets whose
+screen-level selection crashed when the user selected a passage and pressed
+Ctrl+C. Over a single `Static` the selection is simple and reliable, and because
+the `Content`'s plain form has the markup stripped and code kept verbatim, a
+copied selection pastes cleanly (a command from a code block pastes exactly).
+The single widget carries a cost that `_MarkdownStatic` addresses directly:
+Textual's default `Static` re-renders the whole widget on every refresh, and a
+drag-select refreshes the widget on every mouse move, so a several-hundred-row
+README was re-wrapped and re-styled in full on each move and highlighting
+crawled. `_MarkdownStatic` therefore overrides `render_line` to render one
+visible row at a time. It wraps the document to visual rows once per width (the
+costly step, cached against the width and the active theme), memoises each row's
+unselected strip, and styles only the rows the current selection actually
+covers, mapping the selection's content-line span onto each wrapped row's slice.
+The compositor only requests visible rows, so a drag costs work proportional to
+the visible rows rather than the whole document, while producing output that is
+byte-identical to a full render, selection highlight and clickable-link styling
+included.
+Links stay clickable without a deep widget tree: each link span carries an
+`@click=link(href)` action that Textual routes to `_MarkdownStatic.action_link`
+and on to `ReadmeScreen.follow_link`, where a `#anchor` (the table of contents)
+scrolls to that heading -- its line index converted to a visual row so the jump
+lands even when lines wrap -- a web link opens externally, and a relative path is
+reported but not followed (so it can neither launch a browser nor trip the OS
+folder-access protection). Ctrl+C is bound on the screen (Textual binds it
+app-wide to a non-copy handler except on `Input`/`TextArea`) to
+`action_copy_selection`, which sends the selection to `App.set_clipboard_text`.
+That sets the Windows clipboard with the in-process Win32 clipboard API through
+`ctypes` (`windows/os_hacks/clipboard.py`), falling back to OSC 52 only off
+Windows. The Win32 call starts no child process: an earlier `clip.exe`
+subprocess could change the Windows console mode -- which is how Ctrl+C is
+delivered to the foreground process -- and so intermittently froze or crashed
+the dashboard exactly when the user pressed Ctrl+C to copy; an in-process API
+call cannot disturb the terminal. `set_clipboard_text` performs the write on an
+exclusive worker thread (`@work(thread=True)`) rather than the UI thread.
+`SetClipboardData` and `CloseClipboard` broadcast a change notification to every
+clipboard listener -- third-party clipboard managers, and Windows' own Clipboard
+History and Cloud Clipboard sync -- and block until those listeners respond,
+which can take hundreds of milliseconds; doing that on the UI thread stalled the
+whole dashboard for the duration of each copy. Off-loading it keeps the
+interface responsive, and the exclusive worker means a fresh copy supersedes one
+still draining a slow listener chain. The OSC 52 fallback is marshalled back to
+the UI thread because it writes to the terminal through the app. The screen's
+chrome is a `✕` button docked
+top-right that closes the dialog and a centred footer hint; there is
+deliberately no "copy the whole document" action.
+`CommandHelpScreen` shows copy-pasteable remediation commands with a one-click
+clipboard button whose confirmation is an in-dialog status line -- not a toast,
+so the copy does not trigger a relayout that would flicker the dialog border. The
+remediation catalogue lives in `windows/dashboard/_remediation.py`; the gamepad
+pane pops `CommandHelpScreen` when its `/dev/uinput` permission probe shows the
+uinput tier will fall back, the serial pane pops it (with the per-port `sudo ln
+-sf` command) when a requested `/dev` endpoint is not writable, and the Doctor
+pane offers the fixes for any check that warned or failed. The
+remaining helper modules separate the stylesheet (`_styles.py`), the logging
+handler that feeds the on-screen log (`_log_handler.py`), and the shared
+constants together with the README lookup (`_constants.py`).
+
+Serial port enumeration (`serial.tools.list_ports.comports()`) blocks on the
+Windows SetupAPI, so the periodic table refresh runs it in a Textual worker
+thread and marshals the rows back to the UI thread; the explicit Refresh button
+and the first paint stay synchronous. A gamepad attached through the uinput tier
+shows its real device class (`/dev/input/event*`) in the Endpoint column, falling
+back to the `/tmp` stream path only when the permission probe shows it will fall
+back, so a successful uinput device is never mislabelled as the `/tmp` endpoint.
+A serial bridge always serves its pseudo terminal at the auto-allocated,
+user-writable `/tmp/ttyUSB{n}` endpoint (the WSL helper creates it directly).
+Exposing the device under `/dev` needs no configuration: the user runs a
+one-time `sudo ln -sf /tmp/ttyUSB0 /dev/<anyname>` by hand, with whatever name
+they like, and the dashboard *auto-discovers* that alias. The periodic refresh
+calls `find_dev_aliases` in `windows/doctor.py`, which runs one probe inside WSL
+that scans `/dev` for a top-level symlink whose real target matches each
+bridge's `/tmp` endpoint's live pseudo-terminal slave (`/dev/pts/N`). When a
+match is found the bridge's `dev_alias` is recorded and the Endpoint column
+shows the `/dev` path; when the alias is removed it reverts to `/tmp`. Because
+detection is by realpath rather than a pre-agreed name, the `/dev` name is free
+to differ from the `/tmp` name and is found regardless of what the user chose.
+The "Show /dev link command" checkbox is optional guidance only: on attach it
+pops the suggested `sudo ln -sf` command (pre-filling the `/tmp` basename as the
+`/dev` name); detection does not depend on it. The "WSL path" field renames the
+`/tmp` endpoint itself.
+
+Two measures keep the existing session code, which was written
+for a plain terminal, from corrupting the full-screen interface. First, the
+serial and gamepad sessions print colour banners to standard output and the
+command-line layer logs to standard error; both would punch through the Textual
+screen, so on mount the application silences the banners through
+`set_banners_enabled` in `windows/os_hacks/console.py` and detaches the root
+logger's stream handlers, routing every log record into an on-screen log widget
+instead, and it restores both on exit. Second, the action-required content of
+those banners is re-surfaced as dismissable notices, and any warning or error is
+also raised as a notice, so the operator is not expected to notice it in the
+scrolling log. The device tables refresh on a timer that rebuilds a table only
+when its content actually changed, so an unplugged device updates without
+flicker. The layout is responsive: breakpoint classes toggled on the screen from
+the resize handler reflow it, placing the log beside the tabs on a wide terminal
+and below them otherwise. The README that the F1 binding renders in the terminal
+is read from the checkout's `README.md` when one is found by walking up to the
+project root, and otherwise from the long description embedded in the installed
+package metadata, so the documentation shown always matches the running version.
+When Textual cannot be imported, `windows/dashboard/__init__.py` prints an
+installation hint and returns a non-zero status rather than failing, leaving the
+command-line modes usable.
+
 ## Binary frame formats
 
 Both gamepad frame formats are defined once in `core/frames.py` and imported by
@@ -235,16 +386,22 @@ holds the package version, `__main__.py` lets the package run as
 `python -m com2tty`, and `bridge.py`/`pad_bridge.py` are the WSL entry shims
 described under "The transport".
 
-`cli/` is the user-interface layer: `cli/__init__.py` defines the argument
-parser, expands `@profile` tokens, and dispatches to the mode facades;
-`cli/profiles.py` loads named argument sets from an INI file.
+`cli/` is the user-interface layer, split by responsibility: `cli/parser.py`
+declares the argument surface, `cli/dispatch.py` selects and runs exactly one
+mode by calling the facades in `windows/`, and `cli/__init__.py` expands
+`@profile` tokens and wires the two together under a single top-level error
+boundary, so a `KeyboardInterrupt` exits cleanly and any other failure is logged
+once and exits non-zero. `cli/profiles.py` loads named argument sets from an INI
+file.
 
 `core/` contains the dependency-free definitions both interpreters share:
 `constants.py` (paths, ports, marker strings, timing), `protocol.py` (the
 `[CONTROL]` message catalogue and the host-side `ControlDispatcher`),
 `frames.py` (the controller and rumble frame codecs with their
-resynchronising readers), and `boards.py` (the USB VID classification and
-reset timing data).
+resynchronising readers), `boards.py` (the USB VID classification and
+reset timing data), and `util.py` (the shared UF2 MD5 digest and the
+per-slot endpoint-path helper used by both the multi-port CLI and the
+dashboard manager).
 
 `windows/` runs on the Windows interpreter. `wsl_process.py` builds and
 supervises the `wsl --exec` helper process; `serial_host.py` owns the COM
@@ -258,26 +415,46 @@ orchestrate the serial and gamepad sessions (`run_bridge`,
 `run_multi_gamepad_bridge`); `gamepad_host.py` polls XInput;
 `rfc2217_redirector.py` adapts pyserial's RFC 2217 machinery to the pipe;
 `uf2_flash.py` locates the bootloader drive; `discovery.py` and `doctor.py`
-implement `--list` and `--doctor`. The `windows/os_hacks/` facade isolates
+implement `--list` and `--doctor` (and `discovery.py` also enumerates the
+installed WSL distributions for the dashboard's distribution selector). The
+`windows/dashboard/` package is the interactive terminal interface: `__init__.py`
+exposes `run_dashboard` and degrades gracefully when Textual is absent,
+`manager.py` holds the `BridgeManager` service that runs and tracks the bridge
+sessions as threads with per-device endpoint and port allocation, `app.py` holds
+the Textual `DashboardApp` that supplies the shared chrome and sequences startup
+and shutdown, `_tabs.py` holds the three self-contained pane widgets
+(`SerialTab`, `GamepadTab`, `DoctorTab`) that own their tables, forms, and
+attach, detach, and run logic, `_screens.py` holds the modal README reader and
+the copy-pasteable `CommandHelpScreen`, `_markdown.py` holds the self-contained
+Markdown-to-`Content` renderer (with clickable link spans and heading anchors)
+the README reader displays, `_remediation.py`
+holds the setup-command catalogue those screens present, and `_styles.py`,
+`_log_handler.py`, and `_constants.py` hold the stylesheet, the on-screen log
+handler, and the shared constants with the README lookup respectively. The
+`windows/os_hacks/` facade isolates
 the raw OS-level interventions: `autoplay.py` (registry AutoPlay
 suppression with crash recovery), `explorer.py` (closing Explorer windows
 on the bootloader drive), `device_watcher.py` (`WM_DEVICECHANGE` wake-ups),
-and `console.py` (VT-mode banner colours).
+`console.py` (VT-mode banner colours), and `clipboard.py` (setting the Windows
+clipboard with the in-process Win32 clipboard API via `ctypes`).
 
 `wsl/` runs on the Linux interpreter inside WSL and uses only the standard
 library. `serial_app.py` and `gamepad_app.py` are the helper entry points;
 `pty_manager.py` owns the pseudo-terminal primitives; `evdev_sink.py`
 implements the `/tmp` FIFO and uinput gamepad sinks; `liveness.py` tracks
-session heartbeats and PID markers; `wsl/servers/` contains the
-`LoopbackTcpServer` base with the RFC 2217 forwarder and UF2 relay; and
-`wsl/integrations/` carries the shell-environment injection and the
-picotool interception with its `assets/` wrapper template.
+session heartbeats and PID markers; `secure_io.py` provides the symlink-safe
+writer for the fixed-name `/tmp` artifacts; `wsl/servers/` contains the
+`LoopbackTcpServer` base with the RFC 2217 forwarder and the token-authenticated
+UF2 relay; and `wsl/integrations/` carries the shell-environment injection and
+the picotool interception with its `assets/` wrapper template.
 
 ## Dependencies and integration points
 
-The Windows host depends only on `pyserial`. The WSL helper uses only the Python
-standard library, so the guest distribution needs nothing beyond `python3` on its
-`PATH`. The bridge integrates with PlatformIO by exporting
+The Windows host depends on `pyserial` for the serial transport and on `textual`
+for the interactive dashboard; the command-line modes need only `pyserial`, and
+the dashboard degrades to an installation hint when `textual` is absent. The WSL
+helper uses only the Python standard library, so the guest distribution needs
+nothing beyond `python3` on its `PATH`. The bridge integrates with PlatformIO by exporting
 `PLATFORMIO_UPLOAD_PORT` and `PLATFORMIO_MONITOR_PORT` into the WSL user's shell
 startup files for bash, zsh, and fish, and with esptool, bossac, and `picotool`
 through the RFC 2217 forwarder and the UF2 relay. On minimal distributions the
@@ -328,10 +505,14 @@ silently stolen; a stale or dangling link is replaced as before.
 ## Security considerations
 
 The RFC 2217 forwarder and the UF2 relay listen on the loopback interface inside
-the WSL distribution and perform no authentication. On a single-user machine they
-are not reachable from the network, but on a shared or multi-user WSL host any
-local user in the same distribution could connect to those ports during an
-upload. com2tty should be run only on hosts the operator trusts. The USB serial
+the WSL distribution. The UF2 relay authenticates its client: each session
+generates a random token, embeds it in the owner-readable picotool wrapper, and
+the wrapper presents it before its image is accepted, so on a shared or
+multi-user WSL host another local user cannot push firmware to the relay during
+an upload. The RFC 2217 forwarder performs no authentication; on a single-user
+machine neither port is reachable from the network, but a local user in the same
+distribution could connect to the RFC 2217 port during an upload, so com2tty
+should be run only on hosts the operator trusts. The USB serial
 number used to locate the bootloader mass-storage drive originates from an
 external device descriptor and is treated as untrusted input: it is passed to
 PowerShell through an environment variable rather than interpolated into the
@@ -343,10 +524,20 @@ loaded by its absolute path under the Windows `System32` directory rather than b
 bare name, so a malicious DLL planted in the working directory cannot be loaded
 in its place. The gamepad event FIFO and its force-feedback companion are created
 with owner-only permissions, so another local user in the WSL distribution cannot
-read the input stream or inject events. The shell startup files are rewritten
-atomically, by writing a sibling temporary file and renaming it over the
-original, so an interrupted cleanup cannot leave a user's `~/.bashrc` or
-`~/.zshrc` truncated.
+read the input stream or inject events. The fixed-name artifacts the WSL helper
+writes under the world-writable `/tmp` -- the picotool wrapper (owner-only, so
+its embedded token stays secret), the picotool owner file, and the per-port
+heartbeats -- go through a symlink-safe helper that unlinks any pre-existing
+entry and creates the file with `O_EXCL | O_NOFOLLOW`, so a symlink another local
+user plants at one of those paths is rejected rather than followed. The shell
+startup files are rewritten atomically, by writing a sibling temporary file and
+renaming it over the original, so an interrupted cleanup cannot leave a user's
+`~/.bashrc` or `~/.zshrc` truncated; when the rc file is itself a symlink (common
+with dotfile managers) the link's target is rewritten and the link preserved.
+Session liveness requires `/proc/<pid>/cmdline` to name both `com2tty` and the
+helper script, so neither orphan reclamation nor leftover-listener cleanup
+mistakes an unrelated process that merely mentions one of those strings for a
+live bridge.
 
 ## Known limitations and unverified behaviour
 

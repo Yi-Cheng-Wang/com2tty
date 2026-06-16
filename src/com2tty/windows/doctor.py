@@ -13,7 +13,12 @@ import os
 import shutil
 import subprocess
 
-from .wsl_process import get_wsl_path, helper_script_path, wsl_command
+from .wsl_process import (
+    CONSOLE_NEUTRAL,
+    get_wsl_path,
+    helper_script_path,
+    wsl_command,
+)
 from .os_hacks.autoplay import _autoplay_marker_path
 
 OK = "OK"
@@ -25,9 +30,12 @@ SKIP = "SKIP"
 def _run(cmd, timeout=30):
     """Run a command; return (returncode or None on error, stdout, stderr)."""
     try:
+        # Console-neutral: a doctor probe may be the first command to cold-boot
+        # the WSL VM, and must not bind its terminal to the caller's console
+        # (see CONSOLE_NEUTRAL in wsl_process).
         res = subprocess.run(cmd, capture_output=True, text=True,
                              encoding="utf-8", errors="replace",
-                             timeout=timeout)
+                             timeout=timeout, **CONSOLE_NEUTRAL)
         return res.returncode, (res.stdout or "").strip(), (res.stderr or "").strip()
     except Exception as e:
         return None, "", str(e)
@@ -146,6 +154,59 @@ def check_uinput(distro):
             "(see the README for the one-time setup)")
 
 
+# Probe run inside WSL with python3: for each /tmp endpoint passed as an
+# argument, find a /dev/* symlink that resolves to the same live device, so the
+# dashboard can auto-discover a `sudo ln -sf <tmp> /dev/<name>` alias the user
+# created -- whatever name they chose -- without being told it in advance. The
+# endpoint's real target must be a live pty slave (/dev/pts/N) for a match to
+# count, so a stale/dangling link never reports a phantom alias.
+_DEV_ALIAS_PROBE = (
+    "import os,sys\n"
+    "def find(tmp):\n"
+    " try: target=os.path.realpath(tmp)\n"
+    " except OSError: return ''\n"
+    " if not (target.startswith('/dev/pts/') and os.path.exists(target)): return ''\n"
+    " try: names=sorted(os.listdir('/dev'))\n"
+    " except OSError: return ''\n"
+    " for name in names:\n"
+    "  p='/dev/'+name\n"
+    "  if os.path.islink(p):\n"
+    "   try:\n"
+    "    if os.path.realpath(p)==target: return p\n"
+    "   except OSError: pass\n"
+    " return ''\n"
+    # Emit '-' (not an empty field) when no alias is found, so the marker
+    # survives the caller's .strip() of the captured stdout's trailing line.
+    "for tmp in sys.argv[1:]:\n"
+    " sys.stdout.write(tmp+'\\t'+(find(tmp) or '-')+'\\n')\n"
+)
+
+
+def find_dev_aliases(distro, tmp_paths):
+    """Map each ``/tmp`` endpoint to a ``/dev/*`` symlink aliasing it, or None.
+
+    Runs one probe inside WSL that scans ``/dev`` for a top-level symlink whose
+    real target matches each endpoint's live pseudo-terminal slave. This is how
+    the dashboard auto-detects a ``sudo ln -sf /tmp/ttyUSB0 /dev/ttyACM0`` alias
+    the user created by hand, with any name, and reflects it in the Endpoint
+    column -- no ``/dev`` name has to be configured in advance. Returns ``{}``
+    on any failure so the caller simply shows the ``/tmp`` paths.
+    """
+    paths = [p for p in (tmp_paths or []) if p]
+    if not paths:
+        return {}
+    rc, out, _err = _run(wsl_command(distro, "python3", "-c",
+                                     _DEV_ALIAS_PROBE, *paths))
+    aliases = {}
+    if rc != 0:
+        return aliases
+    for line in out.splitlines():
+        if "\t" in line:
+            tmp, dev = line.split("\t", 1)
+            aliases[tmp] = None if dev in ("", "-") else dev
+    return aliases
+
+
 def check_autoplay_marker():
     if os.path.exists(_autoplay_marker_path()):
         return (WARN, "AutoPlay recovery marker",
@@ -165,12 +226,14 @@ def check_xinput(os_name=os.name):
         return (WARN, "XInput DLL (gamepad)", str(e))
 
 
-def run_doctor(distro=None, rfc2217_port=4000):
-    """Run all checks, print one line per result, return the exit status."""
-    # Each WSL probe can block for up to 30s if WSL is cold-starting or hung;
-    # without this the tool looks frozen while it waits.
-    print("Running com2tty environment checks (WSL probes can take a few "
-          "seconds each if WSL is starting up)...", flush=True)
+def collect_doctor_results(distro=None, rfc2217_port=4000):
+    """Run every applicable check and return a list of (status, label, detail).
+
+    The check chain short-circuits the WSL-dependent probes when WSL itself
+    is missing, exactly like ``run_doctor`` does when printing. Split out so
+    callers that want structured results (e.g. the dashboard's Doctor tab)
+    can render them however they like instead of scraping printed text.
+    """
     results = [check_wsl_exe()]
     wsl_ok = results[0][0] == OK
     if wsl_ok:
@@ -189,6 +252,16 @@ def run_doctor(distro=None, rfc2217_port=4000):
         results.append(check_uinput(distro))
     results.append(check_autoplay_marker())
     results.append(check_xinput())
+    return results
+
+
+def run_doctor(distro=None, rfc2217_port=4000):
+    """Run all checks, print one line per result, return the exit status."""
+    # Each WSL probe can block for up to 30s if WSL is cold-starting or hung;
+    # without this the tool looks frozen while it waits.
+    print("Running com2tty environment checks (WSL probes can take a few "
+          "seconds each if WSL is starting up)...", flush=True)
+    results = collect_doctor_results(distro, rfc2217_port)
 
     for status, label, detail in results:
         line = f"[{status:>4}] {label}"

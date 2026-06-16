@@ -9,7 +9,9 @@ import queue
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
-from com2tty.windows.control_handler import read_wsl_stderr
+import types
+
+from com2tty.windows.control_handler import Uf2UploadController, read_wsl_stderr
 
 
 class TestSamdRfc2217Session(unittest.TestCase):
@@ -131,6 +133,34 @@ class TestReadWslStderr(unittest.TestCase):
 
     def test_settings_parse_error(self):
         self._run(["[CONTROL] SETTINGS: garbage!!!\n"])  # should not raise
+
+    def test_settings_non_numeric_value_caught(self):
+        # A well-formed token whose value is not parseable (int('abc')) raises
+        # a ValueError that the generic handler logs and swallows -- it must
+        # not propagate or cycle the port.
+        ser = MagicMock()
+        ser.baudrate = 9600
+        self._run(["[CONTROL] SETTINGS: baud=abc\n"], ser=ser)
+        self.assertEqual(ser.baudrate, 9600)
+
+    def test_settings_malformed_token_skipped_not_fatal(self):
+        # A token without '=' must be skipped without aborting the rest of the
+        # update; the following valid token still applies (issue 4).
+        ser = MagicMock()
+        ser.baudrate = 9600
+        ser.bytesize = serial.EIGHTBITS
+        ser.parity = serial.PARITY_NONE
+        ser.stopbits = serial.STOPBITS_ONE
+        self._run(["[CONTROL] SETTINGS: garbage baud=115200\n"], ser=ser)
+        self.assertEqual(ser.baudrate, 115200)
+
+    def test_settings_value_with_equals_preserved(self):
+        # split('=', 1) keeps a value that itself contains '='; an unknown key
+        # like this is simply ignored without raising.
+        ser = MagicMock()
+        ser.baudrate = 9600
+        self._run(["[CONTROL] SETTINGS: weird=a=b\n"], ser=ser)
+        self.assertEqual(ser.baudrate, 9600)
 
     def test_settings_without_payload_is_ignored(self):
         # A bare "[CONTROL] SETTINGS" line carries no payload (no colon), so
@@ -1131,6 +1161,77 @@ class TestControlHandlerEdgeCases(unittest.TestCase):
 
         read_wsl_stderr(proc, ser, sd, rfc_evt, q, uf2_evt, uf2_q, None, 'unknown')
         self.assertEqual(ser.close.call_count, 2)
+
+
+class TestSerLockForwarding(unittest.TestCase):
+    """The shared ser_lock must reach reopen_serial_port so post-upload
+    reopens serialise against the dynamic-SETTINGS handler (issue 1)."""
+
+    @patch("com2tty.windows.control_handler.reopen_serial_port", return_value=True)
+    @patch("com2tty.windows.control_handler.time.sleep")
+    @patch("serial.tools.list_ports.comports", return_value=[])
+    def test_uf2_reopen_receives_shared_lock(self, mock_comports, mock_sleep,
+                                             mock_reopen):
+        proc = MagicMock()
+        ser = MagicMock()
+        ser.port = "COM3"
+        lock = threading.Lock()
+        proc.stderr.readline.side_effect = [b"[CONTROL] UF2_UPLOAD_END\n", b""]
+        read_wsl_stderr(proc, ser, threading.Event(), threading.Event(),
+                        queue.Queue(), threading.Event(), queue.Queue(),
+                        None, "pico", ser_lock=lock)
+        mock_reopen.assert_called_once()
+        self.assertIs(mock_reopen.call_args.kwargs.get("ser_lock"), lock)
+
+    @patch("com2tty.windows.control_handler.reopen_serial_port", return_value=True)
+    @patch("com2tty.windows.control_handler.acquire_new_port", return_value="COM9")
+    @patch("com2tty.windows.control_handler.snapshot_ports", return_value={"COM3"})
+    @patch("com2tty.windows.control_handler.samd_touch_reset")
+    @patch("com2tty.windows.control_handler.Redirector")
+    @patch("com2tty.windows.control_handler.time.sleep")
+    def test_samd_reopen_receives_shared_lock(self, mock_sleep, mock_redir,
+                                              mock_touch, mock_snap,
+                                              mock_acquire, mock_reopen):
+        proc = MagicMock()
+        ser = MagicMock()
+        ser.port = "COM3"
+        ser.get_settings.return_value = {}
+        lock = threading.Lock()
+        proc.stderr.readline.side_effect = [
+            b"[CONTROL] RFC2217_CONNECT\n",
+            b"[CONTROL] RFC2217_DISCONNECT\n", b""]
+        read_wsl_stderr(proc, ser, threading.Event(), threading.Event(),
+                        queue.Queue(), threading.Event(), queue.Queue(),
+                        "SER1", "samd", ser_lock=lock)
+        mock_reopen.assert_called_once()
+        self.assertIs(mock_reopen.call_args.kwargs.get("ser_lock"), lock)
+
+
+class TestUf2CloserCleanup(unittest.TestCase):
+    """The BootselWindowCloser thread must be stopped even when the flash
+    raises, so it does not leak (issue 6)."""
+
+    @patch("com2tty.windows.control_handler.os.name", "nt")
+    @patch("com2tty.windows.control_handler.AutoplaySuppressor")
+    @patch("com2tty.windows.control_handler.BootselWindowCloser")
+    @patch("com2tty.windows.control_handler.pico_manual_reset",
+           side_effect=RuntimeError("boom during flash"))
+    def test_closer_stopped_on_flash_exception(self, mock_reset, mock_closer_cls,
+                                               mock_autoplay):
+        closer = MagicMock()
+        mock_closer_cls.return_value = closer
+
+        uf2_q = queue.Queue()
+        uf2_q.put(b"test")
+        uf2_evt = threading.Event()
+        ctrl = Uf2UploadController(MagicMock(), MagicMock(), "pico", None,
+                                   threading.Event(), uf2_evt, uf2_q)
+
+        with self.assertRaises(RuntimeError):
+            ctrl.on_upload_start(types.SimpleNamespace(payload="4"))
+
+        closer.start.assert_called_once()
+        closer.stop.assert_called_once()
 
 
 class TestBindFailureHints(unittest.TestCase):

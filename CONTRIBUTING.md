@@ -22,9 +22,10 @@ USB identity and the detected board family are visible.
 Open an issue that describes the use case before writing code for a substantial
 feature. State the hardware involved, the workflow the feature would enable, and
 why the existing modes do not cover it. Because the WSL helper is constrained to
-the Python standard library and the host depends only on `pyserial`, a proposal
-that would add a runtime dependency should explain why the standard library is
-insufficient.
+the Python standard library, and the host depends only on `pyserial` for the
+command-line modes and on `textual` for the dashboard, a proposal that would add
+a further runtime dependency should explain why the existing dependencies and
+the standard library are insufficient.
 
 ## Branching and pull requests
 

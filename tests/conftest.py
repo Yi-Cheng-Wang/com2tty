@@ -75,9 +75,37 @@ except ImportError:
     _termios.PARODD = 0x200
     _termios.CSTOPB = 0x40
 
+    # Line-discipline flags cleared by set_raw_mode (glibc bit values).
+    # iflag
+    _termios.IGNBRK = 0x001
+    _termios.BRKINT = 0x002
+    _termios.PARMRK = 0x008
+    _termios.ISTRIP = 0x020
+    _termios.INLCR = 0x040
+    _termios.IGNCR = 0x080
+    _termios.ICRNL = 0x100
+    _termios.IXON = 0x400
+    # oflag
+    _termios.OPOST = 0x001
+    # lflag
+    _termios.ISIG = 0x001
+    _termios.ICANON = 0x002
+    _termios.ECHO = 0x008
+    _termios.ECHONL = 0x040
+    _termios.IEXTEN = 0x8000
+    # control-character indices
+    _termios.VMIN = 6
+    _termios.VTIME = 5
+    # tcsetattr "when" constant
+    _termios.TCSANOW = 0
+
     def _tcgetattr(fd):
         raise OSError("mock termios – no real terminal")
 
+    def _tcsetattr(fd, when, attrs):
+        raise OSError("mock termios – no real terminal")
+
     _termios.tcgetattr = _tcgetattr
+    _termios.tcsetattr = _tcsetattr
 
     sys.modules["termios"] = _termios

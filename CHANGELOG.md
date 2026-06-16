@@ -4,6 +4,167 @@ All notable changes to com2tty are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-06-16
+
+### Added
+
+- Interactive dashboard (`--dashboard`): a Textual terminal user interface that
+  manages serial and gamepad forwarding and the environment doctor from a single
+  screen. It lists detected COM ports and XInput controller slots in tables that
+  refresh on a timer, attaches and detaches devices, allocates a distinct WSL
+  endpoint and RFC 2217 port to each attached serial device automatically,
+  switches the active WSL distribution, renders the doctor results, tails a
+  unified activity log, surfaces action-required messages as dismissable notices
+  in the lower-right corner, and renders the README inside the terminal with F1.
+  The layout reflows to the terminal size.
+- `textual`, version 1.0.0 or later, is now a host runtime dependency used only
+  by the dashboard. The command-line modes do not require it, and the dashboard
+  prints an installation hint and exits with a non-zero status when it cannot be
+  imported. (The minimum was raised from 0.40.0 for the in-terminal text
+  selection, read-only `TextArea`, and clipboard-copy APIs the dashboard now
+  uses.)
+- The dashboard proactively surfaces copy-pasteable setup commands when it
+  detects a one-time privileged step the operator is missing. The gamepad pane
+  pops a dialog with the `/dev/uinput` setup commands (and a button that copies
+  them to the clipboard) when the uinput tier would fall back for lack of
+  permission, and the Doctor pane offers the corresponding commands for any
+  check that warned or failed (for example installing `psmisc` or `python3`).
+- Argument profiles accept several whitespace-separated ports in one `port`
+  key (`port = COM3 COM5`), so a saved profile can drive multi-port mode.
+
+### Changed
+
+- Running `com2tty` with no positional COM port and no other mode flag now opens
+  the dashboard instead of reporting a missing-argument error. The command-line
+  modes are unchanged and remain available for scripting and one-shot bridges.
+- The dashboard's F1 README modal renders Markdown with the dashboard's own
+  renderer (`windows/dashboard/_markdown.py`, no Markdown library imported) into
+  a single selectable widget: headings, emphasis, inline code, fenced code
+  blocks (rendered as a block), lists, blockquotes, rules, tables and links are
+  styled, while the document stays one widget so selecting a passage and pressing
+  Ctrl+C reliably copies it (markup stripped, code verbatim) -- a command from a
+  code block pastes exactly. Links stay clickable: a table-of-contents entry
+  jumps to its heading, a web link opens externally, and a relative path is
+  reported but not followed. The modal's chrome is a `✕` button in the top-right
+  corner and a centred footer hint. All dashboard copies (the README selection
+  and the command dialog's Copy
+  button) go through the in-process Win32 clipboard API rather than Textual's
+  OSC 52 escape sequence, which conhost and some Windows Terminal configurations
+  silently drop -- so a copy now actually lands on the clipboard. The command
+  dialog confirms a copy with an in-dialog status line instead of a bottom
+  toast, so pressing Copy no longer triggers a relayout that flickered the
+  dialog border.
+- The dashboard's Serial Ports tab auto-detects a `/dev` alias for each attached
+  device. The device is served at `/tmp/ttyUSB{n}`; the user may, with no
+  configuration, run `sudo ln -sf /tmp/ttyUSB0 /dev/<anyname>` by hand and the
+  Endpoint column switches to that `/dev` path automatically (reverting if it is
+  removed). The advanced settings keep an optional "Show /dev link command"
+  checkbox that pops the suggested command on attach, and a "WSL path" field
+  that renames the `/tmp` endpoint.
+- After the gamepad uinput permission setup, the dashboard now reminds the user
+  to detach and re-attach the controller for the change to take effect.
+- A gamepad attached through the uinput tier now shows its real device class
+  (`/dev/input/event*`) in the dashboard's Endpoint column, falling back to the
+  `/tmp` stream path only when the permission probe shows the bridge will fall
+  back -- a successful uinput device is no longer mislabelled as the `/tmp` path.
+- The dashboard enumerates serial ports in a worker thread on its periodic
+  refresh, so the blocking Windows SetupAPI call no longer hitches the interface.
+- The WSL helper now detects mark and space parity (CMSPAR) on the pseudo
+  terminal, so a client setting either is propagated to the COM port rather than
+  reported as plain odd/even.
+- The PyPI publish workflow runs with least-privilege `permissions: contents:
+  read` (read-only GitHub token) by default.
+
+### Security
+
+- The UF2 relay now authenticates the picotool wrapper with a per-session token
+  held only in the owner-readable wrapper script, so on a shared or multi-user
+  WSL host another local user can no longer push firmware to the relay during an
+  upload.
+- The fixed-name `/tmp` artifacts the WSL helper writes (the picotool wrapper,
+  its owner file, and the per-port heartbeats) are now written through a
+  symlink-safe path that unlinks any pre-existing entry and creates the file with
+  `O_EXCL | O_NOFOLLOW`, so a symlink planted by another local user at one of
+  those paths is rejected rather than followed. The picotool wrapper is created
+  owner-only so its embedded token stays secret.
+- Session-liveness detection now requires `/proc/<pid>/cmdline` to name both
+  `com2tty` and the helper script, so leftover-listener cleanup and orphan
+  reclamation no longer treat an unrelated process that merely mentions one of
+  those strings as a live bridge.
+
+### Fixed
+
+- A WSL distribution passed with `--distro` is now honoured by the dashboard
+  rather than reset to the default distribution when the interface starts.
+- The post-upload serial-port reopen is now serialised against the
+  dynamic-settings handler. The RFC 2217 and UF2 upload controllers now share
+  that handler's lock instead of each falling back to a private one, extending
+  the 0.3.0 reopen-lock fix to cover the upload-path reopens.
+- The WSL helper no longer crashes when the user-writable `/tmp` fallback for
+  the tty symlink is blocked by the sticky bit. If `/tmp/ttyUSB0` is owned by
+  another user and cannot be unlinked, the helper retreats to a user-scoped
+  path (`/tmp/ttyUSB0_<user>`, then a PID-scoped one) instead of raising a
+  `PermissionError`.
+- The XInput functions (`XInputGetState`, the undocumented `XInputGetStateEx`,
+  and `XInputSetState`) now declare their `ctypes` argument and return types, so
+  the unsigned 32-bit status is not truncated and the pointer arguments are
+  sized correctly on 64-bit Python.
+- A malformed dynamic line-settings token from WSL (one without `=`) is now
+  skipped with a warning instead of aborting the whole settings update, so the
+  remaining valid tokens still apply.
+- The serial-mode environment-variable injection now appends to the shell
+  startup files atomically. The 0.3.1 fix made the cleanup rewrite atomic, but
+  the append path still used a plain append that a crash could leave truncated.
+- A failed UF2 flash no longer leaks the background Explorer-window-closer
+  thread. The closer is now stopped in a `finally` block, so an error during the
+  flash cannot leave it polling indefinitely.
+- The serial-mode environment-variable injection now preserves a symlinked
+  `~/.bashrc`/`~/.zshrc` (common with dotfile managers): the link's target is
+  rewritten and the link is kept, rather than the link being replaced with a
+  regular file that detaches the user's tracked dotfiles.
+- The dashboard no longer accumulates records for bridges that ended on their
+  own (for example after the WSL helper exited): such terminal records are
+  reaped from the device listings, which also clears their now-stale endpoint
+  from the table.
+- The dashboard's F1 README was rebuilt with the dashboard's own Markdown
+  renderer feeding a single selectable widget, instead of Textual's `Markdown`
+  widget. Selecting a passage and pressing Ctrl+C no longer crashes (the
+  Markdown widget's deep-tree, screen-level selection was the cause); the
+  rendered document is one widget whose selection copies as clean plain text
+  (markup stripped, code verbatim). Links remain clickable -- a table-of-contents
+  entry jumps to its heading, a web link opens externally, and a relative path is
+  reported but not followed, so a documentation link can no longer open a browser
+  or trip the OS folder-access protection. The copy routes through the in-process
+  Win32 clipboard (see below). There is no longer a "copy the whole document"
+  button.
+- The dashboard's `r` (Refresh ports) and `d` (Run doctor) key bindings now
+  switch to the relevant tab as they run, so the refreshed port table and the
+  doctor results are actually brought on screen instead of updating a tab the
+  user is not looking at.
+- Copying from the dashboard no longer freezes or crashes the interface when the
+  user presses Ctrl+C. The clipboard is now set with the in-process Win32
+  clipboard API (via `ctypes`) instead of spawning `clip.exe`; a console
+  subprocess could change the Windows console mode, which is how Ctrl+C is
+  delivered to the foreground process, and so intermittently hung or crashed the
+  dashboard exactly when copying.
+- Copying from the dashboard no longer briefly freezes the interface. The Win32
+  clipboard write now runs on a worker thread instead of the UI thread, because
+  setting the clipboard broadcasts a change notification to every listener
+  (third-party clipboard managers and Windows' own Clipboard History and Cloud
+  Clipboard sync) and blocks until they respond, which could stall the dashboard
+  for the duration of each copy.
+- Highlighting text in the F1 README no longer lags. The README widget now
+  renders only the visible rows as the selection is dragged, wrapping the
+  document once per width, instead of re-rendering the entire several-hundred-row
+  document on every mouse move; the rendered output is unchanged.
+- The dashboard now auto-detects a serial bridge's `/dev` alias with no
+  configuration. The bridge serves the device at `/tmp/ttyUSB{n}`; if the user
+  runs `sudo ln -sf /tmp/ttyUSB0 /dev/<anyname>` by hand, the dashboard scans
+  `/dev` (by realpath, so any name is found) and shows that `/dev` path in the
+  Endpoint column, reverting to `/tmp` if the alias is removed -- no re-attach
+  and no pre-configured name. The advanced "Show /dev link command" checkbox is
+  now optional guidance that just pops the suggested `sudo ln -sf` command.
+
 ## [0.3.1] - 2026-06-13
 
 ### Added

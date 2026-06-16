@@ -29,7 +29,15 @@ def get_pty_settings(fd):
         bytesize_map = {termios.CS5: 5, termios.CS6: 6, termios.CS7: 7, termios.CS8: 8}
         bytesize = bytesize_map.get(cs_val, 8)
         if cflag & termios.PARENB:
-            parity = 'O' if (cflag & termios.PARODD) else 'E'
+            # CMSPAR (stick parity) selects mark/space; PARODD then picks which.
+            # The host SETTINGS handler accepts S/M, so detect them here too
+            # rather than mis-reporting them as plain odd/even. CMSPAR is a
+            # Linux extension that may be absent, so probe it defensively.
+            cmspar = getattr(termios, 'CMSPAR', 0)
+            if cmspar and (cflag & cmspar):
+                parity = 'M' if (cflag & termios.PARODD) else 'S'
+            else:
+                parity = 'O' if (cflag & termios.PARODD) else 'E'
         else:
             parity = 'N'
         stopbits = '2' if (cflag & termios.CSTOPB) else '1'
@@ -38,15 +46,68 @@ def get_pty_settings(fd):
         return None, None, None, None
 
 
+def set_raw_mode(fd):
+    """Put the pty's line discipline into raw mode so it behaves like a wire.
+
+    ``os.openpty()`` returns a slave in the kernel's default *cooked* terminal
+    mode (ECHO, ICANON, ISIG, ICRNL, IXON, OPOST/ONLCR all on). That is right
+    for a login terminal but wrong for a serial device, which carries raw
+    bytes. Left cooked, the emulated port misbehaves the moment a device starts
+    talking:
+
+    * ``ECHO`` echoes the device's own traffic straight back at it.
+    * ``ISIG`` turns stray control bytes (a 0x03 inside a binary frame) into
+      signals on the line's foreground process group.
+    * ``ICRNL``/``OPOST``/``ONLCR`` rewrite CR<->NL in both directions, so
+      binary frames and firmware bytes arrive corrupted (a lone ``\\n`` toward
+      the device becomes ``\\r\\n``; a ``\\r`` from the device becomes ``\\n``).
+    * ``IXON`` swallows 0x11/0x13 data bytes as XON/XOFF flow control.
+    * ``ICANON`` line-buffers input, so a chatty device with no reader fills
+      the tty input buffer until ``os.write(master_fd, ...)`` blocks and stalls
+      the whole bridge select loop.
+
+    Clearing those flags makes every byte pass through untouched, exactly like
+    a real UART (this is what pyserial et al. do to a real port on open). The
+    ``cflag`` -- byte size, parity, stop bits, and baud -- is deliberately left
+    intact so ``get_pty_settings`` still reports line-setting changes a WSL
+    program makes. Best-effort: a tcget/tcset failure is swallowed (matching
+    ``get_pty_settings``) so it can never block bridge startup.
+    """
+    try:
+        attrs = termios.tcgetattr(fd)
+    except Exception:
+        return
+    iflag, oflag, cflag, lflag, ispeed, ospeed, cc = attrs
+    iflag &= ~(termios.IGNBRK | termios.BRKINT | termios.PARMRK
+               | termios.ISTRIP | termios.INLCR | termios.IGNCR
+               | termios.ICRNL | termios.IXON)
+    oflag &= ~termios.OPOST
+    lflag &= ~(termios.ECHO | termios.ECHONL | termios.ICANON
+               | termios.ISIG | termios.IEXTEN)
+    # Hand every byte to a reader as soon as it arrives, with no inter-byte
+    # timer -- the raw-read defaults expected of a serial line.
+    cc = list(cc)
+    cc[termios.VMIN] = 1
+    cc[termios.VTIME] = 0
+    try:
+        termios.tcsetattr(fd, termios.TCSANOW,
+                          [iflag, oflag, cflag, lflag, ispeed, ospeed, cc])
+    except Exception:
+        return
+
+
 def open_pty():
     """Create the pty pair; returns ``(master_fd, slave_fd, slave_name)``.
 
     Both descriptors must stay open for the bridge's lifetime: keeping the
     slave open prevents EIO errors on the master side when WSL clients open
-    and close the virtual serial port.
+    and close the virtual serial port. The fresh pty is forced into raw mode
+    (see ``set_raw_mode``) so it carries bytes like a real serial line instead
+    of cooking them like a login terminal.
     """
     master_fd, slave_fd = os.openpty()
     slave_name = os.ttyname(slave_fd)
+    set_raw_mode(slave_fd)
     sys.stderr.write(f"Created pseudo-terminal: master_fd={master_fd}, slave={slave_name}\n")
     sys.stderr.flush()
     return master_fd, slave_fd, slave_name
@@ -72,6 +133,45 @@ def _refuse_if_foreign_live_pty(path, our_slave):
             f"{path} is already bound to another live com2tty session's serial "
             f"device ({dest}); refusing to hijack it. Use a different --wsl-tty "
             f"path for this session.")
+
+
+def _link_fallback(slave_name, fallback_path, basename):
+    """Create the /tmp fallback link, dodging the sticky-bit ownership trap.
+
+    /tmp is world-writable but sticky (+t): a pre-existing ``/tmp/ttyUSB0``
+    owned by another user cannot be unlinked, so ``os.unlink`` raises
+    ``PermissionError``. Rather than crash, retreat to a user-scoped path
+    (``/tmp/ttyUSB0_<user>``, then ``..._<pid>``) that this process owns.
+    """
+    candidates = [fallback_path]
+    try:
+        import getpass
+        # getpass.getuser() trusts user-controllable env vars (USER/LOGNAME);
+        # take only the final path component so a value like "../x" cannot
+        # steer the symlink out of /tmp.
+        username = os.path.basename(getpass.getuser())
+        if username:
+            candidates.append(f"/tmp/{basename}_{username}")
+    except Exception:
+        pass
+    candidates.append(f"/tmp/{basename}_{os.getpid()}")
+
+    last_err = None
+    for path in candidates:
+        try:
+            _refuse_if_foreign_live_pty(path, slave_name)
+            if os.path.lexists(path):
+                os.unlink(path)
+            os.symlink(slave_name, path)
+            return path
+        except PermissionError as exc:
+            last_err = exc
+            sys.stderr.write(
+                f"Warning: cannot use {path} (permission denied, sticky /tmp?); "
+                "trying a user-scoped path.\n")
+            sys.stderr.flush()
+            continue
+    raise last_err
 
 
 def create_symlink_with_fallback(slave_name, target_path):
@@ -104,10 +204,7 @@ def create_symlink_with_fallback(slave_name, target_path):
         sys.stderr.write(f"Attempting fallback to user-writable path: {fallback_path}...\n")
         sys.stderr.flush()
 
-        _refuse_if_foreign_live_pty(fallback_path, slave_name)
-        if os.path.lexists(fallback_path):
-            os.unlink(fallback_path)
-        os.symlink(slave_name, fallback_path)
+        fallback_path = _link_fallback(slave_name, fallback_path, basename)
 
         sys.stderr.write(f"Fallback successful: {fallback_path} -> {slave_name}\n")
         sys.stderr.write("--------------------------------------------------\n")

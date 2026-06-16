@@ -21,6 +21,7 @@ to Linux tools running in WSL.
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Usage](#usage)
+  - [Dashboard mode](#dashboard-mode)
   - [Listing available ports](#listing-available-ports)
   - [Bridging a serial port](#bridging-a-serial-port)
   - [Hot-plug auto-reconnect](#hot-plug-auto-reconnect)
@@ -38,9 +39,13 @@ to Linux tools running in WSL.
 
 ## Requirements
 
-The Windows host requires Python 3.8 or later. The `pyserial` package, version
-3.5 or later, is the only runtime dependency and is installed automatically with
-the package. A working WSL installation is required, and the WSL distribution
+The Windows host requires Python 3.8 or later. Two runtime dependencies are
+installed automatically with the package: `pyserial`, version 3.5 or later,
+which drives the serial transport, and `textual`, version 1.0.0 or later, which
+renders the interactive dashboard described under [Dashboard mode](#dashboard-mode).
+The command-line modes do not require `textual`; if it cannot be imported, the
+dashboard prints an installation hint and the command-line modes continue to
+work. A working WSL installation is required, and the WSL distribution
 must provide `python3` on its `PATH`. By default the WSL default distribution
 is used; a specific one can be selected with `--distro`. The WSL helper uses
 only the Python standard library and therefore needs no additional packages
@@ -92,12 +97,21 @@ serial mode; several may be given to bridge them concurrently. The port is
 omitted in gamepad mode, which is selected with `--gamepad`, and in the
 `--list` and `--version` modes.
 
+Running `com2tty` with no positional COM port and no mode flag enters the
+interactive dashboard described under [Dashboard mode](#dashboard-mode). The
+dashboard is therefore the zero-configuration default; the command-line modes
+remain available for scripting and for one-shot bridges.
+
 ### Options common to both modes
 
 The following options apply to both modes.
 
 ```text
 --version              Print the com2tty version and exit.
+--dashboard            Launch the interactive management dashboard (a
+                       terminal user interface). This is also the default
+                       when com2tty is run with no COM port and no other
+                       mode flag. See Dashboard mode below.
 -l, --list             List the serial ports Windows can see (device name,
                        VID:PID, USB bus id, serial number, detected board,
                        description) and exit. Supplying a COM port together
@@ -178,6 +192,69 @@ port [port ...]        Windows COM port(s) to bridge, for example COM3, or
 Run `com2tty` from any Windows terminal, either PowerShell or Command Prompt. The
 process runs in the foreground and is stopped with Ctrl+C.
 
+### Dashboard mode
+
+The dashboard is a full-screen terminal user interface that manages every kind
+of forwarding from one place, without the need to remember command-line flags.
+Start it by running `com2tty` with no arguments, or explicitly with
+`--dashboard`.
+
+```cmd
+com2tty
+```
+
+The screen is divided into a status bar, a tabbed work area, a shared activity
+log, and a footer of key bindings. The status bar holds a selector for the
+active WSL distribution and a live count of the devices currently attached. The
+work area provides three tabs.
+
+The Serial Ports tab lists every COM port Windows can see in a table that
+refreshes on a timer, so a device that is plugged in or unplugged appears or
+disappears within a couple of seconds. Select a port, set the baud rate, the
+board override, and any advanced serial settings (byte size, parity, stop bits,
+and flow control), then attach it. Each attached port is assigned a distinct WSL
+endpoint and RFC 2217 port automatically, shown in the table's Endpoint column,
+so several ports can be bridged concurrently without manual bookkeeping; the
+first attached port owns the PlatformIO environment setup, exactly as in
+multi-port command-line mode. A "Link under /dev" option (in the advanced
+settings) requests the endpoint under `/dev`, mirroring the gamepad uinput tier:
+the device is served under the user-writable `/tmp` path, and the dashboard
+continuously checks whether the `/dev` path resolves to it. While the one-time
+alias is missing it shows the `/tmp` path and pops the `sudo ln -sf` command to
+create the alias; the moment you run that command the Endpoint column switches
+to the `/dev` path automatically, with no need to re-attach (and it reverts to
+`/tmp` if the alias is later removed). The device name (the `ttyUSB0` part) is
+yours to choose through the "WSL path" field, and the `/dev` link reuses that
+name. Detaching a port stops its bridge and frees its endpoint for reuse.
+
+The Gamepads tab lists the four XInput controller slots. Select a slot, set the
+polling rate, the advertised device name, and whether to use the privileged
+uinput tier, then attach it. When the uinput tier is selected and `/dev/uinput`
+is not writable, the dashboard raises a warning describing the one-time setup and
+the fallback to the `/tmp` event stream.
+
+The Doctor tab runs the same environment self-check as `com2tty --doctor` and
+renders the results as a colour-coded table with a one-line summary.
+
+Action-required messages, such as the instruction to reload the WSL shell after
+an attach, appear as dismissable notice cards in the lower-right corner; warnings
+and errors surface there as well. Each card is closed with its close control;
+information and warning cards also clear themselves after a short delay, while
+error cards remain until dismissed. Pressing F1 opens the project README,
+rendered as Markdown inside the terminal (with a close button), so the
+documentation is available without leaving the application; drag to select a
+passage and press Ctrl+C to copy it. When an
+action needs a one-time privileged step the operator lacks -- the `/dev/uinput`
+setup for the gamepad uinput tier, or exposing a serial device under `/dev` --
+the dashboard pops a small dialog containing the exact commands with a button
+that copies them to the clipboard. The layout reflows to the size of the
+terminal, placing the activity log beside the tabs on a wide window and below
+them on a narrow one.
+
+If the `textual` dependency cannot be imported, `com2tty` prints an installation
+hint instead of starting the dashboard, and the command-line modes described
+below continue to work.
+
 ### Listing available ports
 
 `com2tty --list` (or `-l`) enumerates every serial port Windows can see,
@@ -257,8 +334,9 @@ port directly.
 Frequently used argument sets can be saved as named profiles in an INI file,
 either `com2tty.ini` in the current directory or `.com2tty.ini` in the user
 profile directory. Keys are the long option names (dashes and underscores are
-both accepted), `port` supplies the positional argument, and boolean keys
-take `true` or `false`.
+both accepted), `port` supplies the positional argument (and may list several
+whitespace-separated ports, for example `port = COM3 COM5`, to drive multi-port
+mode), and boolean keys take `true` or `false`.
 
 ```ini
 [myboard]
@@ -378,10 +456,14 @@ USB serial number. If the detected board type is wrong (for example a board whos
 USB-UART chip is not recognised), override it with `--board`.
 
 The RFC 2217 forwarder and the UF2 relay listen on the loopback interface
-(`127.0.0.1`) inside the WSL distribution and perform no authentication. On a
-single-user machine this is not exposed to the network, but on a shared or
-multi-user WSL host any local user in the same distribution could connect to
-these ports during an upload. Run com2tty only on hosts you trust, and choose a
+(`127.0.0.1`) inside the WSL distribution. The UF2 relay authenticates the
+intercepted `picotool` wrapper with a per-session token: the wrapper presents
+the token (held only in its owner-readable `/tmp` script) before its image is
+accepted, so another local user on a shared WSL host cannot push firmware to the
+relay during an upload. The RFC 2217 forwarder still performs no authentication.
+On a single-user machine neither is exposed to the network, but on a shared or
+multi-user WSL host any local user in the same distribution could connect to the
+RFC 2217 port during an upload. Run com2tty only on hosts you trust, and choose a
 non-default `--rfc2217-port` if another local service needs the default port. To
 reclaim a port left open by a previous com2tty session, the helper only
 terminates processes whose command line identifies them as a com2tty bridge; an
@@ -551,10 +633,28 @@ Linux interpreter inside WSL.
 `cli/` parses the command line (after `cli/profiles.py` expands any `@profile`
 tokens) and dispatches to an entry function in `windows/`: `run_bridge` in
 serial mode, `run_multi_bridge` when several ports are given, and
-`run_gamepad_bridge` in gamepad mode. `windows/discovery.py` implements
-`--list` and `windows/doctor.py` implements `--doctor`. `__main__.py` and the
-console entry point both call `cli.main`, and `__init__.py` holds the package
-version.
+`run_gamepad_bridge` in gamepad mode. The layer is split by responsibility:
+`cli/parser.py` declares the flag surface, `cli/dispatch.py` selects and runs
+exactly one mode, and `cli/__init__.py` wires the two together under a single
+top-level error boundary (so a `KeyboardInterrupt` is a clean exit and any
+other failure is logged once and exits non-zero). `windows/discovery.py`
+implements `--list` and `windows/doctor.py` implements `--doctor`. `__main__.py`
+and the console entry point both call `cli.main`.
+
+When no COM port and no other mode flag is given, or when `--dashboard` is
+passed, `cli.main` calls `run_dashboard` in `windows/dashboard/`, the interactive
+terminal interface. That package separates the user interface from the bridge
+management. `windows/dashboard/manager.py` holds a `BridgeManager` that starts,
+stops, and tracks the same `run_bridge` and `run_gamepad_bridge` sessions as
+background threads and assigns each attached serial device a distinct WSL
+endpoint and RFC 2217 port, and `windows/dashboard/app.py` is the Textual
+application that supplies the shared chrome -- the header, the WSL-distro
+switcher, the dismissable notice strip, and the activity log -- and sequences
+startup and shutdown. Each pane is its own widget in `windows/dashboard/_tabs.py`
+(`SerialTab`, `GamepadTab`, `DoctorTab`); a tab owns its table, its form, and
+its attach/detach/run logic and drives the manager directly. The manager
+carries no user-interface dependency, so it is tested directly; only the
+application imports Textual.
 
 `core/` defines the contracts both interpreters rely on: `core/protocol.py`
 holds the `[CONTROL]` message catalogue and the dispatcher the host routes

@@ -1,6 +1,6 @@
 """Tests for com2tty.wsl.integrations.picotool (binary interception and self-healing)."""
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 import sys
 import os
 
@@ -95,9 +95,8 @@ class TestSetupPicotoolInterceptor(unittest.TestCase):
     @patch("com2tty.wsl.integrations.picotool.os.path.isfile", return_value=True)
     @patch("com2tty.wsl.integrations.picotool.os.path.islink", return_value=False)
     @patch("com2tty.wsl.integrations.picotool.glob.glob")
-    @patch("com2tty.wsl.integrations.picotool.os.chmod")
-    @patch("builtins.open", new_callable=MagicMock)
-    def test_successful_setup(self, mock_open, mock_chmod, mock_glob,
+    @patch("com2tty.wsl.integrations.picotool.secure_write")
+    def test_successful_setup(self, mock_write, mock_glob,
                                mock_islink, mock_isfile, mock_exists,
                                mock_lexists, mock_rename, mock_remove,
                                mock_symlink):
@@ -106,13 +105,17 @@ class TestSetupPicotoolInterceptor(unittest.TestCase):
         mock_exists.return_value = False  # real_path does not exist yet
         mock_lexists.return_value = False  # picotool_path does not exist after rename
 
-        setup_picotool_interceptor(5001)
+        setup_picotool_interceptor(5001, "deadbeefcafe")
 
-        # Wrapper file written and chmod'd, ownership marker recorded
-        mock_open.assert_any_call("/tmp/com2tty_picotool.py", "w")
-        mock_open.assert_any_call(PICOTOOL_OWNER_FILE, "w")
-        self.assertEqual(mock_open.call_count, 2)
-        mock_chmod.assert_called_once_with("/tmp/com2tty_picotool.py", 0o755)
+        # Wrapper written owner-only (0o700) with the session token embedded,
+        # then the ownership marker -- both via the symlink-safe secure_write.
+        self.assertEqual(mock_write.call_count, 2)
+        wrapper_call, owner_call = mock_write.call_args_list
+        self.assertEqual(wrapper_call.args[0], "/tmp/com2tty_picotool.py")
+        self.assertIn("deadbeefcafe", wrapper_call.args[1])
+        self.assertEqual(wrapper_call.kwargs.get("mode"), 0o700)
+        self.assertEqual(owner_call.args[0], PICOTOOL_OWNER_FILE)
+        self.assertEqual(owner_call.kwargs.get("mode"), 0o600)
 
         # picotool renamed and symlinked
         picotool_path = "/home/user/.platformio/packages/tool-picotool-rp2040/picotool"
@@ -130,9 +133,8 @@ class TestSetupPicotoolInterceptor(unittest.TestCase):
     @patch("com2tty.wsl.integrations.picotool.os.path.isfile", return_value=True)
     @patch("com2tty.wsl.integrations.picotool.os.path.islink", return_value=False)
     @patch("com2tty.wsl.integrations.picotool.glob.glob")
-    @patch("com2tty.wsl.integrations.picotool.os.chmod")
-    @patch("builtins.open", new_callable=MagicMock)
-    def test_existing_real_path_and_lexists(self, mock_open, mock_chmod, mock_glob,
+    @patch("com2tty.wsl.integrations.picotool.secure_write")
+    def test_existing_real_path_and_lexists(self, mock_write, mock_glob,
                                             mock_islink, mock_isfile, mock_exists,
                                             mock_lexists, mock_rename, mock_remove,
                                             mock_symlink):
@@ -149,21 +151,19 @@ class TestSetupPicotoolInterceptor(unittest.TestCase):
         self.assertEqual(len(intercepted_picotools), 1)
 
     @patch("com2tty.wsl.integrations.picotool.glob.glob")
-    @patch("com2tty.wsl.integrations.picotool.os.chmod")
-    @patch("builtins.open", side_effect=PermissionError("cannot write"))
-    def test_wrapper_creation_failure(self, mock_open, mock_chmod, mock_glob):
+    @patch("com2tty.wsl.integrations.picotool.secure_write",
+           side_effect=PermissionError("cannot write"))
+    def test_wrapper_creation_failure(self, mock_write, mock_glob):
         """If wrapper file creation fails, function returns early."""
         setup_picotool_interceptor(5001)
 
-        mock_chmod.assert_not_called()
         mock_glob.assert_not_called()
         self.assertEqual(len(intercepted_picotools), 0)
 
     @patch("com2tty.wsl.integrations.picotool.glob.glob")
-    @patch("com2tty.wsl.integrations.picotool.os.chmod")
-    @patch("builtins.open", new_callable=MagicMock)
+    @patch("com2tty.wsl.integrations.picotool.secure_write")
     @patch("com2tty.wsl.integrations.picotool.os.path.islink", return_value=True)
-    def test_skip_symlink_path(self, mock_islink, mock_open, mock_chmod, mock_glob):
+    def test_skip_symlink_path(self, mock_islink, mock_write, mock_glob):
         """Paths that are already symlinks are skipped."""
         mock_glob.return_value = ["/some/path/picotool"]
 
@@ -172,12 +172,11 @@ class TestSetupPicotoolInterceptor(unittest.TestCase):
         self.assertEqual(len(intercepted_picotools), 0)
 
     @patch("com2tty.wsl.integrations.picotool.glob.glob")
-    @patch("com2tty.wsl.integrations.picotool.os.chmod")
-    @patch("builtins.open", new_callable=MagicMock)
+    @patch("com2tty.wsl.integrations.picotool.secure_write")
     @patch("com2tty.wsl.integrations.picotool.os.path.islink", return_value=False)
     @patch("com2tty.wsl.integrations.picotool.os.path.isfile", return_value=False)
-    def test_skip_non_file_path(self, mock_isfile, mock_islink, mock_open,
-                                 mock_chmod, mock_glob):
+    def test_skip_non_file_path(self, mock_isfile, mock_islink, mock_write,
+                                 mock_glob):
         """Paths that are not regular files are skipped."""
         mock_glob.return_value = ["/some/path/picotool"]
 
@@ -192,9 +191,8 @@ class TestSetupPicotoolInterceptor(unittest.TestCase):
     @patch("com2tty.wsl.integrations.picotool.os.path.isfile", return_value=True)
     @patch("com2tty.wsl.integrations.picotool.os.path.islink", return_value=False)
     @patch("com2tty.wsl.integrations.picotool.glob.glob")
-    @patch("com2tty.wsl.integrations.picotool.os.chmod")
-    @patch("builtins.open", new_callable=MagicMock)
-    def test_rename_symlink_exception(self, mock_open, mock_chmod, mock_glob,
+    @patch("com2tty.wsl.integrations.picotool.secure_write")
+    def test_rename_symlink_exception(self, mock_write, mock_glob,
                                        mock_islink, mock_isfile, mock_exists,
                                        mock_lexists, mock_rename, mock_symlink):
         """Exception during rename/symlink is caught and logged."""
@@ -206,9 +204,8 @@ class TestSetupPicotoolInterceptor(unittest.TestCase):
         self.assertEqual(len(intercepted_picotools), 0)
 
     @patch("com2tty.wsl.integrations.picotool.glob.glob", return_value=[])
-    @patch("com2tty.wsl.integrations.picotool.os.chmod")
-    @patch("builtins.open", new_callable=MagicMock)
-    def test_no_glob_matches(self, mock_open, mock_chmod, mock_glob):
+    @patch("com2tty.wsl.integrations.picotool.secure_write")
+    def test_no_glob_matches(self, mock_write, mock_glob):
         """When glob returns no matches, nothing is intercepted."""
         setup_picotool_interceptor(5001)
 
@@ -275,14 +272,13 @@ class TestPicotoolOwnership(unittest.TestCase):
     @patch("com2tty.wsl.integrations.picotool.os.path.islink", return_value=False)
     @patch("com2tty.wsl.integrations.picotool.glob.glob",
            return_value=["/home/u/.platformio/packages/tool-picotool-x/picotool"])
-    @patch("com2tty.wsl.integrations.picotool.os.chmod")
-    @patch("builtins.open", new_callable=MagicMock)
+    @patch("com2tty.wsl.integrations.picotool.secure_write")
     def test_owner_marker_write_failure_is_tolerated(
-            self, mock_open, mock_chmod, mock_glob, mock_islink, mock_isfile,
+            self, mock_write, mock_glob, mock_islink, mock_isfile,
             mock_exists, mock_lexists, mock_rename, mock_remove, mock_symlink):
         # Wrapper write succeeds, owner-marker write fails: interception must
         # still be in effect.
-        mock_open.side_effect = [MagicMock(), PermissionError("denied")]
+        mock_write.side_effect = [None, PermissionError("denied")]
         setup_picotool_interceptor(5001)
         self.assertEqual(len(intercepted_picotools), 1)
 

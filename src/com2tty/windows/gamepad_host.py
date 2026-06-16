@@ -96,6 +96,17 @@ class GamepadSource:
             self._get_state = self._xinput[_GET_STATE_EX_ORDINAL]
         except Exception:
             self._get_state = self._xinput.XInputGetState
+        # Declare the C signatures explicitly. Without .argtypes/.restype
+        # ctypes guesses int-sized arguments and a c_int return, which is
+        # wrong for the pointer arguments on 64-bit and discards the unsigned
+        # DWORD return; the resulting truncation is undefined behaviour.
+        self._get_state.argtypes = [
+            ctypes.c_ulong, ctypes.POINTER(_XINPUT_STATE)]
+        self._get_state.restype = ctypes.c_ulong
+        self._set_state = self._xinput.XInputSetState
+        self._set_state.argtypes = [
+            ctypes.c_ulong, ctypes.POINTER(_XINPUT_VIBRATION)]
+        self._set_state.restype = ctypes.c_ulong
         self._last_packet = None
         self._last_connected = None
 
@@ -104,7 +115,7 @@ class GamepadSource:
         low-frequency motor). Returns True when XInput accepted the state."""
         vib = _XINPUT_VIBRATION(left & 0xFFFF, right & 0xFFFF)
         try:
-            return self._xinput.XInputSetState(
+            return self._set_state(
                 self.index, ctypes.byref(vib)) == ERROR_SUCCESS
         except Exception:
             return False

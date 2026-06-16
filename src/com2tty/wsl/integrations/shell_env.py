@@ -28,9 +28,14 @@ def _atomic_write_lines(path, lines):
     Instead, write a sibling temp file, flush+fsync it, then ``os.replace`` it
     over the original so the rc is never observed half-written.
     """
-    dir_name = os.path.dirname(path) or "."
+    # If the rc file is a symlink (common with dotfile managers that link
+    # ~/.bashrc into a tracked repo), rewrite the link's *target* and leave the
+    # link itself in place. Replacing the link with a regular file would
+    # silently detach the user's dotfiles setup.
+    target = os.path.realpath(path)
+    dir_name = os.path.dirname(target) or "."
     try:
-        orig_mode = stat.S_IMODE(os.stat(path).st_mode)
+        orig_mode = stat.S_IMODE(os.stat(target).st_mode)
     except OSError:
         orig_mode = None
     fd, tmp = tempfile.mkstemp(dir=dir_name, prefix=".com2tty-rc-")
@@ -41,7 +46,7 @@ def _atomic_write_lines(path, lines):
             os.fsync(f.fileno())
         if orig_mode is not None:
             os.chmod(tmp, orig_mode)
-        os.replace(tmp, path)
+        os.replace(tmp, target)
     except Exception:
         try:
             os.unlink(tmp)
@@ -210,14 +215,18 @@ def inject_rc(port, monitor_path="/tmp/ttyUSB0"):
     )
     for rc_path in get_rc_files():
         try:
-            prefix = ""
+            lines = []
             if os.path.exists(rc_path):
                 with open(rc_path, "r") as f:
-                    content = f.read()
-                    if content and not content.endswith("\n"):
-                        prefix = "\n"
-            with open(rc_path, "a") as f:
-                f.write(prefix + block)
+                    lines = f.readlines()
+                # Guarantee the existing content ends with a newline so the
+                # appended block starts on its own line.
+                if lines and not lines[-1].endswith("\n"):
+                    lines[-1] = lines[-1] + "\n"
+            lines.append(block)
+            # Append atomically: a crash mid-write must not leave the user's
+            # rc file truncated or half-written (it is sourced by every shell).
+            _atomic_write_lines(rc_path, lines)
             sys.stderr.write(f"Injected environment variables to {rc_path}\n")
             sys.stderr.flush()
         except Exception as e:

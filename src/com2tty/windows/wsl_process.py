@@ -27,6 +27,24 @@ _JobObjectExtendedLimitInformation = 9
 _PROCESS_TERMINATE = 0x0001
 _PROCESS_SET_QUOTA = 0x0100
 
+# -- Console-neutral probe spawning -------------------------------------------
+#
+# The short-lived probes below (wslpath translation, the python3/script checks)
+# each run a command *inside* the distro, so whichever runs first cold-boots
+# the WSL2 VM. If that boot inherits the caller's interactive console and its
+# stdin, wsl.exe initialises the VM's terminal relay against them, and that
+# state persists for the VM's whole lifetime: every interactive `wsl` opened
+# afterwards then comes up with no echo and garbled input, until the next
+# `wsl --shutdown`. (Booting the VM from a real interactive `wsl` first avoids
+# it -- which is why the bug only appears when com2tty starts the VM.) Detaching
+# the probe -- no console window, stdin from the null device -- makes the cold
+# boot terminal-neutral, exactly as spawn_wsl_helper already does for the
+# long-lived helper. ``creationflags`` is a no-op off Windows.
+CONSOLE_NEUTRAL = {
+    "stdin": subprocess.DEVNULL,
+    "creationflags": CREATE_NO_WINDOW,
+}
+
 
 class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
     _fields_ = [
@@ -146,7 +164,8 @@ def get_wsl_path(win_path, distro=None):
         # wslpath emits UTF-8 regardless of the Windows locale; decoding with
         # the ANSI codepage would corrupt non-ASCII paths (e.g. CJK usernames).
         res = subprocess.run(cmd, capture_output=True, text=True,
-                             encoding="utf-8", errors="replace", check=True)
+                             encoding="utf-8", errors="replace", check=True,
+                             **CONSOLE_NEUTRAL)
         return res.stdout.strip()
     except Exception as e:
         logging.debug(f"wslpath failed: {e}. Using fallback conversion.")
@@ -175,7 +194,7 @@ def check_wsl_environment(wsl_script_path=None, distro=None):
         res = subprocess.run(
             wsl_command(distro, "python3", "--version"),
             capture_output=True, text=True, encoding="utf-8",
-            errors="replace", timeout=30,
+            errors="replace", timeout=30, **CONSOLE_NEUTRAL,
         )
     except Exception as e:
         raise RuntimeError(f"Failed to start {target}: {e}")
@@ -191,7 +210,7 @@ def check_wsl_environment(wsl_script_path=None, distro=None):
     if wsl_script_path:
         res = subprocess.run(
             wsl_command(distro, "test", "-r", wsl_script_path),
-            capture_output=True, timeout=30,
+            capture_output=True, timeout=30, **CONSOLE_NEUTRAL,
         )
         if res.returncode != 0:
             raise RuntimeError(

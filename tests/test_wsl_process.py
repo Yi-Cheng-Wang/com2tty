@@ -192,6 +192,16 @@ class TestGetWslPath(unittest.TestCase):
             path = get_wsl_path(r"C:\Users\u\file.py")
             self.assertEqual(path, "/mnt/c/Users/u/file.py")
 
+    def test_probe_is_console_neutral(self):
+        # The wslpath probe can cold-boot the VM; it must not bind the VM's
+        # terminal to the caller's console (see CONSOLE_NEUTRAL).
+        with patch("subprocess.run") as m:
+            m.return_value = MagicMock(stdout="/mnt/d/x\n")
+            get_wsl_path(r"D:\x")
+        _, kwargs = m.call_args
+        self.assertEqual(kwargs.get("stdin"), __import__("subprocess").DEVNULL)
+        self.assertEqual(kwargs.get("creationflags"), wp.CREATE_NO_WINDOW)
+
 
 
 class TestWslCommand(unittest.TestCase):
@@ -266,6 +276,13 @@ class TestCheckWslEnvironment(unittest.TestCase):
         ]
         check_wsl_environment("/mnt/c/x/bridge.py")  # should not raise
         self.assertEqual(mock_run.call_count, 2)
+        # Both probes (the cold-boot trigger) must be console-neutral so they
+        # do not poison the terminal state of later interactive `wsl` sessions.
+        import subprocess
+        for call in mock_run.call_args_list:
+            self.assertEqual(call.kwargs.get("stdin"), subprocess.DEVNULL)
+            self.assertEqual(call.kwargs.get("creationflags"),
+                             wp.CREATE_NO_WINDOW)
 
     @patch("com2tty.windows.wsl_process.subprocess.run")
     @patch("com2tty.windows.wsl_process.shutil.which", return_value="C:\\wsl.exe")

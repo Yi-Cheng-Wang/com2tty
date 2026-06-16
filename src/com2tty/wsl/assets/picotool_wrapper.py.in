@@ -37,7 +37,10 @@ def main():
             data = f.read()
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.connect(('127.0.0.1', {port}))
-        s.sendall(data)
+        # Authenticate to the relay with this session's token (prefixed before
+        # the image) so another local user cannot push firmware to the relay
+        # during an upload. The token lives only in this owner-readable wrapper.
+        s.sendall(b'{token}' + data)
         s.close()
         print("com2tty UF2 wrapper: Transfer complete.", file=sys.stderr)
     except Exception as e:

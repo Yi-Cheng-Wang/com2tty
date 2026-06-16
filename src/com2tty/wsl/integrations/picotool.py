@@ -16,6 +16,7 @@ import sys
 
 from ...core.constants import PICOTOOL_OWNER_FILE, PICOTOOL_WRAPPER_PATH
 from ..liveness import pid_alive, read_pid_file
+from ..secure_io import secure_write
 
 _TEMPLATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               os.pardir, "assets", "picotool_wrapper.py.in")
@@ -34,17 +35,22 @@ PICOTOOL_WRAPPER_CONTENT = _load_wrapper_template()
 intercepted_picotools = []
 
 
-def render_wrapper_script(uf2_port):
-    """The wrapper script text with the UF2 relay port substituted in."""
-    return PICOTOOL_WRAPPER_CONTENT.replace("{port}", str(uf2_port))
+def render_wrapper_script(uf2_port, token=""):
+    """The wrapper script text with the UF2 relay port and session token in."""
+    return (PICOTOOL_WRAPPER_CONTENT
+            .replace("{port}", str(uf2_port))
+            .replace("{token}", token))
 
 
-def setup_picotool_interceptor(uf2_port):
+def setup_picotool_interceptor(uf2_port, token=""):
     wrapper_path = PICOTOOL_WRAPPER_PATH
     try:
-        with open(wrapper_path, "w") as f:
-            f.write(render_wrapper_script(uf2_port))
-        os.chmod(wrapper_path, 0o755)
+        # Owner-only (0o700): the wrapper embeds this session's UF2 token, so a
+        # world-readable wrapper would leak it and defeat the relay auth.
+        # secure_write refuses to follow a symlink planted at this fixed /tmp
+        # path (see wsl.secure_io).
+        secure_write(wrapper_path, render_wrapper_script(uf2_port, token),
+                     mode=0o700)
     except Exception as e:
         sys.stderr.write(f"Warning: Failed to create picotool wrapper: {e}\n")
         return
@@ -69,8 +75,7 @@ def setup_picotool_interceptor(uf2_port):
         # Record ownership so a later session's orphan recovery does not
         # restore the binaries out from under this still-running one.
         try:
-            with open(PICOTOOL_OWNER_FILE, "w") as f:
-                f.write(str(os.getpid()))
+            secure_write(PICOTOOL_OWNER_FILE, str(os.getpid()), mode=0o600)
         except Exception:
             pass
 

@@ -15,6 +15,7 @@ import time
 import serial
 
 from ..core.boards import BOARD_LABELS, UF2_FAMILIES
+from ..core.util import indexed_path
 from .control_handler import read_wsl_stderr
 from .os_hacks import device_watcher as devnotify
 from .os_hacks.autoplay import restore_orphaned_autoplay
@@ -133,16 +134,11 @@ def read_com_port(ser, proc, shutdown_event, rfc2217_active_event, uf2_active_ev
 def _derive_indexed_path(base, index):
     """Per-port WSL symlink path for multi-port mode.
 
-    Increments a trailing number when present (/tmp/ttyUSB0 -> /tmp/ttyUSB1),
-    otherwise appends the index, so each bridge gets a distinct endpoint.
+    Thin wrapper over the shared :func:`com2tty.core.util.indexed_path` so the
+    multi-port CLI and the dashboard manager derive endpoints identically
+    (/tmp/ttyUSB0 -> /tmp/ttyUSB1).
     """
-    if index == 0:
-        return base
-    import re
-    m = re.match(r"^(.*?)(\d+)$", base)
-    if m:
-        return f"{m.group(1)}{int(m.group(2)) + index}"
-    return f"{base}{index}"
+    return indexed_path(base, index)
 
 
 def run_with_respawn(target, stop_event=None, respawn_delay=2.0, **kwargs):
@@ -264,6 +260,9 @@ def _resolve_board_type(port, board):
 
 
 def _print_bridge_banner(port, board_type, rfc2217_port, usb_serial, env_setup):
+    from .os_hacks.console import banners_enabled
+    if not banners_enabled():
+        return
     yellow, cyan, green, reset = get_banner_colors()
     board_label = BOARD_LABELS.get(board_type, board_type)
     print(f"\n{yellow}========================================================================{reset}")

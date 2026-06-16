@@ -16,6 +16,12 @@ from com2tty.wsl.servers.uf2_relay import (
     run_uf2_relay_thread,
 )
 
+# Per-session token the picotool wrapper prefixes before the image; the relay
+# only accepts an upload that presents it. The tests send it as the first recv
+# chunk, mirroring the real wrapper.
+_TOKEN = "uf2sessiontoken0"
+_TOKEN_B = _TOKEN.encode()
+
 
 class TestRunUf2RelayThread(unittest.TestCase):
     """Tests for the UF2 relay TCP server thread."""
@@ -65,7 +71,7 @@ class TestRunUf2RelayThread(unittest.TestCase):
         conn = MagicMock()
 
         uf2_data = b"\x00UF2_TEST_DATA\x00" * 10
-        conn.recv.side_effect = [uf2_data, b""]  # data then EOF
+        conn.recv.side_effect = [_TOKEN_B, uf2_data, b""]  # token, data, EOF
 
         sock.accept.side_effect = [
             (conn, ("127.0.0.1", 12345)),
@@ -80,7 +86,7 @@ class TestRunUf2RelayThread(unittest.TestCase):
         mock_stdout.buffer = mock_buf
 
         evt = threading.Event()
-        run_uf2_relay_thread(5001, evt)
+        run_uf2_relay_thread(5001, evt, token=_TOKEN)
 
         # Verify UF2 data written to stdout
         mock_buf.write.assert_called_once_with(bytearray(uf2_data))
@@ -105,7 +111,7 @@ class TestRunUf2RelayThread(unittest.TestCase):
         mock_sock_cls.return_value = sock
         conn = MagicMock()
 
-        conn.recv.side_effect = [b"data", b""]
+        conn.recv.side_effect = [_TOKEN_B, b"data", b""]
         sock.accept.side_effect = [
             (conn, ("127.0.0.1", 12345)),
             OSError("exit"),
@@ -122,7 +128,7 @@ class TestRunUf2RelayThread(unittest.TestCase):
         mock_stdout.buffer = MagicMock()
 
         evt = threading.Event()
-        run_uf2_relay_thread(5001, evt)
+        run_uf2_relay_thread(5001, evt, token=_TOKEN)
 
         # stdout.buffer.write should NOT have been called
         mock_stdout.buffer.write.assert_not_called()
@@ -146,7 +152,7 @@ class TestRunUf2RelayThread(unittest.TestCase):
         sock = MagicMock()
         mock_sock_cls.return_value = sock
         conn = MagicMock()
-        conn.recv.side_effect = [b"data", b""]
+        conn.recv.side_effect = [_TOKEN_B, b"data", b""]
         sock.accept.side_effect = [
             (conn, ("127.0.0.1", 12345)),
             OSError("exit"),
@@ -156,7 +162,7 @@ class TestRunUf2RelayThread(unittest.TestCase):
         mock_select.return_value = ([], [], [])  # stdin never ready
         mock_stdout.buffer = MagicMock()
 
-        run_uf2_relay_thread(5001, threading.Event())
+        run_uf2_relay_thread(5001, threading.Event(), token=_TOKEN)
         mock_stdout.buffer.write.assert_not_called()
 
     @patch("com2tty.wsl.servers.uf2_relay.sys.stderr")
@@ -175,7 +181,7 @@ class TestRunUf2RelayThread(unittest.TestCase):
         mock_sock_cls.return_value = sock
         conn = MagicMock()
 
-        conn.recv.side_effect = [b"data", b""]
+        conn.recv.side_effect = [_TOKEN_B, b"data", b""]
         sock.accept.side_effect = [
             (conn, ("127.0.0.1", 12345)),
             OSError("exit"),
@@ -189,7 +195,7 @@ class TestRunUf2RelayThread(unittest.TestCase):
         mock_stdout.buffer = mock_buf
 
         evt = threading.Event()
-        run_uf2_relay_thread(5001, evt)
+        run_uf2_relay_thread(5001, evt, token=_TOKEN)
 
         # Error about write failure logged
         mock_stderr.write.assert_any_call(
@@ -210,7 +216,7 @@ class TestRunUf2RelayThread(unittest.TestCase):
         mock_sock_cls.return_value = sock
         conn = MagicMock()
 
-        conn.recv.side_effect = [b"partial", ConnectionResetError("reset")]
+        conn.recv.side_effect = [_TOKEN_B, b"partial", ConnectionResetError("reset")]
         sock.accept.side_effect = [
             (conn, ("127.0.0.1", 12345)),
             OSError("exit"),
@@ -223,7 +229,7 @@ class TestRunUf2RelayThread(unittest.TestCase):
         mock_stdout.buffer = mock_buf
 
         evt = threading.Event()
-        run_uf2_relay_thread(5001, evt)
+        run_uf2_relay_thread(5001, evt, token=_TOKEN)
 
         # Partial data should still be written
         mock_buf.write.assert_called_once_with(bytearray(b"partial"))
@@ -258,7 +264,7 @@ class TestRunUf2RelayThread(unittest.TestCase):
         sock = MagicMock()
         mock_sock_cls.return_value = sock
         conn = MagicMock()
-        conn.recv.side_effect = [b"firmware", b""]
+        conn.recv.side_effect = [_TOKEN_B, b"firmware", b""]
         sock.accept.side_effect = [
             (conn, ("127.0.0.1", 12345)),
             OSError("exit"),
@@ -270,7 +276,7 @@ class TestRunUf2RelayThread(unittest.TestCase):
         mock_buf = MagicMock()
         mock_stdout.buffer = mock_buf
 
-        run_uf2_relay_thread(5001, threading.Event())
+        run_uf2_relay_thread(5001, threading.Event(), token=_TOKEN)
         mock_buf.write.assert_called_once_with(bytearray(b"firmware"))
 
     @patch("com2tty.wsl.servers.uf2_relay.sys.stderr")
@@ -289,7 +295,7 @@ class TestRunUf2RelayThread(unittest.TestCase):
         mock_sock_cls.return_value = sock
         conn = MagicMock()
 
-        conn.recv.side_effect = [b"data", b""]
+        conn.recv.side_effect = [_TOKEN_B, b"data", b""]
         sock.accept.side_effect = [
             (conn, ("127.0.0.1", 12345)),
             OSError("exit"),
@@ -301,7 +307,7 @@ class TestRunUf2RelayThread(unittest.TestCase):
         mock_stdout.buffer = MagicMock()
 
         evt = threading.Event()
-        run_uf2_relay_thread(5001, evt)
+        run_uf2_relay_thread(5001, evt, token=_TOKEN)
 
         # No ACK → timeout path
         mock_stdout.buffer.write.assert_not_called()
@@ -325,7 +331,7 @@ class TestRunUf2RelayThread(unittest.TestCase):
         mock_sock_cls.return_value = sock
         conn = MagicMock()
 
-        conn.recv.side_effect = [b"data", b""]
+        conn.recv.side_effect = [_TOKEN_B, b"data", b""]
         sock.accept.side_effect = [
             (conn, ("127.0.0.1", 12345)),
             OSError("exit"),
@@ -337,7 +343,7 @@ class TestRunUf2RelayThread(unittest.TestCase):
         mock_stdout.buffer = MagicMock()
 
         evt = threading.Event()
-        run_uf2_relay_thread(5001, evt)
+        run_uf2_relay_thread(5001, evt, token=_TOKEN)
 
         # No ACK → timeout path
         mock_stdout.buffer.write.assert_not_called()
@@ -345,6 +351,87 @@ class TestRunUf2RelayThread(unittest.TestCase):
             "[CONTROL] UF2_ERROR: Timeout waiting for host UF2_ACK\n"
         )
 
+
+
+class TestUf2RelayTokenAuth(unittest.TestCase):
+    """The relay only accepts an upload that presents the session token."""
+
+    @patch("com2tty.wsl.servers.uf2_relay.sys.stderr")
+    @patch("com2tty.wsl.servers.uf2_relay.sys.stdout")
+    @patch("time.sleep")
+    @patch("subprocess.run")
+    @patch("com2tty.wsl.servers.base.socket.socket")
+    def test_rejects_when_no_token_configured(self, mock_sock_cls, mock_sp,
+                                              mock_sleep, mock_stdout,
+                                              mock_stderr):
+        """With no token (e.g. a secondary bridge), every upload is rejected
+        without even reading the connection."""
+        sock = MagicMock()
+        mock_sock_cls.return_value = sock
+        conn = MagicMock()
+        sock.accept.side_effect = [
+            (conn, ("127.0.0.1", 12345)),
+            OSError("exit"),
+        ]
+        mock_stdout.buffer = MagicMock()
+
+        run_uf2_relay_thread(5001, threading.Event())  # token="" by default
+
+        conn.close.assert_called()
+        conn.recv.assert_not_called()
+        mock_stdout.buffer.write.assert_not_called()
+        written = "".join(c.args[0] for c in mock_stderr.write.call_args_list)
+        self.assertNotIn("UF2_UPLOAD_START", written)
+
+    @patch("com2tty.wsl.servers.uf2_relay.sys.stderr")
+    @patch("com2tty.wsl.servers.uf2_relay.sys.stdout")
+    @patch("time.sleep")
+    @patch("subprocess.run")
+    @patch("com2tty.wsl.servers.base.socket.socket")
+    def test_rejects_token_mismatch(self, mock_sock_cls, mock_sp, mock_sleep,
+                                    mock_stdout, mock_stderr):
+        """A client presenting the wrong token is rejected; image not relayed."""
+        sock = MagicMock()
+        mock_sock_cls.return_value = sock
+        conn = MagicMock()
+        conn.recv.side_effect = [b"x" * len(_TOKEN_B), b"ignored"]
+        sock.accept.side_effect = [
+            (conn, ("127.0.0.1", 12345)),
+            OSError("exit"),
+        ]
+        mock_stdout.buffer = MagicMock()
+
+        run_uf2_relay_thread(5001, threading.Event(), token=_TOKEN)
+
+        mock_stdout.buffer.write.assert_not_called()
+        written = "".join(c.args[0] for c in mock_stderr.write.call_args_list)
+        self.assertIn("rejected an unauthenticated", written)
+        self.assertNotIn("UF2_UPLOAD_START", written)
+
+    @patch("com2tty.wsl.servers.uf2_relay.sys.stderr")
+    @patch("com2tty.wsl.servers.uf2_relay.sys.stdout")
+    @patch("time.sleep")
+    @patch("subprocess.run")
+    @patch("com2tty.wsl.servers.base.socket.socket")
+    def test_rejects_token_truncated_by_eof(self, mock_sock_cls, mock_sp,
+                                            mock_sleep, mock_stdout,
+                                            mock_stderr):
+        """A client that closes before sending the full token is rejected."""
+        sock = MagicMock()
+        mock_sock_cls.return_value = sock
+        conn = MagicMock()
+        conn.recv.side_effect = [b"uf2", b""]  # short token then EOF
+        sock.accept.side_effect = [
+            (conn, ("127.0.0.1", 12345)),
+            OSError("exit"),
+        ]
+        mock_stdout.buffer = MagicMock()
+
+        run_uf2_relay_thread(5001, threading.Event(), token=_TOKEN)
+
+        mock_stdout.buffer.write.assert_not_called()
+        written = "".join(c.args[0] for c in mock_stderr.write.call_args_list)
+        self.assertIn("rejected an unauthenticated", written)
 
 
 class TestMd5Hexdigest(unittest.TestCase):

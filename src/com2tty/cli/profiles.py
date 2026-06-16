@@ -72,12 +72,15 @@ def load_profile_args(name, search_paths=None):
                ", ".join(parser.sections()) or "none"))
 
     args = []
-    port = None
+    ports = []
     for key, value in parser.items(name):
         option = key.replace("_", "-").lower()
         value = value.strip()
         if option == "port":
-            port = value
+            # Allow several whitespace-separated ports (``port = COM3 COM5``)
+            # so a profile can drive multi-port mode, mirroring the command line
+            # where the positional argument accepts several ports.
+            ports = value.split()
         elif option in FLAG_OPTIONS:
             lowered = value.lower()
             if lowered in _TRUE_VALUES:
@@ -87,8 +90,10 @@ def load_profile_args(name, search_paths=None):
                     f"profile [{name}]: '{key}' must be a boolean, got '{value}'")
         else:
             args.extend([f"--{option}", value])
-    if port is not None:
-        args.insert(0, port)
+    # Positionals lead so argparse reads them as the COM port(s); reversed so
+    # repeated insert(0, ...) preserves the profile's port order.
+    for token in reversed(ports):
+        args.insert(0, token)
     return args
 
 

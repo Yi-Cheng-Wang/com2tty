@@ -20,6 +20,8 @@ from com2tty.windows.doctor import (
     check_uinput,
     check_autoplay_marker,
     check_xinput,
+    collect_doctor_results,
+    find_dev_aliases,
     run_doctor,
 )
 
@@ -195,6 +197,28 @@ class TestIndividualChecks(unittest.TestCase):
         self.assertEqual(status, WARN)
         self.assertIn("--gamepad --uinput", detail)
 
+    @patch("com2tty.windows.doctor._run")
+    def test_find_dev_aliases_parses_probe_output(self, mock_run):
+        # The probe prints "<tmp>\t<dev>" per endpoint; a '-' second field
+        # (the no-alias marker, which survives the caller's strip) becomes None.
+        mock_run.return_value = (0, "/tmp/ttyUSB0\t/dev/ttyACM0\n/tmp/ttyUSB1\t-",
+                                 "")
+        result = find_dev_aliases(None, ["/tmp/ttyUSB0", "/tmp/ttyUSB1"])
+        self.assertEqual(result, {"/tmp/ttyUSB0": "/dev/ttyACM0",
+                                  "/tmp/ttyUSB1": None})
+        # The endpoints are passed to the probe as arguments.
+        self.assertEqual(mock_run.call_args[0][0][-2:],
+                         ["/tmp/ttyUSB0", "/tmp/ttyUSB1"])
+
+    def test_find_dev_aliases_no_paths_skips_probe(self):
+        with patch("com2tty.windows.doctor._run") as mock_run:
+            self.assertEqual(find_dev_aliases(None, []), {})
+            mock_run.assert_not_called()
+
+    @patch("com2tty.windows.doctor._run", return_value=(1, "", "boom"))
+    def test_find_dev_aliases_returns_empty_on_failure(self, mock_run):
+        self.assertEqual(find_dev_aliases(None, ["/tmp/ttyUSB0"]), {})
+
     def test_autoplay_marker_absent(self):
         # conftest redirects tempfile.gettempdir to a per-test directory.
         self.assertEqual(check_autoplay_marker()[0], OK)
@@ -319,5 +343,23 @@ class TestRunDoctor(unittest.TestCase):
                 p.stop()
 
 
-if __name__ == "__main__":
-    unittest.main()
+class TestCollectDoctorResults(unittest.TestCase):
+    """The structured API behind both run_doctor and the dashboard's table."""
+
+    @patch("com2tty.windows.doctor.check_xinput",
+           return_value=(OK, "XInput DLL", ""))
+    @patch("com2tty.windows.doctor.check_autoplay_marker",
+           return_value=(OK, "AutoPlay marker", "none"))
+    @patch("com2tty.windows.doctor.check_wsl_exe",
+           return_value=(FAIL, "wsl.exe on PATH", "not found"))
+    def test_returns_structured_tuples_and_gates_on_wsl(
+            self, mock_wsl, mock_marker, mock_xinput):
+        results = collect_doctor_results(distro=None, rfc2217_port=4000)
+        # Every entry is a (status, label, detail) triple.
+        for status, label, detail in results:
+            self.assertIn(status, (OK, WARN, FAIL, SKIP))
+            self.assertIsInstance(label, str)
+        labels = [label for _, label, _ in results]
+        # WSL missing: no in-WSL probe ran, but host-side checks still did.
+        self.assertNotIn("python3 in WSL", labels)
+        self.assertIn("XInput DLL", labels)
