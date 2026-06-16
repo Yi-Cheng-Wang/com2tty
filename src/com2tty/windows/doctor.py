@@ -13,7 +13,12 @@ import os
 import shutil
 import subprocess
 
-from .wsl_process import get_wsl_path, helper_script_path, wsl_command
+from .wsl_process import (
+    CONSOLE_NEUTRAL,
+    get_wsl_path,
+    helper_script_path,
+    wsl_command,
+)
 from .os_hacks.autoplay import _autoplay_marker_path
 
 OK = "OK"
@@ -25,9 +30,12 @@ SKIP = "SKIP"
 def _run(cmd, timeout=30):
     """Run a command; return (returncode or None on error, stdout, stderr)."""
     try:
+        # Console-neutral: a doctor probe may be the first command to cold-boot
+        # the WSL VM, and must not bind its terminal to the caller's console
+        # (see CONSOLE_NEUTRAL in wsl_process).
         res = subprocess.run(cmd, capture_output=True, text=True,
                              encoding="utf-8", errors="replace",
-                             timeout=timeout)
+                             timeout=timeout, **CONSOLE_NEUTRAL)
         return res.returncode, (res.stdout or "").strip(), (res.stderr or "").strip()
     except Exception as e:
         return None, "", str(e)
