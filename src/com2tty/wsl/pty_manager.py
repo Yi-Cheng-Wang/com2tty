@@ -46,15 +46,68 @@ def get_pty_settings(fd):
         return None, None, None, None
 
 
+def set_raw_mode(fd):
+    """Put the pty's line discipline into raw mode so it behaves like a wire.
+
+    ``os.openpty()`` returns a slave in the kernel's default *cooked* terminal
+    mode (ECHO, ICANON, ISIG, ICRNL, IXON, OPOST/ONLCR all on). That is right
+    for a login terminal but wrong for a serial device, which carries raw
+    bytes. Left cooked, the emulated port misbehaves the moment a device starts
+    talking:
+
+    * ``ECHO`` echoes the device's own traffic straight back at it.
+    * ``ISIG`` turns stray control bytes (a 0x03 inside a binary frame) into
+      signals on the line's foreground process group.
+    * ``ICRNL``/``OPOST``/``ONLCR`` rewrite CR<->NL in both directions, so
+      binary frames and firmware bytes arrive corrupted (a lone ``\\n`` toward
+      the device becomes ``\\r\\n``; a ``\\r`` from the device becomes ``\\n``).
+    * ``IXON`` swallows 0x11/0x13 data bytes as XON/XOFF flow control.
+    * ``ICANON`` line-buffers input, so a chatty device with no reader fills
+      the tty input buffer until ``os.write(master_fd, ...)`` blocks and stalls
+      the whole bridge select loop.
+
+    Clearing those flags makes every byte pass through untouched, exactly like
+    a real UART (this is what pyserial et al. do to a real port on open). The
+    ``cflag`` -- byte size, parity, stop bits, and baud -- is deliberately left
+    intact so ``get_pty_settings`` still reports line-setting changes a WSL
+    program makes. Best-effort: a tcget/tcset failure is swallowed (matching
+    ``get_pty_settings``) so it can never block bridge startup.
+    """
+    try:
+        attrs = termios.tcgetattr(fd)
+    except Exception:
+        return
+    iflag, oflag, cflag, lflag, ispeed, ospeed, cc = attrs
+    iflag &= ~(termios.IGNBRK | termios.BRKINT | termios.PARMRK
+               | termios.ISTRIP | termios.INLCR | termios.IGNCR
+               | termios.ICRNL | termios.IXON)
+    oflag &= ~termios.OPOST
+    lflag &= ~(termios.ECHO | termios.ECHONL | termios.ICANON
+               | termios.ISIG | termios.IEXTEN)
+    # Hand every byte to a reader as soon as it arrives, with no inter-byte
+    # timer -- the raw-read defaults expected of a serial line.
+    cc = list(cc)
+    cc[termios.VMIN] = 1
+    cc[termios.VTIME] = 0
+    try:
+        termios.tcsetattr(fd, termios.TCSANOW,
+                          [iflag, oflag, cflag, lflag, ispeed, ospeed, cc])
+    except Exception:
+        return
+
+
 def open_pty():
     """Create the pty pair; returns ``(master_fd, slave_fd, slave_name)``.
 
     Both descriptors must stay open for the bridge's lifetime: keeping the
     slave open prevents EIO errors on the master side when WSL clients open
-    and close the virtual serial port.
+    and close the virtual serial port. The fresh pty is forced into raw mode
+    (see ``set_raw_mode``) so it carries bytes like a real serial line instead
+    of cooking them like a login terminal.
     """
     master_fd, slave_fd = os.openpty()
     slave_name = os.ttyname(slave_fd)
+    set_raw_mode(slave_fd)
     sys.stderr.write(f"Created pseudo-terminal: master_fd={master_fd}, slave={slave_name}\n")
     sys.stderr.flush()
     return master_fd, slave_fd, slave_name

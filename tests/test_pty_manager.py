@@ -14,7 +14,21 @@ from com2tty.wsl.pty_manager import (
     cleanup_symlink,
     create_symlink_with_fallback,
     get_pty_settings,
+    open_pty,
+    set_raw_mode,
 )
+
+
+def _cooked_attrs():
+    """A termios attrs list with every cooked-mode flag this code clears set."""
+    iflag = (termios.IGNBRK | termios.BRKINT | termios.PARMRK | termios.ISTRIP
+             | termios.INLCR | termios.IGNCR | termios.ICRNL | termios.IXON)
+    oflag = termios.OPOST
+    cflag = termios.CS8 | termios.PARENB  # must survive untouched
+    lflag = (termios.ECHO | termios.ECHONL | termios.ICANON | termios.ISIG
+             | termios.IEXTEN)
+    cc = [0] * 32
+    return [iflag, oflag, cflag, lflag, termios.B9600, termios.B9600, cc]
 
 
 class TestRefuseIfForeignLivePty(unittest.TestCase):
@@ -192,6 +206,63 @@ class TestGetPtySettings(unittest.TestCase):
             self.assertEqual(get_pty_settings(99),
                              (None, None, None, None))
 
+
+
+class TestSetRawMode(unittest.TestCase):
+    """The emulated serial line must be raw, not a cooked login terminal."""
+
+    def test_clears_cooked_flags_and_keeps_cflag(self):
+        attrs = _cooked_attrs()
+        with patch("com2tty.wsl.pty_manager.termios.tcgetattr", return_value=attrs), \
+                patch("com2tty.wsl.pty_manager.termios.tcsetattr") as m_set:
+            set_raw_mode(7)
+
+        m_set.assert_called_once()
+        fd, when, new = m_set.call_args[0]
+        self.assertEqual(fd, 7)
+        self.assertEqual(when, termios.TCSANOW)
+        iflag, oflag, cflag, lflag, ispeed, ospeed, cc = new
+        # Every cooked flag the device traffic would trip over is gone.
+        for bit in (termios.ICRNL, termios.INLCR, termios.IGNCR, termios.IXON,
+                    termios.ISTRIP, termios.BRKINT, termios.PARMRK,
+                    termios.IGNBRK):
+            self.assertFalse(iflag & bit)
+        self.assertFalse(oflag & termios.OPOST)
+        for bit in (termios.ECHO, termios.ECHONL, termios.ICANON,
+                    termios.ISIG, termios.IEXTEN):
+            self.assertFalse(lflag & bit)
+        # Byte size / parity / baud are the bridge's to report, untouched here.
+        self.assertEqual(cflag, termios.CS8 | termios.PARENB)
+        self.assertEqual(ispeed, termios.B9600)
+        self.assertEqual(ospeed, termios.B9600)
+        # Raw reads: deliver each byte immediately, no inter-byte timer.
+        self.assertEqual(cc[termios.VMIN], 1)
+        self.assertEqual(cc[termios.VTIME], 0)
+
+    def test_tcgetattr_failure_is_swallowed(self):
+        with patch("com2tty.wsl.pty_manager.termios.tcgetattr",
+                   side_effect=OSError("no tty")), \
+                patch("com2tty.wsl.pty_manager.termios.tcsetattr") as m_set:
+            set_raw_mode(7)  # must not raise
+        m_set.assert_not_called()
+
+    def test_tcsetattr_failure_is_swallowed(self):
+        with patch("com2tty.wsl.pty_manager.termios.tcgetattr",
+                   return_value=_cooked_attrs()), \
+                patch("com2tty.wsl.pty_manager.termios.tcsetattr",
+                      side_effect=OSError("denied")):
+            set_raw_mode(7)  # must not raise
+
+
+class TestOpenPtyRawsTheSlave(unittest.TestCase):
+
+    @patch("com2tty.wsl.pty_manager.set_raw_mode")
+    @patch("os.ttyname", return_value="/dev/pts/3", create=True)
+    @patch("os.openpty", return_value=(11, 12), create=True)
+    def test_open_pty_sets_slave_raw(self, m_openpty, m_ttyname, m_raw):
+        master_fd, slave_fd, slave_name = open_pty()
+        self.assertEqual((master_fd, slave_fd, slave_name), (11, 12, "/dev/pts/3"))
+        m_raw.assert_called_once_with(12)
 
 
 class TestCleanupSymlink(unittest.TestCase):
